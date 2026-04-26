@@ -82,7 +82,7 @@ impl App {
             .enumerate()
             .filter(|(_, e)| match project {
                 None => true,
-                Some(p) => e.project_root.as_ref() == Some(p),
+                Some(p) => e.project_roots.iter().any(|r| r == p),
             })
             .map(|(i, _)| i)
             .collect()

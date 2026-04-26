@@ -1,4 +1,5 @@
 mod app;
+mod claude;
 mod diff;
 mod history;
 mod ui;
@@ -14,20 +15,39 @@ use history::HistoryStore;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{io, path::PathBuf, time::Duration};
 
-fn history_dir() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME not set");
-    let cursor = PathBuf::from(&home).join("Library/Application Support/Cursor/User/History");
-    if cursor.exists() {
-        return cursor;
+fn cursor_history_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    for candidate in [
+        "Library/Application Support/Cursor/User/History",
+        "Library/Application Support/Code/User/History",
+        ".config/Cursor/User/History",
+        ".config/Code/User/History",
+    ] {
+        let p = PathBuf::from(&home).join(candidate);
+        if p.exists() {
+            return Some(p);
+        }
     }
-    PathBuf::from(&home).join("Library/Application Support/Code/User/History")
+    None
 }
 
 fn main() -> Result<()> {
     let absolute_time = std::env::args().any(|a| a == "--absolute" || a == "-a");
 
-    let dir = history_dir();
-    let store = HistoryStore::load(&dir)?;
+    let mut entries = Vec::new();
+    if let Some(dir) = cursor_history_dir() {
+        match HistoryStore::load_cursor(&dir) {
+            Ok(mut e) => entries.append(&mut e),
+            Err(e) => eprintln!("recap: cursor history failed: {e}"),
+        }
+    }
+    if let Some(dir) = claude::projects_dir() {
+        match claude::load(&dir) {
+            Ok(mut e) => entries.append(&mut e),
+            Err(e) => eprintln!("recap: claude history failed: {e}"),
+        }
+    }
+    let store = HistoryStore::from_entries(entries);
 
     let mut app = App::new(store);
     app.absolute_time = absolute_time;

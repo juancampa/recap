@@ -1,5 +1,6 @@
 use crate::app::{App, DisplayRow, Panel};
 use crate::diff::{DiffLine, DiffSummary};
+use crate::history::EditSource;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -12,6 +13,17 @@ use ratatui::{
 };
 
 const ORANGE: Color = Color::Rgb(220, 120, 20);
+const CURSOR_COLOR: Color = Color::Rgb(120, 170, 255);
+const CLAUDE_COLOR: Color = Color::Rgb(217, 119, 87);
+const SOURCE_WIDTH: usize = 6;
+
+fn source_span(src: EditSource) -> Span<'static> {
+    let (label, color) = match src {
+        EditSource::Cursor => ("cursor", CURSOR_COLOR),
+        EditSource::ClaudeCode => ("claude", CLAUDE_COLOR),
+    };
+    Span::styled(format!("{:<width$}", label, width = SOURCE_WIDTH), Style::default().fg(color))
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -243,12 +255,12 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     let entry_idx = group.entry_indices[0];
                     let entry = &app.store.entries[entry_idx];
                     let ts = app.timestamp_str(&entry.timestamp);
-                    let path = entry.short_path(3);
+                    let path = entry.display_path();
                     let count = group.entry_indices.len();
                     let time_color = if epochs[*gi] == 0 { Color::Yellow } else { ORANGE };
                     let summary = app.diff_summaries.get(&entry_idx);
 
-                    let mut spans = Vec::with_capacity(8);
+                    let mut spans = Vec::with_capacity(10);
                     if single {
                         spans.push(Span::raw("  "));
                     } else {
@@ -262,6 +274,8 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         format!("{:<8}", ts),
                         Style::default().fg(time_color),
                     ));
+                    spans.push(Span::raw(" "));
+                    spans.push(source_span(entry.source));
                     spans.push(Span::raw(" "));
                     spans.extend(summary_spans(summary));
                     spans.push(Span::raw(" "));
@@ -285,12 +299,14 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     let time_color = if epochs[*group_idx] == 0 { Color::Yellow } else { ORANGE };
                     let summary = app.diff_summaries.get(&entry_idx);
 
-                    let mut spans = Vec::with_capacity(6);
+                    let mut spans = Vec::with_capacity(8);
                     spans.push(Span::raw("    "));
                     spans.push(Span::styled(
                         format!("{:<8}", ts),
                         Style::default().fg(time_color),
                     ));
+                    spans.push(Span::raw(" "));
+                    spans.push(source_span(entry.source));
                     spans.push(Span::raw(" "));
                     spans.extend(summary_spans(summary));
                     spans.push(Span::raw(" "));
@@ -330,7 +346,7 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
     // Title shows the current file path
     let title = app
         .current_entry()
-        .map(|e| format!(" {} ", e.short_path(4)))
+        .map(|e| format!(" {} ", e.display_path()))
         .unwrap_or_else(|| " Diff ".to_string());
 
     let block = Block::default()
