@@ -8,6 +8,13 @@ pub enum DiffLine {
     Removed(String),
     Context(String),
     Header(String),
+    /// One line of a prompt entry's body. Rendered in light blue, with
+    /// a `> ` prefix on the first line.
+    Prompt(String),
+    /// Per-child separator emitted when a collapsed group's diff is the
+    /// concatenation of its children. The renderer formats this with the
+    /// same spans the history panel uses, keyed by `entry_idx`.
+    ChildSeparator { entry_idx: usize },
 }
 
 #[derive(Debug, Clone, Copy)]

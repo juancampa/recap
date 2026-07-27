@@ -10,11 +10,12 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-use crate::history::{find_project_chain, EditSource, HistoryEntry};
+use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind};
 
 #[derive(Debug, Deserialize)]
 struct Line {
@@ -27,6 +28,7 @@ struct Line {
     message: Option<MessageField>,
     #[serde(rename = "toolUseResult")]
     tool_use_result: Option<Value>,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,15 +48,23 @@ fn cache_root() -> PathBuf {
     PathBuf::from(home).join(".cache/recap/claude")
 }
 
-pub fn load(projects_dir: &Path) -> Result<Vec<HistoryEntry>> {
-    let mut entries = Vec::new();
+/// Scan all Claude project dirs, emitting one batch per session via
+/// `on_batch`. Sessions are processed newest-first (sorted by `.jsonl`
+/// mtime descending). `on_batch` returning `false` aborts the scan.
+pub fn load(
+    projects_dir: &Path,
+    mtimes: &mut HashMap<PathBuf, SystemTime>,
+    seen_keys: &mut HashSet<PathBuf>,
+    on_batch: &mut dyn FnMut(Vec<HistoryEntry>) -> bool,
+) -> Result<()> {
     let mut chain_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
     let read = match fs::read_dir(projects_dir) {
         Ok(r) => r,
-        Err(_) => return Ok(entries),
+        Err(_) => return Ok(()),
     };
 
+    let mut sessions: Vec<(PathBuf, SystemTime)> = Vec::new();
     for proj in read.flatten() {
         let proj_path = proj.path();
         if !proj_path.is_dir() {
@@ -69,19 +79,39 @@ pub fn load(projects_dir: &Path) -> Result<Vec<HistoryEntry>> {
             if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Err(e) = load_session(&p, &mut entries, &mut chain_cache) {
-                eprintln!("recap: skipped session {}: {e}", p.display());
+            let Some(mtime) = fs::metadata(&p).ok().and_then(|m| m.modified().ok()) else {
+                continue;
+            };
+            // Skip session files whose jsonl hasn't grown since the last scan.
+            if let Some(prev) = mtimes.get(&p).copied()
+                && mtime <= prev
+            {
+                continue;
             }
+            sessions.push((p, mtime));
+        }
+    }
+    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (path, mtime) in sessions {
+        let mut batch: Vec<HistoryEntry> = Vec::new();
+        if let Err(e) = load_session(&path, &mut batch, &mut chain_cache, seen_keys) {
+            eprintln!("recap: skipped session {}: {e}", path.display());
+        }
+        mtimes.insert(path, mtime);
+        if !batch.is_empty() && !on_batch(batch) {
+            return Ok(());
         }
     }
 
-    Ok(entries)
+    Ok(())
 }
 
 fn load_session(
     path: &Path,
     out: &mut Vec<HistoryEntry>,
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    seen_keys: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let raw_lines: Vec<Line> = content
@@ -124,9 +154,30 @@ fn load_session(
         .to_string();
     let session_cache = cache_root().join(&session_id);
 
+    // The session's working directory, taken from the first line that records
+    // one (a session stays in a single cwd). Used as the `claude --resume`
+    // launch directory. `mode`/snapshot lines carry no cwd, so scan for the
+    // first non-empty value.
+    let session_cwd: Option<PathBuf> = raw_lines
+        .iter()
+        .find_map(|l| l.cwd.as_deref().filter(|c| !c.is_empty()))
+        .map(PathBuf::from);
+
     let mut state: HashMap<PathBuf, String> = HashMap::new();
 
     for line in &raw_lines {
+        // User-typed prompt: emit a Prompt entry. Tool results also use
+        // type=="user" but their content is an array of tool_result items;
+        // genuine prompts are either a string or an array of text-only items.
+        if line.kind.as_deref() == Some("user") {
+            if let Some(entry) = extract_prompt(line, &session_id, chain_cache)
+                && !seen_keys.contains(&entry.file_path)
+            {
+                seen_keys.insert(entry.file_path.clone());
+                out.push(entry);
+            }
+            continue;
+        }
         if line.kind.as_deref() != Some("assistant") {
             continue;
         }
@@ -226,22 +277,105 @@ fn load_session(
                 continue;
             };
 
+            if seen_keys.contains(&snapshot_path) {
+                continue;
+            }
+
             let project_roots = chain_cache
                 .entry(file_path.clone())
                 .or_insert_with(|| find_project_chain(&file_path))
                 .clone();
 
+            seen_keys.insert(snapshot_path.clone());
             out.push(HistoryEntry {
                 timestamp,
                 file_path,
                 snapshot_path,
                 project_roots,
                 source: EditSource::ClaudeCode,
+                kind: HistoryEntryKind::FileChange,
+                session_id: Some(session_id.clone()),
+                session_cwd: session_cwd.clone(),
             });
         }
     }
 
     Ok(())
+}
+
+/// Pull a user-typed prompt out of a `type=="user"` line. Returns None when
+/// the line is a tool result (content is an array of tool_result items),
+/// when the prompt text is empty, or when required fields are missing.
+fn extract_prompt(
+    line: &Line,
+    session_id: &str,
+    chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> Option<HistoryEntry> {
+    let msg = line.message.as_ref()?;
+    if msg.role.as_deref() != Some("user") {
+        return None;
+    }
+    let content = msg.content.as_ref()?;
+
+    let text = if let Some(s) = content.as_str() {
+        s.to_string()
+    } else if let Some(arr) = content.as_array() {
+        let mut buf = String::new();
+        for item in arr {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                        if !buf.is_empty() {
+                            buf.push('\n');
+                        }
+                        buf.push_str(t);
+                    }
+                }
+                // Any non-text item (most importantly tool_result) means this
+                // isn't a typed prompt — bail.
+                _ => return None,
+            }
+        }
+        buf
+    } else {
+        return None;
+    };
+
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let ts_str = line.timestamp.as_ref()?;
+    let ts = DateTime::parse_from_rfc3339(ts_str).ok()?;
+    let timestamp: DateTime<Local> = ts.with_timezone(&Local);
+
+    // `find_project_chain` walks ancestors of a *file*, so feed it a
+    // pseudo-child of cwd so cwd itself can show up in the chain.
+    let cwd = line.cwd.as_deref().unwrap_or("");
+    let project_roots: Vec<PathBuf> = if cwd.is_empty() {
+        Vec::new()
+    } else {
+        let cwd_path = PathBuf::from(cwd);
+        let probe = cwd_path.join(".");
+        chain_cache
+            .entry(probe.clone())
+            .or_insert_with(|| find_project_chain(&probe))
+            .clone()
+    };
+
+    let uuid = line.uuid.clone().unwrap_or_default();
+    let synthetic = PathBuf::from(format!("claude:{session_id}:{uuid}"));
+
+    Some(HistoryEntry {
+        timestamp,
+        file_path: synthetic,
+        snapshot_path: PathBuf::new(),
+        project_roots,
+        source: EditSource::ClaudeCode,
+        kind: HistoryEntryKind::Prompt { text },
+        session_id: Some(session_id.to_string()),
+        session_cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
+    })
 }
 
 fn apply_edit(
