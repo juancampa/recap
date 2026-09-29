@@ -1,0 +1,7 @@
+- [Cursor edit→agent attribution](memory/cursor-agent-attribution.md) — how recap ties Cursor Local-History snapshots to the composer (agent session) that made them
+- [Content search performance](memory/cursor-content-search-perf.md) — why `f` prefilters snapshots and scans on all cores
+- [Semantic search](memory/semantic-search.md) — how `F` embeds, stores and ranks entries, and what it costs
+- [Agent responses](memory/agent-responses.md) — where the final response of each turn lives in the Claude JSONL and Cursor DB, and the corpus size
+- [History row heights](memory/history-row-heights.md) — the row-height cache goes stale after a refilter, and scroll math must refresh it
+- [Blame](memory/blame.md) — how `recap blame` votes a hunk to a session and prompt, and its limits
+- [Session titles](memory/session-titles.md) — where the title of a Claude Code and a Cursor session comes from

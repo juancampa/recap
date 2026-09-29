@@ -1,16 +1,22 @@
 mod app;
+mod blame;
 mod claude;
 mod cursor_sessions;
 mod cursor_workspace;
 mod diff;
+mod embed;
 mod history;
+mod log;
 mod nvim;
 mod persist;
+mod prompt;
+mod search_history;
 mod session;
+mod settings;
 mod ui;
 
 use anyhow::Result;
-use app::{App, Sources};
+use app::{App, KindFilter, Sources};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -21,20 +27,27 @@ use crossterm::{
 };
 use history::{EditSource, HistoryStore};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use serde::Serialize;
 use std::{
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
-fn copy_to_clipboard(path: &Path) {
-    let s = path.to_string_lossy();
-    let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else {
+fn copy_to_clipboard(text: &str) {
+    // `pbcopy` inherits the terminal unless the caller says otherwise. Its
+    // output would paint over the TUI, so send it to /dev/null.
+    let Ok(mut child) = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
         return;
     };
     if let Some(stdin) = child.stdin.as_mut() {
-        let _ = stdin.write_all(s.as_bytes());
+        let _ = stdin.write_all(text.as_bytes());
     }
     let _ = child.wait();
 }
@@ -242,8 +255,328 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
+/// Build the embedding index without the TUI, then run one query against it.
+/// The first build of the diff index needs 10 to 20 minutes, so it helps to
+/// run it in a plain terminal and watch the progress.
+fn run_index_cli(app: &mut App, queries: &[String]) -> Result<()> {
+    use app::EmbedStatus;
+    use std::time::Instant;
+
+    load_store(app);
+
+    app.start_embedding(true);
+    let build = Instant::now();
+    let mut last_done = usize::MAX;
+    loop {
+        app.drain_embed_events();
+        match app.embed.status.clone() {
+            EmbedStatus::Ready => break,
+            EmbedStatus::Failed(e) => return Err(anyhow::anyhow!(e)),
+            EmbedStatus::Off => break,
+            EmbedStatus::Starting | EmbedStatus::Indexing => {}
+        }
+        if app.embed.done != last_done {
+            last_done = app.embed.done;
+            let rate = app.embed.done as f32 / build.elapsed().as_secs_f32().max(0.001);
+            eprint!(
+                "\rembedded {}/{} ({rate:.0}/s)      ",
+                app.embed.done, app.embed.total
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!(
+        "\nindex ready: {} vectors ({} prompts, {} edits) in {:.0}s",
+        app.embed.index.len(),
+        app.embed.index.count_of(embed::EmbedKind::Prompt),
+        app.embed.index.count_of(embed::EmbedKind::Diff),
+        build.elapsed().as_secs_f32()
+    );
+
+    for q in queries {
+        let asked = Instant::now();
+        app.semantic_search(q, 50);
+        println!("\nquery: {q}   ({:.0} ms)", asked.elapsed().as_secs_f32() * 1000.0);
+        for (rank, m) in app.search.matches.iter().take(15).enumerate() {
+            let entry = &app.store.entries[m.entry_idx];
+            let kind = if entry.is_prompt() { "prompt" } else { "edit  " };
+            println!(
+                "{:>2}. {:.3} {kind} {} {}",
+                rank + 1,
+                m.score as f32 / 10_000.0,
+                entry.timestamp.format("%Y-%m-%d"),
+                entry.display_path(&app.store.project_names)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Load the whole history without the TUI. Progress goes to stderr.
+fn load_store(app: &mut App) {
+    let started = std::time::Instant::now();
+    // `recap list` calls this again for each widening of its period. Only the
+    // first call starts from an empty store, so only it prints the header.
+    if app.store.entries.is_empty() {
+        eprintln!("loading history…");
+    }
+    app.start_background_load();
+    while app.loading {
+        app.drain_load_events(50);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!(
+        "{} entries in {:.1}s",
+        app.store.entries.len(),
+        started.elapsed().as_secs_f32()
+    );
+}
+
+/// `recap blame [--stdin] [--] [<git diff args>...]`: attribute the hunks of
+/// a diff to the sessions and prompts that produced them, as JSON on stdout.
+/// The diff comes from stdin with `--stdin`, else from `git diff <args>`
+/// (default `HEAD`) in the current directory. A test of "is stdin a
+/// terminal" is not enough: an agent harness runs the command with a stdin
+/// that is not a terminal and never closes, and the read then never ends.
+fn run_blame_cli(app: &mut App, git_args: &[String], stdin: bool) -> Result<()> {
+    let root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("cannot run git: {e}"))?;
+    if !root.status.success() {
+        anyhow::bail!("recap blame: the current directory is not in a git repository");
+    }
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&root.stdout).trim_end());
+
+    let diff_text = if stdin {
+        let mut text = String::new();
+        io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        let mut cmd = Command::new("git");
+        cmd.args(["diff", "--no-color"]);
+        if git_args.is_empty() {
+            cmd.arg("HEAD");
+        } else {
+            cmd.args(git_args);
+        }
+        let out = cmd.output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            );
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let files = blame::parse_unified(&diff_text);
+    load_store(app);
+    let bash = match claude::projects_dir() {
+        Some(dir) => claude::bash_calls(&dir),
+        None => Vec::new(),
+    };
+    let blames = blame::attribute(&app.store, &files, &repo_root, &bash);
+    let unattributed = blames.iter().filter(|b| b.winner.is_none()).count();
+    eprintln!(
+        "{} hunks in {} files, {unattributed} unattributed",
+        blames.len(),
+        files.len()
+    );
+    println!("{}", serde_json::to_string_pretty(&blames)?);
+    Ok(())
+}
+
+/// One row of the `recap list` JSON output. A field that belongs to one kind
+/// only stays absent for the other kind, so `jq` can select on `kind`.
+#[derive(Serialize)]
+struct ListRow<'a> {
+    timestamp: String,
+    /// "prompt" or "diff".
+    kind: &'a str,
+    source: EditSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_cwd: Option<&'a Path>,
+    /// The prompt text. Present for a prompt entry only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<&'a str>,
+    /// The final text of the agent for this prompt. Absent when the turn has
+    /// no final text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<&'a str>,
+    /// The edited file. Present for a file change only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<&'a Path>,
+    /// The file that holds the content after the edit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_path: Option<&'a Path>,
+    /// The file that holds the content before the edit. Absent for the first
+    /// snapshot of a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_path: Option<&'a Path>,
+}
+
+/// The longest period that `recap list` reads before it gives up on the
+/// count. A load of one year already reads almost every file.
+const LIST_WINDOW_CAP: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// Parse a period such as `30m`, `12h`, `7d` or `2w`. A plain number means
+/// days. Returns `None` for `all`, which reads the full history.
+fn parse_window(text: &str) -> Result<Option<Duration>> {
+    if text == "all" {
+        return Ok(None);
+    }
+    let (digits, unit) = match text.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&text[..i], &text[i..]),
+        None => (text, "d"),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--since: `{text}` is not a period such as 7d or 12h"))?;
+    let secs = match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 24 * 3600,
+        "w" => 7 * 24 * 3600,
+        _ => anyhow::bail!("--since: `{unit}` is not one of m, h, d, w"),
+    };
+    Ok(Some(Duration::from_secs(n * secs)))
+}
+
+/// Parse a `--filter` argument of `recap list`. The only key is `kind`, and
+/// its values are the `kind` values of the JSON output.
+fn parse_list_filter(text: &str) -> Result<KindFilter> {
+    match text.split_once('=') {
+        Some(("kind", "prompt")) => Ok(KindFilter::Prompts),
+        Some(("kind", "diff")) => Ok(KindFilter::Changes),
+        Some(("kind", value)) => {
+            anyhow::bail!("--filter: `{value}` is not one of prompt, diff")
+        }
+        _ => anyhow::bail!("--filter: `{text}` is not a filter such as kind=prompt"),
+    }
+}
+
+/// `recap list [-n <count>] [--since <period>] [--filter kind=<kind>]`: print
+/// the newest entries as JSON on stdout. The filter applies before the count,
+/// so `-n 5 --filter kind=prompt` prints the 5 newest prompts. The store sorts the entries newest first, so the command
+/// takes a prefix. Progress goes to stderr, which keeps stdout parsable.
+///
+/// `window` limits the files that the loaders read, which is what makes the
+/// command fast. A short period can hold fewer entries than `limit`, so the
+/// command doubles the period and loads again until it has enough matching
+/// entries or
+/// it reaches [`LIST_WINDOW_CAP`]. The second load is incremental: the
+/// loaders remember the files that they already read.
+fn run_list_cli(
+    app: &mut App,
+    limit: usize,
+    window: Option<Duration>,
+    filter: KindFilter,
+) -> Result<()> {
+    let mut window = window;
+    loop {
+        app.load_since = window.map(|w| SystemTime::now() - w);
+        load_store(app);
+        if app.store.entries.iter().filter(|e| filter.keeps(e)).count() >= limit {
+            break;
+        }
+        match window {
+            None => break,
+            Some(w) if w >= LIST_WINDOW_CAP => break,
+            Some(w) => window = Some(w.saturating_mul(2).min(LIST_WINDOW_CAP)),
+        }
+    }
+    let store = &app.store;
+    let rows: Vec<ListRow> = store
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| filter.keeps(e))
+        .take(limit)
+        .map(|(i, e)| {
+            let is_prompt = e.is_prompt();
+            let project = e.project_root();
+            ListRow {
+                timestamp: e.timestamp.to_rfc3339(),
+                kind: if is_prompt { "prompt" } else { "diff" },
+                source: e.source,
+                project,
+                project_name: project
+                    .and_then(|p| store.project_names.get(p))
+                    .map(String::as_str),
+                session_id: e.session_id.as_deref(),
+                session_title: e
+                    .session_id
+                    .as_deref()
+                    .and_then(|s| store.session_titles.get(s))
+                    .map(String::as_str),
+                session_cwd: e.session_cwd.as_deref(),
+                prompt: e.prompt_text(),
+                response: e.response_text(),
+                file: (!is_prompt).then(|| e.file_path.as_path()),
+                snapshot_path: (!is_prompt).then(|| e.snapshot_path.as_path()),
+                base_path: if is_prompt {
+                    None
+                } else {
+                    store.prev_snapshot(i)
+                },
+            }
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let absolute_time = std::env::args().any(|a| a == "--absolute" || a == "-a");
+    let args: Vec<String> = std::env::args().collect();
+    let index_only = args.iter().any(|a| a == "--index");
+    let blame_cmd = args.get(1).map(String::as_str) == Some("blame");
+    let list_cmd = args.get(1).map(String::as_str) == Some("list");
+    // `recap list [-n <count>]`. The default keeps the output small enough to
+    // read, and a caller that wants more passes a larger count.
+    let list_limit = args
+        .iter()
+        .position(|a| a == "-n" || a == "--limit")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
+    // The loaders read only the files that changed within this period. The
+    // default keeps the command fast; `--since all` reads everything.
+    let list_window = match args.iter().position(|a| a == "--since") {
+        Some(i) => parse_window(args.get(i + 1).map(String::as_str).unwrap_or("7d"))?,
+        None => Some(Duration::from_secs(7 * 24 * 3600)),
+    };
+    let list_filter = match args.iter().position(|a| a == "--filter") {
+        Some(i) => parse_list_filter(args.get(i + 1).map(String::as_str).unwrap_or(""))?,
+        None => KindFilter::All,
+    };
+    let blame_stdin = blame_cmd && args[2..].iter().any(|a| a == "--stdin");
+    // `recap blame [--stdin] [--] <git diff args>`: the rest goes to git.
+    let git_args: Vec<String> = if blame_cmd {
+        args[2..]
+            .iter()
+            .filter(|a| *a != "--" && *a != "--stdin")
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // `--query` may repeat, so one index run can answer several questions.
+    let queries: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--query")
+        .filter_map(|(i, _)| args.get(i + 1).cloned())
+        .collect();
 
     // Chain a terminal-restore step in front of the default panic handler so
     // backtraces aren't mangled by raw mode / the alternate screen.
@@ -261,9 +594,23 @@ fn main() -> Result<()> {
 
     let mut app = App::new(store, sources);
     let persisted = persist::PersistedState::load();
-    app.apply_persisted(&persisted);
+    // The index command searches the whole corpus. A persisted project or file
+    // selection would narrow the groups that the query ranks, so skip it.
+    if !index_only && !blame_cmd && !list_cmd {
+        app.apply_persisted(&persisted);
+    }
     // CLI flag forces absolute time on; otherwise honor the persisted toggle.
     app.absolute_time = absolute_time || persisted.absolute_time;
+
+    if index_only {
+        return run_index_cli(&mut app, &queries);
+    }
+    if blame_cmd {
+        return run_blame_cli(&mut app, &git_args, blame_stdin);
+    }
+    if list_cmd {
+        return run_list_cli(&mut app, list_limit, list_window, list_filter);
+    }
     app.start_background_load();
 
     enable_raw_mode()?;
@@ -283,14 +630,19 @@ fn main() -> Result<()> {
 
 /// Compute the panel rectangles using the same layout the renderer uses.
 /// The bottom row is reserved for the help bar; we strip it before splitting.
-fn current_layout(size: Rect, projects_active: bool, files_active: bool) -> ui::LayoutRects {
+fn current_layout(
+    size: Rect,
+    projects_active: bool,
+    files_active: bool,
+    agent_mode: bool,
+) -> ui::LayoutRects {
     let content = Rect {
         x: size.x,
         y: size.y,
         width: size.width,
         height: size.height.saturating_sub(1),
     };
-    ui::compute_layout(content, projects_active, files_active)
+    ui::compute_layout(content, projects_active, files_active, agent_mode)
 }
 
 /// Translate a click inside a panel's outer rect to a 0-based row index in
@@ -310,10 +662,24 @@ fn click_to_row(panel: Rect, mx: u16, my: u16) -> Option<usize> {
     Some((my - inner_y) as usize)
 }
 
+/// Map a mouse position to a cell of `panel`'s inner rect, as
+/// `(row, col)`. The position clamps to the inner rect, so a drag that leaves
+/// the panel still names its nearest cell instead of ending the selection.
+fn click_to_cell(panel: Rect, mx: u16, my: u16) -> (usize, usize) {
+    let inner_x = panel.x + 1;
+    let inner_y = panel.y + 1;
+    let last_col = panel.width.saturating_sub(3);
+    let last_row = panel.height.saturating_sub(3);
+    let row = my.saturating_sub(inner_y).min(last_row);
+    let col = mx.saturating_sub(inner_x).min(last_col);
+    (row as usize, col as usize)
+}
+
 fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     app: &mut App,
     me: MouseEvent,
@@ -322,6 +688,7 @@ fn handle_mouse(
     visible_projects: usize,
     visible_files: usize,
     visible_diff: usize,
+    visible_agents: usize,
 ) {
     // Roughly emulate a 3-line scroll wheel step.
     const SCROLL_STEP: usize = 3;
@@ -344,6 +711,13 @@ fn handle_mouse(
                     let target = app.file_scroll + row;
                     select_file(app, target, visible_files);
                 }
+            } else if let Some(agents) = rects.agents
+                && rect_contains(agents, me.column, me.row)
+            {
+                app.active_panel = app::Panel::Agents;
+                if let Some(row) = click_to_row(agents, me.column, me.row) {
+                    app.select_agent_row(app.agent_scroll + row, visible_agents);
+                }
             } else if rect_contains(rects.history, me.column, me.row) {
                 app.active_panel = app::Panel::History;
                 if let Some(row) = click_to_row(rects.history, me.column, me.row) {
@@ -351,9 +725,31 @@ fn handle_mouse(
                         select_history_row(app, target, visible_history);
                     }
                 }
-            } else if let Some(diff) = rects.diff {
-                if rect_contains(diff, me.column, me.row) {
-                    app.active_panel = app::Panel::Diff;
+            } else if let Some(diff) = rects.diff
+                && rect_contains(diff, me.column, me.row)
+            {
+                app.active_panel = app::Panel::Diff;
+                let (row, col) = click_to_cell(diff, me.column, me.row);
+                app.diff_select_start(row, col);
+            }
+            // A click outside the Diff panel drops the selection it held.
+            if app.active_panel != app::Panel::Diff {
+                app.diff_select_clear();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(diff) = rects.diff {
+                let (row, col) = click_to_cell(diff, me.column, me.row);
+                app.diff_select_to(row, col);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // The drag ended. Put the selected text on the clipboard, so the
+            // user needs no second key to copy it.
+            if let Some(diff) = rects.diff {
+                let inner_width = (diff.width as usize).saturating_sub(2);
+                if let Some(text) = ui::diff_selection_text(app, inner_width, visible_diff) {
+                    copy_to_clipboard(&text);
                 }
             }
         }
@@ -363,6 +759,7 @@ fn handle_mouse(
                 match target {
                     Some(app::Panel::Projects) => app.project_down(visible_projects),
                     Some(app::Panel::Files) => app.file_down(visible_files),
+                    Some(app::Panel::Agents) => app.agent_down(visible_agents),
                     Some(app::Panel::History) => app.history_down(visible_history),
                     Some(app::Panel::Diff) => app.diff_down(),
                     None => {}
@@ -376,6 +773,7 @@ fn handle_mouse(
                 match target {
                     Some(app::Panel::Projects) => app.project_up(visible_projects),
                     Some(app::Panel::Files) => app.file_up(visible_files),
+                    Some(app::Panel::Agents) => app.agent_up(visible_agents),
                     Some(app::Panel::History) => app.history_up(visible_history),
                     Some(app::Panel::Diff) => app.diff_up(),
                     None => {}
@@ -391,6 +789,8 @@ fn panel_under(rects: ui::LayoutRects, x: u16, y: u16) -> Option<app::Panel> {
         Some(app::Panel::Projects)
     } else if rects.files.is_some_and(|r| rect_contains(r, x, y)) {
         Some(app::Panel::Files)
+    } else if rects.agents.is_some_and(|r| rect_contains(r, x, y)) {
+        Some(app::Panel::Agents)
     } else if rect_contains(rects.history, x, y) {
         Some(app::Panel::History)
     } else if rects.diff.is_some_and(|r| rect_contains(r, x, y)) {
@@ -484,7 +884,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         };
         let projects_active = app.active_panel == app::Panel::Projects;
         let files_active = app.active_panel == app::Panel::Files;
-        let rects = current_layout(area, projects_active, files_active);
+        let rects = current_layout(
+            area,
+            projects_active,
+            files_active,
+            app.mode == app::Mode::Agent,
+        );
 
         // History has a footer carved off its bottom, so its list height is
         // smaller than the other panels'; derive each from its actual rect.
@@ -502,17 +907,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             .files
             .map(|r| (r.height as usize).saturating_sub(2))
             .unwrap_or(full);
+        let visible_agents = rects
+            .agents
+            .map(|r| (r.height as usize).saturating_sub(2))
+            .unwrap_or(full);
 
         app.drain_load_events(visible_history);
+        app.drain_embed_events();
+        app.maybe_run_pending_search(visible_history);
         app.maybe_rescan_running();
         app.ensure_summaries_visible(visible_history);
         let list_width = (rects.history.width as usize).saturating_sub(2);
         app.recompute_row_heights(list_width, visible_history);
+        app.set_diff_height(visible_diff);
         terminal.draw(|f| ui::draw(f, app))?;
 
         // While the background loader is running, poll more aggressively so
-        // freshly-arrived batches surface within ~30ms instead of 100ms.
-        let poll_ms = if app.loading { 30 } else { 100 };
+        // freshly-arrived batches surface within ~30ms instead of 100ms. Same
+        // for a debounced content search: the loop has to come back around for
+        // `maybe_run_pending_search` to fire it.
+        let poll_ms = if app.loading || app.search.scan_pending() {
+            30
+        } else {
+            100
+        };
         if event::poll(Duration::from_millis(poll_ms))? {
             let ev = event::read()?;
             match ev {
@@ -525,6 +943,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         visible_projects,
                         visible_files,
                         visible_diff,
+                        visible_agents,
                     );
                 }
                 Event::Key(key) => {
@@ -541,9 +960,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     if app.search.phase == app::SearchPhase::Typing {
                         match key.code {
                             KeyCode::Esc => app.search_cancel(visible_history),
-                            KeyCode::Enter => app.search_commit(),
+                            KeyCode::Enter => app.search_commit(visible_history),
                             KeyCode::Backspace => app.search_pop_char(visible_history),
                             KeyCode::Char('c') if ctrl => app.search_cancel(visible_history),
+                            // Vim's command line: Up and Down walk the queries
+                            // this prompt remembers.
+                            KeyCode::Up => app.search_history_older(visible_history),
+                            KeyCode::Down => app.search_history_newer(visible_history),
                             KeyCode::Char(c) => app.search_push_char(c, visible_history),
                             _ => {}
                         }
@@ -557,6 +980,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             KeyCode::Char('c') if ctrl => {
                                 app.project_search_cancel(visible_projects)
                             }
+                            KeyCode::Up => app.project_search_history_older(visible_projects),
+                            KeyCode::Down => app.project_search_history_newer(visible_projects),
                             KeyCode::Char(c) => app.project_search_push_char(c, visible_projects),
                             _ => {}
                         }
@@ -568,6 +993,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             KeyCode::Enter => app.file_search_commit(),
                             KeyCode::Backspace => app.file_search_pop_char(visible_files),
                             KeyCode::Char('c') if ctrl => app.file_search_cancel(visible_files),
+                            KeyCode::Up => app.file_search_history_older(visible_files),
+                            KeyCode::Down => app.file_search_history_newer(visible_files),
                             KeyCode::Char(c) => app.file_search_push_char(c, visible_files),
                             _ => {}
                         }
@@ -579,7 +1006,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             KeyCode::Enter => app.diff_search_commit(),
                             KeyCode::Backspace => app.diff_search_pop_char(),
                             KeyCode::Char('c') if ctrl => app.diff_search_cancel(),
+                            KeyCode::Up => app.diff_search_history_older(),
+                            KeyCode::Down => app.diff_search_history_newer(),
                             KeyCode::Char(c) => app.diff_search_push_char(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // The settings menu takes every key while it is open.
+                    if app.settings_menu.open {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+                                app.settings_menu.open = false;
+                            }
+                            KeyCode::Char('c') if ctrl => break,
+                            KeyCode::Char('j') | KeyCode::Down => app.settings_menu.down(),
+                            KeyCode::Char('k') | KeyCode::Up => app.settings_menu.up(),
+                            KeyCode::Char(' ') | KeyCode::Enter => {
+                                app.toggle_selected_setting(visible_history);
+                            }
                             _ => {}
                         }
                         continue;
@@ -588,6 +1034,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if ctrl => break,
+                        KeyCode::Char('S') => app.toggle_settings_menu(),
                         KeyCode::Char('z') if ctrl => suspend_self(terminal)?,
                         KeyCode::Esc => {
                             // Vim's `:noh`: hide highlights but keep the search
@@ -598,7 +1045,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                                 app::Panel::History => app.search_hide(),
                                 app::Panel::Projects => app.project_search_hide(),
                                 app::Panel::Files => app.file_search_hide(),
-                                app::Panel::Diff => app.diff_search_hide(),
+                                app::Panel::Diff => {
+                                    app.diff_select_clear();
+                                    app.diff_search_hide();
+                                }
+                                app::Panel::Agents => {}
                             }
                         }
                         KeyCode::Tab => {
@@ -623,19 +1074,37 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                         KeyCode::Char('<') if app.active_panel == app::Panel::History => {
                             app.dec_prompt_lines();
                         }
+                        KeyCode::Char('p') if app.active_panel == app::Panel::History => {
+                            app.cycle_kind_filter(visible_history);
+                        }
+                        KeyCode::Char('m') => app.toggle_mode(visible_history, visible_agents),
                         KeyCode::Char('t') => app.toggle_time(),
                         KeyCode::Char('y') => {
-                            if let Some(p) = app.selected_path() {
-                                copy_to_clipboard(&p);
+                            // A mouse selection in the Diff panel wins over
+                            // the whole-entry copy, because the user marked
+                            // the exact text they want.
+                            let selected = rects.diff.and_then(|d| {
+                                let w = (d.width as usize).saturating_sub(2);
+                                ui::diff_selection_text(app, w, visible_diff)
+                            });
+                            if let Some(text) = selected {
+                                copy_to_clipboard(&text);
+                            } else if let Some((text, _)) = app.copy_target() {
+                                copy_to_clipboard(&text);
+                            }
+                        }
+                        KeyCode::Char('Y') => {
+                            if let Some(text) = app.copy_response_target() {
+                                copy_to_clipboard(&text);
                             }
                         }
                         KeyCode::Char('O') => {
-                            if let Some(entry) = app.current_entry() {
-                                if !entry.is_prompt() {
-                                    let path = entry.file_path.clone();
-                                    let source = entry.source;
-                                    open_entry(terminal, &path, source)?;
-                                }
+                            if app.can_open_file()
+                                && let Some(entry) = app.current_entry()
+                            {
+                                let path = entry.file_path.clone();
+                                let source = entry.source;
+                                open_entry(terminal, &path, source)?;
                             }
                         }
                         KeyCode::Char('o') => {
@@ -650,16 +1119,18 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app::Panel::Projects => app.project_search_open(),
                             app::Panel::Files => app.file_search_open(),
                             app::Panel::Diff => app.diff_search_open(),
+                            app::Panel::Agents => {}
                         },
+                        KeyCode::Char('F') if app.active_panel == app::Panel::History => {
+                            app.search_open_semantic();
+                        }
                         KeyCode::Char('f') if app.active_panel == app::Panel::History => {
                             app.search_open_content();
                         }
                         KeyCode::Char('n') if !ctrl && !shift => match app.active_panel {
-                            app::Panel::History
-                                if app.search.phase == app::SearchPhase::Active =>
-                            {
-                                app.search_next(visible_history)
-                            }
+                            // The History panel runs the last search again,
+                            // so `n` works after Esc dropped the matches.
+                            app::Panel::History => app.search_next(visible_history),
                             app::Panel::Projects
                                 if app.project_search.phase == app::SearchPhase::Active =>
                             {
@@ -678,11 +1149,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             _ => {}
                         },
                         KeyCode::Char('N') => match app.active_panel {
-                            app::Panel::History
-                                if app.search.phase == app::SearchPhase::Active =>
-                            {
-                                app.search_prev(visible_history)
-                            }
+                            // The History panel runs the last search again,
+                            // so `n` works after Esc dropped the matches.
+                            app::Panel::History => app.search_prev(visible_history),
                             app::Panel::Projects
                                 if app.project_search.phase == app::SearchPhase::Active =>
                             {
@@ -705,12 +1174,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app::Panel::History => app.history_down(visible_history),
                             app::Panel::Projects => app.project_down(visible_projects),
                             app::Panel::Files => app.file_down(visible_files),
+                            app::Panel::Agents => app.agent_down(visible_agents),
                             app::Panel::Diff => app.diff_down(),
                         },
                         KeyCode::Char('k') | KeyCode::Up => match app.active_panel {
                             app::Panel::History => app.history_up(visible_history),
                             app::Panel::Projects => app.project_up(visible_projects),
                             app::Panel::Files => app.file_up(visible_files),
+                            app::Panel::Agents => app.agent_up(visible_agents),
                             app::Panel::Diff => app.diff_up(),
                         },
 
@@ -718,12 +1189,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app::Panel::History => app.history_top(visible_history),
                             app::Panel::Projects => app.project_top(),
                             app::Panel::Files => app.file_top(),
+                            app::Panel::Agents => app.agent_top(visible_agents),
                             app::Panel::Diff => app.diff_top(),
                         },
                         KeyCode::Char('G') => match app.active_panel {
                             app::Panel::History => app.history_bottom(visible_history),
                             app::Panel::Projects => app.project_bottom(visible_projects),
                             app::Panel::Files => app.file_bottom(visible_files),
+                            app::Panel::Agents => app.agent_bottom(visible_agents),
                             app::Panel::Diff => app.diff_bottom(visible_diff),
                         },
 
@@ -732,12 +1205,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             app::Panel::History => app.history_page_down(visible_history),
                             app::Panel::Projects => app.project_page_down(visible_projects),
                             app::Panel::Files => app.file_page_down(visible_files),
+                            app::Panel::Agents => app.agent_page_down(visible_agents),
                             app::Panel::Diff => app.diff_page_down(visible_diff),
                         },
                         KeyCode::Char('u') if ctrl => match app.active_panel {
                             app::Panel::History => app.history_page_up(visible_history),
                             app::Panel::Projects => app.project_page_up(visible_projects),
                             app::Panel::Files => app.file_page_up(visible_files),
+                            app::Panel::Agents => app.agent_page_up(visible_agents),
                             app::Panel::Diff => app.diff_page_up(visible_diff),
                         },
 

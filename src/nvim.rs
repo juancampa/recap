@@ -61,7 +61,10 @@ pub fn undodir() -> Option<PathBuf> {
 /// the user's init.lua / init.vim, so a custom `set undodir=...` is picked
 /// up automatically. Returns the first listed entry that exists on disk.
 fn query_undodir_from_nvim() -> Option<PathBuf> {
+    // `output()` captures stdout and stderr, but stdin stays connected to the
+    // terminal. Headless nvim must not read the keys that the user types.
     let output = std::process::Command::new("nvim")
+        .stdin(std::process::Stdio::null())
         .args([
             "--headless",
             "-c",
@@ -123,10 +126,14 @@ fn cache_root() -> PathBuf {
 /// Scan the Neovim undodir, emitting one batch per undofile via `on_batch`.
 /// Undofiles are processed newest-first (sorted by mtime descending).
 /// `on_batch` returning `false` aborts the scan.
+/// Read the undofiles. `since` limits the scan: the loader skips a file whose
+/// mtime is older, because such a file holds no newer entry. `None` reads
+/// every file.
 pub fn load(
     undodir: &Path,
     mtimes: &mut HashMap<PathBuf, SystemTime>,
     seen_keys: &mut HashSet<PathBuf>,
+    since: Option<SystemTime>,
     on_batch: &mut dyn FnMut(Vec<HistoryEntry>) -> bool,
 ) -> Result<()> {
     let read = match fs::read_dir(undodir) {
@@ -148,6 +155,9 @@ pub fn load(
         {
             continue;
         }
+        if since.is_some_and(|cut| mtime < cut) {
+            continue;
+        }
         files.push((p, mtime));
     }
     files.sort_by(|a, b| b.1.cmp(&a.1));
@@ -156,7 +166,7 @@ pub fn load(
     for (path, mtime) in files {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         if let Err(e) = process_undofile(&path, &mut batch, &mut chain_cache, seen_keys) {
-            eprintln!("recap: skipped undofile {}: {e}", path.display());
+            crate::log_warn!("recap: skipped undofile {}: {e}", path.display());
         }
         mtimes.insert(path, mtime);
         if !batch.is_empty() && !on_batch(batch) {
@@ -231,6 +241,7 @@ fn process_undofile(
                 timestamp,
                 file_path: file_path.clone(),
                 snapshot_path,
+                base_path: None,
                 project_roots: project_roots.clone(),
                 source: EditSource::Neovim,
                 kind: HistoryEntryKind::FileChange,
@@ -294,7 +305,7 @@ fn write_snapshot(
         buf.push(b'\n');
     }
     if let Err(e) = fs::write(&path, &buf) {
-        eprintln!("recap: nvim snapshot write failed: {e}");
+        crate::log_warn!("recap: nvim snapshot write failed: {e}");
         return None;
     }
     Some(path)

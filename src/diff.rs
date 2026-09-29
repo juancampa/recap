@@ -8,9 +8,13 @@ pub enum DiffLine {
     Removed(String),
     Context(String),
     Header(String),
-    /// One line of a prompt entry's body. Rendered in light blue, with
-    /// a `> ` prefix on the first line.
+    /// One source line of a prompt entry's body. The renderer formats it
+    /// with the same wrapping, indent and Markdown highlighting the History
+    /// panel uses (see `ui::prompt_line_spans`).
     Prompt(String),
+    /// One source line of the agent's final response to a prompt entry. The
+    /// renderer formats it like a `Prompt` line, in the response color.
+    Response(String),
     /// Per-child separator emitted when a collapsed group's diff is the
     /// concatenation of its children. The renderer formats this with the
     /// same spans the history panel uses, keyed by `entry_idx`.
@@ -62,7 +66,13 @@ pub fn build_diff(old_path: Option<&Path>, new_path: &Path) -> Vec<DiffLine> {
         None => String::new(),
     };
 
-    let diff = TextDiff::from_lines(&old_content, &new_content);
+    build_diff_from(&old_content, &new_content)
+}
+
+/// The body of [`build_diff`], for a caller that already holds both contents.
+/// The content search reads each snapshot once and reuses it here.
+pub fn build_diff_from(old_content: &str, new_content: &str) -> Vec<DiffLine> {
+    let diff = TextDiff::from_lines(old_content, new_content);
     let mut lines: Vec<DiffLine> = Vec::new();
 
     for group in diff.grouped_ops(3) {

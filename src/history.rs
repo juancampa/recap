@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone};
 use percent_encoding::percent_decode_str;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 #[derive(Debug, Deserialize)]
@@ -20,7 +21,8 @@ struct RawEntry {
     timestamp: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EditSource {
     Cursor,
     ClaudeCode,
@@ -34,8 +36,14 @@ pub enum HistoryEntryKind {
     FileChange,
     /// A user prompt sent to the LLM. `snapshot_path` is unused; `file_path`
     /// is a synthetic unique key (e.g. `claude:<session>:<uuid>`) that keeps
-    /// `build_groups` from coalescing distinct prompts.
-    Prompt { text: String },
+    /// `build_groups` from coalescing distinct prompts. `response` is the
+    /// final text the agent wrote for this prompt, after its last tool use.
+    /// `None` when the turn has no final text: an interrupted turn, a queued
+    /// prompt, or a session that still runs.
+    Prompt {
+        text: String,
+        response: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +54,13 @@ pub struct HistoryEntry {
     pub file_path: PathBuf,
     /// The history snapshot file on disk. Empty for prompt entries.
     pub snapshot_path: PathBuf,
+    /// The content this entry's diff must start from, when the source records
+    /// it. Cursor agent edits carry the exact before-content of the tool call
+    /// (see [`crate::cursor_edits`]), which is more accurate than the
+    /// previous snapshot of the same file. `None` for every other source, and
+    /// then [`HistoryStore::prev_snapshot`] falls back to that previous
+    /// snapshot.
+    pub base_path: Option<PathBuf>,
     /// Containing projects, sorted outermost → innermost.
     /// Each entry contains a project marker (.git, Cargo.toml, etc).
     pub project_roots: Vec<PathBuf>,
@@ -79,7 +94,16 @@ impl HistoryEntry {
 
     pub fn prompt_text(&self) -> Option<&str> {
         match &self.kind {
-            HistoryEntryKind::Prompt { text } => Some(text),
+            HistoryEntryKind::Prompt { text, .. } => Some(text),
+            HistoryEntryKind::FileChange => None,
+        }
+    }
+
+    /// The agent's final response to a prompt entry. `None` for a file
+    /// change and for a prompt whose turn has no final text.
+    pub fn response_text(&self) -> Option<&str> {
+        match &self.kind {
+            HistoryEntryKind::Prompt { response, .. } => response.as_deref(),
             HistoryEntryKind::FileChange => None,
         }
     }
@@ -113,7 +137,7 @@ impl HistoryEntry {
         &self,
         names: &HashMap<PathBuf, String>,
     ) -> (Vec<String>, String) {
-        if let HistoryEntryKind::Prompt { text } = &self.kind {
+        if let HistoryEntryKind::Prompt { text, .. } = &self.kind {
             let chain = self.chain_names(names);
             return (chain, single_line(text));
         }
@@ -150,7 +174,7 @@ impl HistoryEntry {
 
 /// Collapse newlines and runs of whitespace into a single space, so a
 /// multi-line prompt fits in one row of the History panel.
-fn single_line(s: &str) -> String {
+pub fn single_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut last_space = false;
     for ch in s.chars() {
@@ -168,141 +192,6 @@ fn single_line(s: &str) -> String {
         out.pop();
     }
     out
-}
-
-/// Extra indent applied to soft-wrapped continuation lines so they read as
-/// visually distinct from lines produced by a real linebreak in the text.
-pub const WRAP_INDENT: usize = 2;
-
-/// One physical line produced by [`wrap_text`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WrappedLine {
-    pub text: String,
-    /// True when this line is a soft-wrap continuation of the previous one
-    /// (the renderer indents it by [`WRAP_INDENT`]). False for the very first
-    /// line and for the first line following a real linebreak in `text`.
-    pub continuation: bool,
-}
-
-/// Word-wrap `text` into at most `max_lines` lines of `width` columns. Real
-/// linebreaks (`\n`) in `text` are preserved: each starts a fresh, un-indented
-/// line. Lines produced by *soft* wrapping (a line too long for `width`) are
-/// flagged `continuation: true` and wrapped `WRAP_INDENT` columns narrower so
-/// the renderer can indent them without overflowing. Whitespace within a
-/// logical line is collapsed to single spaces; blank lines are dropped. Words
-/// longer than a line are hard-split. When the text doesn't fit in `max_lines`,
-/// the last line is truncated with a trailing `…`. Always returns between 1 and
-/// `max_lines` lines.
-pub fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<WrappedLine> {
-    let width = width.max(1);
-    let max_lines = max_lines.max(1);
-    let mut lines: Vec<WrappedLine> = Vec::new();
-
-    // Stop generating once we have one more line than we'll keep — that's
-    // enough to know the text overflowed, and it bounds work on huge prompts.
-    'outer: for para in text.split('\n') {
-        let para = single_line(para);
-        if para.is_empty() {
-            continue;
-        }
-        let mut cur = String::new();
-        let mut cur_len = 0usize;
-        // Whether the line currently being built is a soft-wrap continuation.
-        let mut cont = false;
-        // Available columns for the current line (continuations are narrower).
-        let line_width = |cont: bool| {
-            if cont {
-                width.saturating_sub(WRAP_INDENT).max(1)
-            } else {
-                width
-            }
-        };
-
-        for word in para.split(' ') {
-            let mut rest = word;
-            loop {
-                let lw = line_width(cont);
-                let wlen = rest.chars().count();
-                if cur_len == 0 {
-                    if wlen <= lw {
-                        cur.push_str(rest);
-                        cur_len = wlen;
-                        break;
-                    }
-                    // Hard-split a word longer than the whole line.
-                    let take_bytes = rest
-                        .char_indices()
-                        .nth(lw)
-                        .map(|(i, _)| i)
-                        .unwrap_or(rest.len());
-                    lines.push(WrappedLine {
-                        text: rest[..take_bytes].to_string(),
-                        continuation: cont,
-                    });
-                    if lines.len() > max_lines {
-                        break 'outer;
-                    }
-                    rest = &rest[take_bytes..];
-                    cont = true;
-                    continue;
-                } else if cur_len + 1 + wlen <= lw {
-                    cur.push(' ');
-                    cur.push_str(rest);
-                    cur_len += 1 + wlen;
-                    break;
-                } else {
-                    lines.push(WrappedLine {
-                        text: std::mem::take(&mut cur),
-                        continuation: cont,
-                    });
-                    cur_len = 0;
-                    cont = true;
-                    if lines.len() > max_lines {
-                        break 'outer;
-                    }
-                    // Reprocess this word on the fresh line.
-                    continue;
-                }
-            }
-        }
-        // Flush the last line of this paragraph (para is non-empty, so cur has
-        // content unless every word was hard-split into already-pushed lines).
-        if cur_len > 0 {
-            lines.push(WrappedLine {
-                text: cur,
-                continuation: cont,
-            });
-            if lines.len() > max_lines {
-                break 'outer;
-            }
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(WrappedLine {
-            text: String::new(),
-            continuation: false,
-        });
-    }
-
-    if lines.len() > max_lines {
-        lines.truncate(max_lines);
-        if let Some(last) = lines.last_mut() {
-            let lw = if last.continuation {
-                width.saturating_sub(WRAP_INDENT).max(1)
-            } else {
-                width
-            };
-            let mut chars: Vec<char> = last.text.chars().collect();
-            while chars.len() + 1 > lw {
-                chars.pop();
-            }
-            chars.push('…');
-            last.text = chars.into_iter().collect();
-        }
-    }
-
-    lines
 }
 
 fn short_path(path: &Path, n: usize) -> String {
@@ -331,8 +220,42 @@ const PROJECT_MARKERS: &[&str] = &[
     "go.mod",
 ];
 
-fn is_project_root(dir: &Path) -> bool {
-    PROJECT_MARKERS.iter().any(|m| dir.join(m).exists())
+/// What the loader knows about one directory. `Missing` means the directory
+/// does not exist, so no directory below it exists either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirState {
+    Missing,
+    Plain,
+    Root,
+}
+
+/// The directory states that [`find_project_chain`] found so far, for every
+/// loader thread. A `stat` under an automount such as `/home` on macOS costs
+/// 10 to 20 ms, and the loaders probe the same directories many thousand
+/// times, so each directory gets one probe per load.
+static DIR_STATES: Mutex<Option<HashMap<PathBuf, DirState>>> = Mutex::new(None);
+
+/// Forget every directory state. Call this before a reload, so a project
+/// marker that appeared after the last load gets a new probe.
+pub fn clear_dir_states() {
+    *DIR_STATES.lock().unwrap() = None;
+}
+
+fn dir_state(dir: &Path) -> DirState {
+    let mut guard = DIR_STATES.lock().unwrap();
+    let states = guard.get_or_insert_with(HashMap::new);
+    if let Some(state) = states.get(dir) {
+        return *state;
+    }
+    let state = if !dir.is_dir() {
+        DirState::Missing
+    } else if PROJECT_MARKERS.iter().any(|m| dir.join(m).exists()) {
+        DirState::Root
+    } else {
+        DirState::Plain
+    };
+    states.insert(dir.to_path_buf(), state);
+    state
 }
 
 /// Display name for a project root. Regular projects use the directory
@@ -392,19 +315,20 @@ fn git_dir_kind(project: &Path) -> Option<GitDirKind> {
 /// root. Returns them sorted outermost → innermost.
 pub fn find_project_chain(path: &Path) -> Vec<PathBuf> {
     let mut chain = Vec::new();
-    let Some(mut dir) = path.parent() else {
+    let Some(parent) = path.parent() else {
         return chain;
     };
-    loop {
-        if is_project_root(dir) {
-            chain.push(dir.to_path_buf());
-        }
-        match dir.parent() {
-            Some(p) if p != dir => dir = p,
-            _ => break,
+    // Walk from the filesystem root down to the parent. The walk stops at the
+    // first directory that does not exist, because a path below a missing
+    // directory (a remote path, for example) cannot hold a project marker.
+    let ancestors: Vec<&Path> = parent.ancestors().collect();
+    for dir in ancestors.into_iter().rev() {
+        match dir_state(dir) {
+            DirState::Missing => break,
+            DirState::Root => chain.push(dir.to_path_buf()),
+            DirState::Plain => {}
         }
     }
-    chain.reverse();
     chain
 }
 
@@ -421,9 +345,16 @@ pub struct HistoryStore {
     /// Number of history entries that touch each project (an entry whose chain
     /// is `[outer, inner]` increments the count for both).
     pub project_counts: HashMap<PathBuf, usize>,
-    /// Cursor composerId → display name, for labelling attributed edits (see
-    /// [`crate::cursor_sessions`]). Populated by the Cursor loader thread.
-    pub cursor_session_names: HashMap<String, String>,
+    /// Agent session id → session title. A Cursor entry uses the composer
+    /// name (see [`crate::cursor_sessions`]); a Claude Code entry uses the
+    /// `aiTitle` of its session file (see [`crate::claude`]). The loader
+    /// threads of both sources fill this one map.
+    pub session_titles: HashMap<String, String>,
+    /// For each entry, the index of the nearest *older* entry touching the same
+    /// `file_path` — i.e. the snapshot a diff for that entry is taken against.
+    /// Derived from `entries`; rebuilt by `recompute_projects` (see
+    /// [`Self::prev_snapshot`]). Same length as `entries`.
+    prev_by_index: Vec<Option<usize>>,
 }
 
 impl HistoryStore {
@@ -436,10 +367,26 @@ impl HistoryStore {
             project_chains: HashMap::new(),
             project_names: HashMap::new(),
             project_counts: HashMap::new(),
-            cursor_session_names: HashMap::new(),
+            session_titles: HashMap::new(),
+            prev_by_index: Vec::new(),
         };
         store.recompute_projects();
         store
+    }
+
+    /// Snapshot the diff for `entry_idx` is taken against: the nearest older
+    /// entry with the same `file_path`, or `None` when this is the file's first
+    /// snapshot. Reads the precomputed `prev_by_index` rather than re-scanning
+    /// `entries`, which turned every caller into an O(n) walk (and content
+    /// search, which asks for every entry, into O(n²)).
+    pub fn prev_snapshot(&self, entry_idx: usize) -> Option<&Path> {
+        // A source that records its own before-content wins: it describes the
+        // one edit, and the previous snapshot can include other edits.
+        if let Some(base) = self.entries.get(entry_idx).and_then(|e| e.base_path.as_deref()) {
+            return Some(base);
+        }
+        let prev = (*self.prev_by_index.get(entry_idx)?)?;
+        Some(self.entries[prev].snapshot_path.as_path())
     }
 
     /// Recompute the project-level metadata from `self.entries`. Called by
@@ -486,6 +433,26 @@ impl HistoryStore {
         self.project_chains = project_chains;
         self.project_names = project_names;
         self.project_counts = project_counts;
+
+        // Both this and `prev_by_index` derive from `entries`, and every
+        // mutation of `entries` (load batch merge, reload) runs through here —
+        // so they're refreshed together and can't drift apart.
+        self.recompute_predecessors();
+    }
+
+    /// Link each entry to the nearest older entry for the same file. `entries`
+    /// is newest-first, so walking it backwards and remembering the last index
+    /// seen per path leaves, at each step, exactly the smallest index greater
+    /// than the current one — the nearest older snapshot.
+    fn recompute_predecessors(&mut self) {
+        let mut last_seen: HashMap<&Path, usize> = HashMap::new();
+        let mut prev = vec![None; self.entries.len()];
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
+            let path = entry.file_path.as_path();
+            prev[idx] = last_seen.get(path).copied();
+            last_seen.insert(path, idx);
+        }
+        self.prev_by_index = prev;
     }
 
     /// Scan the Cursor history dir, emitting one batch per folder via
@@ -495,10 +462,14 @@ impl HistoryStore {
     /// subsequent calls skip unchanged folders; `seen_keys` deduplicates
     /// across calls. `on_batch` returning `false` aborts the scan (used to
     /// shut down when the receiver has been dropped).
+    /// Read the Cursor file history. `since` limits the scan: the loader
+    /// skips a folder whose `entries.json` is older, because such a folder
+    /// holds no newer entry. `None` reads every folder.
     pub fn load_cursor(
         history_dir: &Path,
         mtimes: &mut HashMap<PathBuf, SystemTime>,
         seen_keys: &mut HashSet<PathBuf>,
+        since: Option<SystemTime>,
         on_batch: &mut dyn FnMut(Vec<HistoryEntry>) -> bool,
     ) -> Result<()> {
         let read_dir = fs::read_dir(history_dir)
@@ -522,6 +493,9 @@ impl HistoryStore {
             if let Some(prev) = mtimes.get(&folder).copied()
                 && mtime <= prev
             {
+                continue;
+            }
+            if since.is_some_and(|cut| mtime < cut) {
                 continue;
             }
             folders.push((folder, mtime));
@@ -584,6 +558,7 @@ impl HistoryStore {
                     timestamp,
                     file_path: file_path.clone(),
                     snapshot_path,
+                    base_path: None,
                     project_roots: project_roots.clone(),
                     source: EditSource::Cursor,
                     kind: HistoryEntryKind::FileChange,
@@ -615,6 +590,7 @@ mod tests {
             timestamp: Local.timestamp_opt(0, 0).unwrap(),
             file_path: PathBuf::from(file),
             snapshot_path: PathBuf::new(),
+            base_path: None,
             project_roots: roots.iter().map(PathBuf::from).collect(),
             source: EditSource::Cursor,
             kind: HistoryEntryKind::FileChange,
@@ -628,10 +604,12 @@ mod tests {
             timestamp: Local.timestamp_opt(0, 0).unwrap(),
             file_path: PathBuf::from(format!("prompt:{}", text)),
             snapshot_path: PathBuf::new(),
+            base_path: None,
             project_roots: roots.iter().map(PathBuf::from).collect(),
             source: EditSource::ClaudeCode,
             kind: HistoryEntryKind::Prompt {
                 text: text.to_string(),
+                response: None,
             },
             session_id: None,
             session_cwd: None,
@@ -715,76 +693,6 @@ mod tests {
         assert_eq!(out[1], "47m");
     }
 
-    fn texts(lines: &[WrappedLine]) -> Vec<&str> {
-        lines.iter().map(|l| l.text.as_str()).collect()
-    }
-
-    #[test]
-    fn wrap_text_fits_single_line() {
-        let out = wrap_text("hello world", 40, 5);
-        assert_eq!(texts(&out), vec!["hello world"]);
-        assert!(!out[0].continuation);
-    }
-
-    #[test]
-    fn wrap_text_wraps_on_words() {
-        // width 11 → "hello" (5) + " world" won't fit (12) → second line.
-        let out = wrap_text("hello world foo", 11, 5);
-        assert_eq!(texts(&out), vec!["hello world", "foo"]);
-        // The wrapped second line is a soft-wrap continuation.
-        assert!(!out[0].continuation);
-        assert!(out[1].continuation);
-    }
-
-    #[test]
-    fn wrap_text_caps_at_max_lines_with_ellipsis() {
-        let out = wrap_text("aa bb cc dd", 2, 2);
-        assert_eq!(out.len(), 2);
-        assert!(out.last().unwrap().text.ends_with('…'));
-    }
-
-    #[test]
-    fn wrap_text_hard_splits_long_word() {
-        let out = wrap_text("abcdefgh", 3, 8);
-        // First line uses full width (3); continuation lines are narrowed by
-        // WRAP_INDENT, leaving width 1 for the remaining "defgh".
-        assert_eq!(texts(&out), vec!["abc", "d", "e", "f", "g", "h"]);
-        assert!(!out[0].continuation);
-        assert!(out[1..].iter().all(|l| l.continuation));
-    }
-
-    #[test]
-    fn wrap_text_empty_yields_one_line() {
-        let out = wrap_text("", 10, 5);
-        assert_eq!(texts(&out), vec![""]);
-        assert!(!out[0].continuation);
-    }
-
-    #[test]
-    fn wrap_text_preserves_real_linebreaks_uindented() {
-        // Each real linebreak starts a fresh, non-continuation line.
-        let out = wrap_text("first line\nsecond line", 40, 5);
-        assert_eq!(texts(&out), vec!["first line", "second line"]);
-        assert!(!out[0].continuation);
-        assert!(!out[1].continuation, "line after \\n is not a soft-wrap");
-    }
-
-    #[test]
-    fn wrap_text_drops_blank_lines() {
-        let out = wrap_text("a\n\n\nb", 40, 5);
-        assert_eq!(texts(&out), vec!["a", "b"]);
-    }
-
-    #[test]
-    fn wrap_text_mixes_linebreaks_and_wrapping() {
-        // First para wraps (width 11), second para is a real linebreak.
-        let out = wrap_text("hello world foo\nbye", 11, 5);
-        assert_eq!(texts(&out), vec!["hello world", "foo", "bye"]);
-        assert!(!out[0].continuation);
-        assert!(out[1].continuation, "soft-wrap of first para");
-        assert!(!out[2].continuation, "real linebreak");
-    }
-
     #[test]
     fn display_path_uses_name_lookup() {
         let e = entry(
@@ -799,6 +707,54 @@ mod tests {
         assert_eq!(e.display_path(&names), "mnode (hfgxb) → src/main.rs");
     }
 
+    /// `prev_snapshot` replaced a linear `entries[idx+1..].find(same file)` at
+    /// every caller. Assert it agrees with that scan for every entry, over a
+    /// history that interleaves several files and a prompt (whose synthetic
+    /// `file_path` is unique, so it must never link to anything).
+    #[test]
+    fn prev_snapshot_matches_linear_scan() {
+        let files = ["/p/a.rs", "/p/b.rs", "/p/a.rs", "/p/a.rs", "/p/c.rs", "/p/b.rs"];
+        let mut entries: Vec<HistoryEntry> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let mut e = entry(f, &["/p"]);
+                // from_entries sorts newest-first; make the order deterministic
+                // and give each entry a distinguishable snapshot.
+                e.timestamp = Local.timestamp_opt(1_000 + i as i64, 0).unwrap();
+                e.snapshot_path = PathBuf::from(format!("/snap/{i}"));
+                e
+            })
+            .collect();
+        let mut p = prompt_entry("a prompt", &["/p"]);
+        p.timestamp = Local.timestamp_opt(1_003, 0).unwrap();
+        p.snapshot_path = PathBuf::from("/snap/prompt");
+        entries.push(p);
+
+        let store = HistoryStore::from_entries(entries);
+        for idx in 0..store.entries.len() {
+            let expected = store.entries[idx + 1..]
+                .iter()
+                .find(|e| e.file_path == store.entries[idx].file_path)
+                .map(|e| e.snapshot_path.as_path());
+            assert_eq!(
+                store.prev_snapshot(idx),
+                expected,
+                "entry {idx} ({:?})",
+                store.entries[idx].file_path
+            );
+        }
+
+        // Sanity: the fixture actually exercises both outcomes.
+        assert!((0..store.entries.len()).any(|i| store.prev_snapshot(i).is_some()));
+        assert!((0..store.entries.len()).any(|i| store.prev_snapshot(i).is_none()));
+        let prompt_idx = store
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, HistoryEntryKind::Prompt { .. }))
+            .expect("prompt present");
+        assert_eq!(store.prev_snapshot(prompt_idx), None);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
