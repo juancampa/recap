@@ -325,7 +325,8 @@ impl From<&HistoryEntry> for CachedEntry {
     fn from(e: &HistoryEntry) -> Self {
         let prompt = match &e.kind {
             EntryKind::Prompt { text, response } => Some((text.clone(), response.clone())),
-            EntryKind::FileChange => None,
+            // The Cursor loader makes no compaction entry.
+            EntryKind::FileChange | EntryKind::Compaction { .. } => None,
         };
         Self {
             ts_ms: e.timestamp.timestamp_millis(),

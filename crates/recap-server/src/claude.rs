@@ -19,6 +19,13 @@
 //! lines that the harness writes (`<task-notification>`, `<system-reminder>`,
 //! command output) are not prompts and do not end the turn.
 //!
+//! A compaction replaces the earlier messages of a session with a summary.
+//! The summary line becomes a `Compaction` entry, not a prompt. Usually the
+//! session continues in the same file. A background session can continue in
+//! a new file instead: the new file starts with a copy of the lines of the
+//! old session. The loader emits no entry for the copied lines, and records
+//! the old session as the parent of the new session (see [`copied_prefix`]).
+//!
 //! Claude Code deletes a session file after `cleanupPeriodDays` (30 days by
 //! default). The loader keeps a compressed copy of each session in
 //! [`archive_dir`], and reads the copy when the session file is gone. See
@@ -44,6 +51,14 @@ struct Line {
     timestamp: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    /// The session that wrote the line. In a session that continues another
+    /// session, the copied lines keep the id of the other session. Not all
+    /// lines have this field (see [`copied_prefix`]).
+    #[serde(rename = "session_id")]
+    writer_session: Option<String>,
+    /// True on the user line that holds the summary of a compaction.
+    #[serde(rename = "isCompactSummary")]
+    is_compact_summary: Option<bool>,
     message: Option<MessageField>,
     #[serde(rename = "toolUseResult")]
     tool_use_result: Option<Value>,
@@ -77,11 +92,28 @@ fn cache_root() -> PathBuf {
     crate::paths::cache_root().join("claude")
 }
 
+/// The facts about sessions that the session files record. Each map has
+/// the session id as key.
+#[derive(Debug, Default)]
+pub struct SessionFacts {
+    /// The session title (see `load_session`).
+    pub titles: HashMap<String, String>,
+    /// The summary that Claude Code shows while the session is idle.
+    pub summaries: HashMap<String, String>,
+    /// The session that the session continues (see [`copied_prefix`]).
+    pub parents: HashMap<String, String>,
+}
+
+impl SessionFacts {
+    pub fn is_empty(&self) -> bool {
+        self.titles.is_empty() && self.summaries.is_empty() && self.parents.is_empty()
+    }
+}
+
 /// Scan all Claude project dirs, emitting one batch per session via
 /// `on_batch`. Sessions are processed newest-first (sorted by `.jsonl`
-/// mtime descending). Each call also carries the session titles and the
-/// session summaries that the session file records (session id → text).
-/// `on_batch` returning `false` aborts the scan.
+/// mtime descending). Each call also carries the [`SessionFacts`] that the
+/// session file records. `on_batch` returning `false` aborts the scan.
 /// Read the session files. `since` limits the scan: the loader skips a file
 /// whose mtime is older, because such a file holds no newer entry. `None`
 /// reads every file.
@@ -95,7 +127,7 @@ pub fn load(
     mtimes: &mut HashMap<PathBuf, SystemTime>,
     seen_keys: &mut HashSet<PathBuf>,
     since: Option<SystemTime>,
-    on_batch: &mut dyn FnMut(Vec<HistoryEntry>, HashMap<String, String>, HashMap<String, String>) -> bool,
+    on_batch: &mut dyn FnMut(Vec<HistoryEntry>, SessionFacts) -> bool,
 ) -> Result<HashSet<String>> {
     let mut chain_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
@@ -122,11 +154,10 @@ pub fn load(
 
     for (t, mtime) in sessions {
         let mut batch: Vec<HistoryEntry> = Vec::new();
-        let mut titles: HashMap<String, String> = HashMap::new();
-        let mut summaries: HashMap<String, String> = HashMap::new();
-        let loaded = t.read().and_then(|content| {
-            load_session(&t.id, &content, &mut batch, &mut chain_cache, seen_keys, &mut titles, &mut summaries)
-        });
+        let mut facts = SessionFacts::default();
+        let loaded = t
+            .read()
+            .and_then(|content| load_session(&t.id, &content, &mut batch, &mut chain_cache, seen_keys, &mut facts));
         if let Err(e) = loaded {
             log::warn!("skipped session {}: {e}", t.path.display());
         }
@@ -137,10 +168,8 @@ pub fn load(
         }
         mtimes.insert(t.path, mtime);
         // A session whose file did not grow emits no entry, but it can still
-        // carry a title or a summary that an earlier scan did not see.
-        if (!batch.is_empty() || !titles.is_empty() || !summaries.is_empty())
-            && !on_batch(batch, titles, summaries)
-        {
+        // carry a fact that an earlier scan did not see.
+        if (!batch.is_empty() || !facts.is_empty()) && !on_batch(batch, facts) {
             return Ok(archived);
         }
     }
@@ -411,8 +440,7 @@ fn load_session(
     out: &mut Vec<HistoryEntry>,
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     seen_keys: &mut HashSet<PathBuf>,
-    titles: &mut HashMap<String, String>,
-    summaries: &mut HashMap<String, String>,
+    facts: &mut SessionFacts,
 ) -> Result<()> {
     let raw_lines: Vec<Line> = content
         .lines()
@@ -458,7 +486,7 @@ fn load_session(
         }
         l.ai_title.as_deref().filter(|t| !t.trim().is_empty())
     }) {
-        titles.insert(session_id.clone(), title.to_string());
+        facts.titles.insert(session_id.clone(), title.to_string());
     }
 
     // The session summary. Claude Code appends an `away_summary` line each
@@ -470,8 +498,19 @@ fn load_session(
         }
         l.content.as_ref()?.as_str().filter(|t| !t.trim().is_empty())
     }) {
-        summaries.insert(session_id.clone(), summary.to_string());
+        facts.summaries.insert(session_id.clone(), summary.to_string());
     }
+
+    // The lines that Claude Code copied from the parent session. The loop
+    // replays their edits, so the file state is correct for the later
+    // edits, but it emits no entry for them: the parent emits those entries.
+    let copied = match copied_prefix(&session_id, &raw_lines) {
+        Some((len, parent)) => {
+            facts.parents.insert(session_id.clone(), parent);
+            len
+        }
+        None => 0,
+    };
 
     // The session's working directory, taken from the first line that records
     // one (a session stays in a single cwd). Used as the `claude --resume`
@@ -507,11 +546,26 @@ fn load_session(
         out.push(prompt);
     };
 
-    for line in &raw_lines {
+    for (i, line) in raw_lines.iter().enumerate() {
+        let copied = i < copied;
         // User-typed prompt: open a turn. Tool results also use
         // type=="user" but their content is an array of tool_result items;
         // genuine prompts are either a string or an array of text-only items.
         if line.kind.as_deref() == Some("user") {
+            // A compaction can happen in the middle of a turn, so it does
+            // not close the open turn.
+            if line.is_compact_summary == Some(true) {
+                if !copied
+                    && let Some(entry) = extract_compaction(line, &session_id, chain_cache)
+                    && seen_keys.insert(entry.file_path.clone())
+                {
+                    out.push(entry);
+                }
+                continue;
+            }
+            if copied {
+                continue;
+            }
             match classify_user_line(line) {
                 UserLine::Prompt => {
                     if let Some(entry) = extract_prompt(line, &session_id, chain_cache) {
@@ -538,7 +592,7 @@ fn load_session(
         // Final-response candidate: a line with text and no tool use. A
         // tool-use line discards the candidate, because the response must
         // come after the last tool use of the turn.
-        if open_prompt.is_some() {
+        if open_prompt.is_some() && !copied {
             let has_tool_use = arr
                 .iter()
                 .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
@@ -626,6 +680,9 @@ fn load_session(
             let Some(before) = before else {
                 continue;
             };
+            if copied {
+                continue;
+            }
             let Some(ts_str) = &line.timestamp else { continue };
             let Ok(ts) = DateTime::parse_from_rfc3339(ts_str) else { continue };
             let timestamp: DateTime<Local> = ts.with_timezone(&Local);
@@ -671,6 +728,21 @@ fn load_session(
     close_turn(open_prompt.take(), candidate.take(), out, seen_keys);
 
     Ok(())
+}
+
+/// The number of lines at the start of `lines` that Claude Code copied from
+/// another session, and the id of that session (the parent).
+///
+/// A copied line keeps the id of the session that wrote it in its
+/// `session_id` field. Some copied lines have no such field, the typed
+/// prompts for example. The copied lines are a block at the start of the
+/// file, so the block ends at the last line that names another session.
+/// The parent is the session that this last line names.
+fn copied_prefix(session_id: &str, lines: &[Line]) -> Option<(usize, String)> {
+    lines.iter().enumerate().rev().find_map(|(i, l)| {
+        let writer = l.writer_session.as_deref()?;
+        (writer != session_id).then(|| (i + 1, writer.to_string()))
+    })
 }
 
 /// What a `type=="user"` line is.
@@ -758,7 +830,28 @@ fn extract_prompt(
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Option<HistoryEntry> {
     let text = user_text(line)?;
+    conversation_entry(line, session_id, chain_cache, EntryKind::Prompt { text, response: None })
+}
 
+/// Make a `Compaction` entry from the user line that holds the summary of a
+/// compaction.
+fn extract_compaction(
+    line: &Line,
+    session_id: &str,
+    chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> Option<HistoryEntry> {
+    let summary = user_text(line)?;
+    conversation_entry(line, session_id, chain_cache, EntryKind::Compaction { summary })
+}
+
+/// An entry of the kind `kind` at the time and in the directory of `line`.
+/// The entry has the synthetic key `claude:<session>:<uuid>`.
+fn conversation_entry(
+    line: &Line,
+    session_id: &str,
+    chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    kind: EntryKind,
+) -> Option<HistoryEntry> {
     let ts_str = line.timestamp.as_ref()?;
     let ts = DateTime::parse_from_rfc3339(ts_str).ok()?;
     let timestamp: DateTime<Local> = ts.with_timezone(&Local);
@@ -787,10 +880,7 @@ fn extract_prompt(
         base_path: None,
         project_roots,
         source: EditSource::ClaudeCode,
-        kind: EntryKind::Prompt {
-            text,
-            response: None,
-        },
+        kind,
         session_id: Some(session_id.to_string()),
         session_cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
     })
@@ -937,13 +1027,11 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut chain_cache = HashMap::new();
-        let mut titles = HashMap::new();
-        let mut summaries = HashMap::new();
+        let mut facts = SessionFacts::default();
         let mut seen = HashSet::new();
-        load_session("titled", &lines.join("\n"), &mut out, &mut chain_cache, &mut seen, &mut titles, &mut summaries)
-            .unwrap();
+        load_session("titled", &lines.join("\n"), &mut out, &mut chain_cache, &mut seen, &mut facts).unwrap();
         assert_eq!(
-            titles.get("titled").map(String::as_str),
+            facts.titles.get("titled").map(String::as_str),
             Some("Page embed argument handling")
         );
     }
@@ -961,29 +1049,36 @@ mod tests {
             serde_json::json!({ "type": "attachment", "content": { "kind": "file" } }).to_string(),
             summary("I added the archive."),
         ];
-        let mut summaries = HashMap::new();
+        let mut facts = SessionFacts::default();
         load_session(
             "summarized",
             &lines.join("\n"),
             &mut Vec::new(),
             &mut HashMap::new(),
             &mut HashSet::new(),
-            &mut HashMap::new(),
-            &mut summaries,
+            &mut facts,
         )
         .unwrap();
-        assert_eq!(summaries.get("summarized").map(String::as_str), Some("I added the archive."));
+        assert_eq!(facts.summaries.get("summarized").map(String::as_str), Some("I added the archive."));
     }
 
     /// Load `lines` as the session `name`. Each test uses its own name,
     /// because the tests run in parallel.
     fn load_lines(name: &str, lines: &[String], seen: &mut HashSet<PathBuf>) -> Vec<HistoryEntry> {
+        load_lines_with_facts(name, lines, seen).0
+    }
+
+    /// [`load_lines`], and also the facts that the session records.
+    fn load_lines_with_facts(
+        name: &str,
+        lines: &[String],
+        seen: &mut HashSet<PathBuf>,
+    ) -> (Vec<HistoryEntry>, SessionFacts) {
         let mut out = Vec::new();
         let mut chain_cache = HashMap::new();
-        let mut titles = HashMap::new();
-        let mut summaries = HashMap::new();
-        load_session(name, &lines.join("\n"), &mut out, &mut chain_cache, seen, &mut titles, &mut summaries).unwrap();
-        out
+        let mut facts = SessionFacts::default();
+        load_session(name, &lines.join("\n"), &mut out, &mut chain_cache, seen, &mut facts).unwrap();
+        (out, facts)
     }
 
     #[test]
@@ -1045,6 +1140,79 @@ mod tests {
         )
     }
 
+    /// `line` with the fields that Claude Code adds to a line of a session:
+    /// the session that wrote the line, and more fields from `extra`.
+    fn with_fields(line: String, extra: serde_json::Value) -> String {
+        let mut value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            value[k] = v.clone();
+        }
+        value.to_string()
+    }
+
+    /// The summary of a compaction is a `Compaction` entry, not a prompt. An
+    /// automatic compaction happens in the middle of a turn, so the response
+    /// after the summary still belongs to the prompt before it.
+    #[test]
+    fn a_compaction_summary_is_a_compaction_entry() {
+        let lines = vec![
+            user("u1", "fix the bug"),
+            assistant_tool("a1"),
+            with_fields(
+                user("c1", "This session is being continued from a previous conversation."),
+                serde_json::json!({ "isCompactSummary": true }),
+            ),
+            assistant_text("a2", "Done."),
+        ];
+        let out = load_lines("compacted", &lines, &mut HashSet::new());
+        let kinds: Vec<&EntryKind> = out.iter().map(|e| &e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                &EntryKind::Compaction {
+                    summary: "This session is being continued from a previous conversation.".to_string()
+                },
+                &EntryKind::Prompt { text: "fix the bug".to_string(), response: Some("Done.".to_string()) },
+            ]
+        );
+    }
+
+    /// A session that continues another session starts with a copy of the
+    /// lines of the other session. The copied lines give no entry, but their
+    /// edits still change the replayed file state. The session records the
+    /// other session as its parent.
+    #[test]
+    fn the_copied_lines_of_a_continued_session_give_no_entry() {
+        let dir = std::env::temp_dir().join(format!("recap-claude-copied-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        fs::write(&file, "a\n").unwrap();
+        let path = file.to_string_lossy().to_string();
+        let parent = serde_json::json!({ "session_id": "parent" });
+        let child = serde_json::json!({ "session_id": "copied" });
+        let lines = vec![
+            // The copied prompt has no `session_id`, as in the real files.
+            user("u1", "edit the file"),
+            with_fields(edit_tool("a1", "t1", &path, "a", "b"), parent.clone()),
+            with_fields(
+                user("c1", "This session is being continued."),
+                serde_json::json!({ "session_id": "parent", "isCompactSummary": true }),
+            ),
+            with_fields(assistant_text("a2", "Edited."), parent),
+            with_fields(user("u2", "again"), child.clone()),
+            with_fields(edit_tool("a3", "t2", &path, "b", "c"), child),
+        ];
+        let (out, facts) = load_lines_with_facts("copied", &lines, &mut HashSet::new());
+        assert_eq!(facts.parents.get("copied").map(String::as_str), Some("parent"));
+        assert_eq!(out.len(), 2, "{out:?}");
+        // The loader emits a prompt when its turn closes, after its edits.
+        assert_eq!(out[1].prompt_text(), Some("again"));
+        let base = fs::read_to_string(out[0].base_path.as_ref().unwrap()).unwrap();
+        assert_eq!(base, "b\n", "the copied edit changed the replayed state");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(cache_root().join("copied"));
+    }
+
     /// The second edit's `old_string` is not in the replayed content, because
     /// something else changed the file in between. The entry still exists,
     /// and its base holds exactly the text the edit replaced.
@@ -1086,7 +1254,7 @@ mod tests {
     /// prompt texts and the archived session ids.
     fn load_prompts(projects: &Path, archive: &Path) -> (Vec<String>, HashSet<String>) {
         let mut prompts = Vec::new();
-        let mut on_batch = |batch: Vec<HistoryEntry>, _titles: HashMap<String, String>, _summaries: HashMap<String, String>| -> bool {
+        let mut on_batch = |batch: Vec<HistoryEntry>, _facts: SessionFacts| -> bool {
             prompts.extend(batch.iter().filter_map(|e| e.prompt_text().map(str::to_string)));
             true
         };
@@ -1165,7 +1333,7 @@ mod tests {
         let mut prompts = 0;
         let mut with_response = 0;
         let mut harness = 0;
-        let mut on_batch = |batch: Vec<HistoryEntry>, _titles: HashMap<String, String>, _summaries: HashMap<String, String>| -> bool {
+        let mut on_batch = |batch: Vec<HistoryEntry>, _facts: SessionFacts| -> bool {
             for e in &batch {
                 if e.is_prompt() {
                     prompts += 1;

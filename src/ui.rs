@@ -142,6 +142,11 @@ const NEOVIM_COLOR: Color = Color::Rgb(120, 200, 100);
 const SOURCE_WIDTH: usize = 6;
 /// Green used for the "session still running" play glyph.
 const RUNNING_COLOR: Color = Color::Rgb(90, 220, 120);
+
+/// Color of the label of a compaction row. The orange differs from the
+/// session colors and from the prompt and response colors, so the row is
+/// easy to find in a long session.
+const COMPACTION_COLOR: Color = Color::Rgb(255, 165, 80);
 /// The glyph of a session that Claude Code deleted and recap archived.
 const ARCHIVED_GLYPH: &str = "◌";
 
@@ -1189,13 +1194,13 @@ fn group_row_line(
     if title_width > 0 {
         prefix.push(title_span(
             session_name,
-            entry.session_id.as_deref(),
+            entry.chain_id.as_deref(),
             show_head,
             title_width,
         ));
         prefix.push(Span::raw(" "));
     }
-    prefix.push(session_bar_span(entry.session_id.as_deref(), false));
+    prefix.push(session_bar_span(entry.chain_id.as_deref(), false));
 
     let (chain_names, rel) = entry.display_path_segments(project_names);
     let dim_base = Style::default().fg(Color::Gray);
@@ -1320,7 +1325,7 @@ fn group_row_line(
                 // The bar is the last span of the prefix; end it when this
                 // is also the last line of the row.
                 if last_line && bar_end && spans.pop().is_some() {
-                    spans.push(session_bar_span(entry.session_id.as_deref(), true));
+                    spans.push(session_bar_span(entry.chain_id.as_deref(), true));
                 }
                 spans.extend(project_spans(None));
                 if let Some(ord) = ord_span.clone() {
@@ -1334,7 +1339,7 @@ fn group_row_line(
                     spans.push(Span::raw(" ".repeat(bar_col)));
                 }
                 spans.push(continuation_bar_span(
-                    entry.session_id.as_deref(),
+                    entry.chain_id.as_deref(),
                     last_line && bar_end,
                 ));
                 if chain_chars > 0 {
@@ -1360,10 +1365,24 @@ fn group_row_line(
         return lines;
     }
 
+    // ── Compaction entries: single line, chain + label. ──
+    if entry.is_compaction() {
+        let mut spans = prefix;
+        if bar_end && spans.pop().is_some() {
+            spans.push(session_bar_span(entry.chain_id.as_deref(), true));
+        }
+        spans.extend(project_spans(None));
+        spans.push(Span::styled(rel, Style::default().fg(COMPACTION_COLOR).add_modifier(Modifier::ITALIC)));
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
+        lines.extend(date_row);
+        lines.push(Line::from(spans));
+        return lines;
+    }
+
     // ── File-change entries: single line, chain + dir + filename. ──
     let mut spans = prefix;
     if bar_end && spans.pop().is_some() {
-        spans.push(session_bar_span(entry.session_id.as_deref(), true));
+        spans.push(session_bar_span(entry.chain_id.as_deref(), true));
     }
     let split = rel.rfind('/').map(|i| i + 1).unwrap_or(0);
     let (dir_part, file_part) = rel.split_at(split);
@@ -2002,13 +2021,13 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             ));
             spans.push(Span::raw(" "));
             let (label, _) = source_label(agent.source);
-            let src_color = shade_for(session_color(&agent.session_id), state);
+            let src_color = shade_for(session_color(&agent.chain_id), state);
             spans.push(Span::styled(
                 format!("{:<w$}", label, w = SOURCE_WIDTH),
                 Style::default().fg(src_color),
             ));
             spans.push(Span::raw(" "));
-            spans.push(session_bar_span(Some(&agent.session_id), false));
+            spans.push(session_bar_span(Some(&agent.chain_id), false));
 
             let chain: Vec<String> = agent
                 .project_roots
@@ -2206,7 +2225,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                 child_local,
             } => app.groups[*group_idx].entry_indices[*child_local],
         };
-        app.view.entries[entry_idx].session_id.clone()
+        app.view.entries[entry_idx].chain_id.clone()
     };
     let mut prev_session: Option<String> = app
         .history_scroll
@@ -2300,10 +2319,11 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     let leading = leading_marker(is_group, group.expanded, app.effective_auto_expand());
                     // Multi-entry groups display the child count instead of
                     // +/-, since +/- on a group reflects only one child.
-                    // Prompts leave the column blank (no marker).
+                    // Prompts and compactions leave the column blank (no
+                    // marker).
                     let change_spans = if is_group {
                         count_spans(count)
-                    } else if entry.is_prompt() {
+                    } else if !entry.is_file_change() {
                         vec![Span::raw(" ".repeat(CHANGE_COL_WIDTH))]
                     } else {
                         summary_spans(summary)
@@ -2388,14 +2408,14 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     if title_width > 0 {
                         spans.push(title_span(
                             session_title(entry),
-                            entry.session_id.as_deref(),
+                            entry.chain_id.as_deref(),
                             show_source,
                             title_width,
                         ));
                         spans.push(Span::raw(" "));
                     }
                     spans.push(session_bar_span(
-                        entry.session_id.as_deref(),
+                        entry.chain_id.as_deref(),
                         session_end_flags.get(local_idx).copied().unwrap_or(false),
                     ));
                     let fname_style = if match_indices.is_some() {
@@ -2570,9 +2590,11 @@ pub fn diff_selection_text(app: &App, inner_width: usize, visible: usize) -> Opt
 /// [`diff_selection_text`] reads the same lines back, so the text the user
 /// copies is the text the panel shows.
 fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line<'static>> {
+    // A compaction shows its summary as a response, so it takes the prompt
+    // path too.
     let is_prompt = app
         .current_entry()
-        .map(|e| e.is_prompt())
+        .map(|e| !e.is_file_change())
         .unwrap_or(false);
 
     // Active regex for content search — used to highlight in-diff hits on
@@ -2670,7 +2692,9 @@ fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line
         // its line in the matching highlight.
         let entry = app.current_entry();
         let text = entry.and_then(|e| e.prompt_text()).unwrap_or("");
-        let response = entry.and_then(|e| e.response_text()).unwrap_or("");
+        let response = entry
+            .and_then(|e| e.response_text().or(e.compaction_summary()))
+            .unwrap_or("");
         let hl_prompt = prompt::highlight(text, PROMPT_COLOR);
         let hl_response = prompt::highlight(response, RESPONSE_COLOR);
         let empty: Vec<prompt::Piece> = Vec::new();
@@ -3216,6 +3240,34 @@ mod render_tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A compaction row shows the label in the compaction color. The rows of
+    /// two sessions of one session chain have the bar color of the chain.
+    #[test]
+    fn a_compaction_row_shows_the_label_and_the_chain_color() {
+        let mut compaction = prompt("summary", "child");
+        compaction.file_path = PathBuf::from("claude:child:c1");
+        compaction.kind = EntryKind::Compaction { summary: "The summary.".to_string() };
+        compaction.timestamp = Local::now() - chrono::Duration::minutes(5);
+        let mut store = Store::from_entries(vec![prompt("start", "root"), compaction, file_edit("/dev/proj/a.rs", Some("child"), EditSource::ClaudeCode)]);
+        store.extend_parents([("child".to_string(), "root".to_string())]);
+        store.commit();
+        let mut app = App::new(Arc::new(recap_server::Server::from_store(store)));
+        app.recompute_row_heights(90, 18);
+        let out = history_half(&render(&app, 190, 20), 190);
+
+        let (label_x, label_y) = find(&out, recap_api::COMPACTION_LABEL);
+        assert_eq!(fg_at(&app, 190, 20, (label_x + 3) as u16, label_y as u16), COMPACTION_COLOR);
+        let (_, start_y) = find(&out, "start");
+        // The oldest row of the chain ends the band with `╹`.
+        let (bar_x, _) = find(&out, "╹");
+        assert_eq!(
+            fg_at(&app, 190, 20, bar_x as u16, label_y as u16),
+            fg_at(&app, 190, 20, bar_x as u16, start_y as u16),
+            "the two sessions of the chain have one bar color\n{out}"
+        );
+        assert_eq!(fg_at(&app, 190, 20, bar_x as u16, label_y as u16), session_color("root"), "{out}");
     }
 
     /// The title column prints the session title of the entry. The map holds

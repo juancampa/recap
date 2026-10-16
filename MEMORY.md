@@ -5,3 +5,4 @@
 - [History row heights](memory/history-row-heights.md) — the row-height cache goes stale after a refilter, and scroll math must refresh it
 - [Blame](memory/blame.md) — how `recap blame` votes a hunk to a session and prompt, and its limits
 - [Session titles](memory/session-titles.md) — where the title of a Claude Code and a Cursor session comes from
+- [Session chains](memory/session-chains.md) — how a compaction appears in the Claude Code files, and how recap joins a continued session to its parent

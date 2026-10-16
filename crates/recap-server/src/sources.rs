@@ -62,11 +62,9 @@ pub enum LoadEvent {
         sessions: Arc<CursorSessions>,
         mtime: Option<SystemTime>,
     },
-    /// Agent session id → session title, from the Claude Code session files.
-    SessionTitles(HashMap<String, String>),
-    /// Agent session id → the summary that Claude Code shows while the
-    /// session is idle, from the Claude Code session files.
-    SessionSummaries(HashMap<String, String>),
+    /// The titles, summaries and parents of sessions, from the Claude Code
+    /// session files.
+    SessionFacts(claude::SessionFacts),
     /// The ids of all the Claude Code sessions that Claude Code deleted and
     /// that the loader read from the archive (see [`claude::load`]). The
     /// Claude loader sends it once in each load.
@@ -187,14 +185,8 @@ impl Sources {
             let tx = tx.clone();
             pending += 1;
             std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>,
-                                    titles: HashMap<String, String>,
-                                    summaries: HashMap<String, String>|
-                 -> bool {
-                    if !titles.is_empty() && tx.send(LoadEvent::SessionTitles(titles)).is_err() {
-                        return false;
-                    }
-                    if !summaries.is_empty() && tx.send(LoadEvent::SessionSummaries(summaries)).is_err() {
+                let mut on_batch = |batch: Vec<HistoryEntry>, facts: claude::SessionFacts| -> bool {
+                    if !facts.is_empty() && tx.send(LoadEvent::SessionFacts(facts)).is_err() {
                         return false;
                     }
                     if batch.is_empty() {

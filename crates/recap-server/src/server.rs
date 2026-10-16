@@ -245,14 +245,18 @@ impl Server {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         let mut titles: HashMap<String, String> = HashMap::new();
         let mut summaries: HashMap<String, String> = HashMap::new();
+        let mut parents: HashMap<String, String> = HashMap::new();
         let mut archived: Option<HashSet<String>> = None;
         let mut attribution = false;
         let mut disconnected = false;
         loop {
             match load.rx.try_recv() {
                 Ok(LoadEvent::Batch(mut entries)) => batch.append(&mut entries),
-                Ok(LoadEvent::SessionTitles(t)) => titles.extend(t),
-                Ok(LoadEvent::SessionSummaries(t)) => summaries.extend(t),
+                Ok(LoadEvent::SessionFacts(facts)) => {
+                    titles.extend(facts.titles);
+                    summaries.extend(facts.summaries);
+                    parents.extend(facts.parents);
+                }
                 Ok(LoadEvent::ArchivedSessions(ids)) => archived = Some(ids),
                 Ok(LoadEvent::CursorSessions { sessions, mtime }) => {
                     sources.cursor_sessions_mtime = mtime;
@@ -288,12 +292,19 @@ impl Server {
         }
 
         stats.received += batch.len();
-        if !batch.is_empty() || !titles.is_empty() || !summaries.is_empty() || archived.is_some() || attribution {
+        if !batch.is_empty()
+            || !titles.is_empty()
+            || !summaries.is_empty()
+            || !parents.is_empty()
+            || archived.is_some()
+            || attribution
+        {
             sources.attach_plan_project(&mut batch);
             let merged = !batch.is_empty();
             let mut store = write(&self.inner.store);
             store.extend_titles(titles);
             store.extend_summaries(summaries);
+            store.extend_parents(parents);
             if let Some(ids) = archived {
                 store.set_archived_sessions(ids);
             }
@@ -383,9 +394,14 @@ impl Server {
     }
 
     /// The lines that the Diff panel shows for one entry: the prompt and the
-    /// response for a prompt, the diff to the base for a file change.
+    /// response for a prompt, the summary for a compaction, the diff to the
+    /// base for a file change.
     fn entry_diff(store: &Store, idx: usize) -> Vec<DiffLine> {
         let entry = &store.history.entries[idx];
+        // The agent wrote the summary, so the summary shows as a response.
+        if let Some(summary) = recap_api::EntryFields::compaction_summary(entry) {
+            return summary.lines().map(|l| DiffLine::Response(l.to_string())).collect();
+        }
         if let Some(text) = recap_api::EntryFields::prompt_text(entry) {
             let mut lines: Vec<DiffLine> = text.lines().map(|l| DiffLine::Prompt(l.to_string())).collect();
             if lines.is_empty() {

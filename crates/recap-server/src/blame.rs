@@ -336,7 +336,7 @@ pub fn attribute(
     // Candidates per absolute path, newest first (the store order).
     let mut candidates: HashMap<&Path, Vec<usize>> = HashMap::new();
     for (idx, entry) in store.entries.iter().enumerate() {
-        if !entry.is_prompt() && wanted.contains(&entry.file_path) {
+        if entry.is_file_change() && wanted.contains(&entry.file_path) {
             candidates
                 .entry(entry.file_path.as_path())
                 .or_default()

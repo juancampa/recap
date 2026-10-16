@@ -66,7 +66,7 @@ pub fn path_matches(store: &Store, filter: &Filter, query: &str) -> (Vec<SearchM
     };
     for idx in candidates {
         let entry = &store.history.entries[idx];
-        let s = if entry.is_prompt() {
+        let s = if !entry.is_file_change() {
             let (chain, _) = entry.display_path_segments(names);
             chain.join(" → ")
         } else {
@@ -190,6 +190,9 @@ fn fill_content_cache(
                                 }
                                 out.push((id, diff_text(&old_content, &new_content)));
                             }
+                            // The summary of a compaction is not searchable
+                            // text (see the embedder jobs).
+                            EntryKind::Compaction { .. } => {}
                         }
                     }
                     (out, read, bytes, rejected)

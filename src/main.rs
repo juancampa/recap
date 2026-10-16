@@ -17,7 +17,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use recap_api::{Api, BlameRequest, EditSource, EmbedStatus, Entry, EntryFields, Filter, Page, RunningSession, SearchKind};
+use recap_api::{Api, BlameRequest, EditSource, EmbedStatus, Entry, EntryFields, EntryKind, Filter, Page, RunningSession, SearchKind};
 use recap_client::Client;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use serde::Serialize;
@@ -483,11 +483,14 @@ fn run_list_cli(
         .iter()
         .take(limit)
         .map(|e| {
-            let is_prompt = e.is_prompt();
             let project = e.project_root();
             ListRow {
                 timestamp: e.timestamp.to_rfc3339(),
-                kind: if is_prompt { "prompt" } else { "diff" },
+                kind: match e.kind {
+                    EntryKind::Prompt { .. } => "prompt",
+                    EntryKind::Compaction { .. } => "compaction",
+                    EntryKind::FileChange => "diff",
+                },
                 source: e.source,
                 project,
                 project_name: project.and_then(|p| names.get(p)).map(String::as_str),
@@ -496,7 +499,7 @@ fn run_list_cli(
                 session_cwd: e.session_cwd.as_deref(),
                 prompt: e.prompt_text(),
                 response: e.response_text(),
-                file: (!is_prompt).then(|| e.file_path.as_path()),
+                file: e.is_file_change().then(|| e.file_path.as_path()),
                 snapshot_path: e.snapshot_path.as_deref(),
                 base_path: e.base_path.as_deref(),
             }

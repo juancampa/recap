@@ -480,8 +480,8 @@ pub struct App {
     /// edits, unattributed Cursor saves) have no agent, so Agent mode does
     /// not reach them.
     pub agents: Vec<Agent>,
-    /// Session id of the selected agent. Stored by id (not index) so the
-    /// selection survives a change of the list.
+    /// Chain id of the selected agent (see `Entry::chain_id`). Stored by id
+    /// (not index) so the selection survives a change of the list.
     pub selected_agent: Option<String>,
     pub agent_scroll: usize,
     /// Selection memory for the `m` toggle. See [`ModeReturn`].
@@ -995,11 +995,11 @@ impl App {
         let still_there = self
             .selected_agent
             .as_deref()
-            .is_some_and(|id| agents.iter().any(|a| a.session_id == id));
+            .is_some_and(|id| agents.iter().any(|a| a.chain_id == id));
         let restoring = self.pending_agent_restore.is_some()
             && self.pending_agent_restore == self.selected_agent;
         if !still_there && !restoring {
-            self.selected_agent = agents.first().map(|a| a.session_id.clone());
+            self.selected_agent = agents.first().map(|a| a.chain_id.clone());
             self.agent_scroll = 0;
         }
         self.agents = agents;
@@ -1719,9 +1719,10 @@ impl App {
             .map(|t| t.to_string())
     }
 
-    /// True if `O` has a file to open. A prompt row has none.
+    /// True if `O` has a file to open. A prompt row and a compaction row
+    /// have none.
     pub fn can_open_file(&self) -> bool {
-        self.current_entry().is_some_and(|e| !e.is_prompt())
+        self.current_entry().is_some_and(|e| e.is_file_change())
     }
 
     // ── Navigation ────────────────────────────────────────────────────────────
@@ -2148,7 +2149,7 @@ impl App {
         let current = self.current_entry_id();
         let current_session = self
             .current_entry()
-            .and_then(|e| e.session_id.clone());
+            .and_then(|e| e.chain_id.clone());
 
         // The row to select after the switch.
         let target = match self.mode {
@@ -2206,7 +2207,8 @@ impl App {
         };
     }
 
-    /// The session of the History row closest to the cursor that has one.
+    /// The session chain of the History row closest to the cursor that has
+    /// one.
     /// The search starts at the selected group and moves outward, newer row
     /// first. Returns None if no visible row carries a session.
     fn nearest_session(&self) -> Option<String> {
@@ -2223,7 +2225,7 @@ impl App {
                 let found = group
                     .entry_indices
                     .iter()
-                    .find_map(|&ei| self.view.entries[ei].session_id.clone());
+                    .find_map(|&ei| self.view.entries[ei].chain_id.clone());
                 if found.is_some() {
                     return found;
                 }
@@ -2254,7 +2256,7 @@ impl App {
     /// Index of the selected agent in `agents`.
     pub fn sel_agent_idx(&self) -> Option<usize> {
         let id = self.selected_agent.as_deref()?;
-        self.agents.iter().position(|a| a.session_id == id)
+        self.agents.iter().position(|a| a.chain_id == id)
     }
 
     /// Select the agent at row `target`, then rebuild History for it.
@@ -2262,7 +2264,7 @@ impl App {
         let Some(agent) = self.agents.get(target) else {
             return;
         };
-        let id = agent.session_id.clone();
+        let id = agent.chain_id.clone();
         if self.selected_agent.as_deref() == Some(id.as_str()) {
             return;
         }

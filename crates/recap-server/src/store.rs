@@ -20,12 +20,15 @@ use std::path::{Path, PathBuf};
 
 /// The identity of the searchable text of an entry, as a string that does not
 /// depend on the cache location. A file change keys on its snapshot file (one
-/// for each edit). A prompt keys on its synthetic `file_path`. The part of a
+/// for each edit). A prompt and a compaction key on the synthetic
+/// `file_path`. The part of a
 /// path inside the cache root is relative, so the prod cache and a copy of it
 /// give the same keys. The vector store (`embeddings.db`) uses the same key.
 pub fn entry_key(entry: &HistoryEntry) -> String {
     let raw = match &entry.kind {
-        EntryKind::Prompt { .. } => entry.file_path.to_string_lossy().into_owned(),
+        EntryKind::Prompt { .. } | EntryKind::Compaction { .. } => {
+            entry.file_path.to_string_lossy().into_owned()
+        }
         // A Cursor blob snapshot has the name of its content hash, so two
         // edits that end at the same content have the same snapshot. Their
         // diffs differ, so the key also holds the base.
@@ -89,8 +92,9 @@ pub struct Store {
     meta: Vec<Meta>,
     by_id: HashMap<EntryId, usize>,
     version: u64,
-    /// The position of each prompt in its own session, counted from the
-    /// oldest prompt as 1. The key is the synthetic `file_path` of the prompt.
+    /// The position of each prompt in its own session chain, counted from
+    /// the oldest prompt as 1. The key is the synthetic `file_path` of the
+    /// prompt.
     /// [`Store::commit`] calculates it again from `history.entries`.
     ordinals: HashMap<PathBuf, usize>,
     /// The ids of the Claude Code sessions that Claude Code deleted. The
@@ -100,6 +104,10 @@ pub struct Store {
     /// Agent session id → the summary that Claude Code shows while the
     /// session is idle (see [`crate::claude::load`]).
     session_summaries: HashMap<String, String>,
+    /// Agent session id → the session that it continues (see
+    /// [`crate::claude::SessionFacts::parents`]). [`Self::chain_id`] follows
+    /// these links.
+    session_parents: HashMap<String, String>,
 }
 
 impl Default for Store {
@@ -112,6 +120,7 @@ impl Default for Store {
             ordinals: HashMap::new(),
             archived_sessions: HashSet::new(),
             session_summaries: HashMap::new(),
+            session_parents: HashMap::new(),
         }
     }
 }
@@ -259,7 +268,7 @@ impl Store {
             // call named. A prompt has its own composer too, and its synthetic
             // path matches no file, so the fuzzy join would only erase that
             // composer. Only the Local History edits need the join.
-            if entry.base_path.is_some() || entry.is_prompt() {
+            if entry.base_path.is_some() || !entry.is_file_change() {
                 continue;
             }
             entry.session_id = sessions.attribute(&entry.file_path, entry.timestamp.timestamp_millis());
@@ -280,6 +289,30 @@ impl Store {
 
     fn session_summary(&self, entry: &HistoryEntry) -> Option<&String> {
         entry.session_id.as_ref().and_then(|sid| self.session_summaries.get(sid))
+    }
+
+    /// Add the parent links of sessions.
+    pub fn extend_parents(&mut self, parents: impl IntoIterator<Item = (String, String)>) {
+        self.session_parents.extend(parents);
+    }
+
+    /// The first session of the session chain that holds `session_id` (see
+    /// [`Entry::chain_id`]). The function follows the parent links. It stops
+    /// after as many steps as there are links, so a loop in the links does
+    /// not stop the server.
+    pub fn chain_id<'a>(&'a self, session_id: &'a str) -> &'a str {
+        let mut current = session_id;
+        for _ in 0..self.session_parents.len() {
+            match self.session_parents.get(current) {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        current
+    }
+
+    fn entry_chain_id<'a>(&'a self, entry: &'a HistoryEntry) -> Option<&'a str> {
+        entry.session_id.as_deref().map(|sid| self.chain_id(sid))
     }
 
     /// Replace the set of archived sessions. The Claude loader sends the full
@@ -322,6 +355,7 @@ impl Store {
         let mut h = DefaultHasher::new();
         self.history.prev_snapshot(idx).hash(&mut h);
         entry.session_id.hash(&mut h);
+        self.entry_chain_id(entry).hash(&mut h);
         self.session_title(entry).hash(&mut h);
         self.session_summary(entry).hash(&mut h);
         self.is_archived(entry.session_id.as_deref()).hash(&mut h);
@@ -330,8 +364,8 @@ impl Store {
     }
 
     /// Calculate [`Self::ordinals`]. `history.entries` is newest first, so the
-    /// walk runs backwards to count the prompts of each session from the
-    /// oldest one.
+    /// walk runs backwards to count the prompts of each session chain from
+    /// the oldest one.
     fn recompute_ordinals(&mut self) {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut out: HashMap<PathBuf, usize> = HashMap::new();
@@ -339,10 +373,10 @@ impl Store {
             if !e.is_prompt() {
                 continue;
             }
-            let Some(sid) = e.session_id.as_deref() else {
+            let Some(chain) = self.entry_chain_id(e) else {
                 continue;
             };
-            let n = counts.entry(sid).or_insert(0);
+            let n = counts.entry(chain).or_insert(0);
             *n += 1;
             out.insert(e.file_path.clone(), *n);
         }
@@ -367,7 +401,7 @@ impl Store {
     pub fn wire(&self, idx: usize) -> Entry {
         let e = &self.history.entries[idx];
         let meta = &self.meta[idx];
-        let is_prompt = e.is_prompt();
+        let is_file_change = e.is_file_change();
         Entry {
             id: meta.id.clone(),
             version: meta.version,
@@ -377,22 +411,23 @@ impl Store {
             source: e.source,
             kind: e.kind.clone(),
             session_id: e.session_id.clone(),
+            chain_id: self.entry_chain_id(e).map(str::to_string),
             session_title: self.session_title(e).cloned(),
             session_summary: self.session_summary(e).cloned(),
             session_cwd: e.session_cwd.clone(),
             session_archived: self.is_archived(e.session_id.as_deref()),
             ordinal: self.ordinal(e),
-            snapshot_path: (!is_prompt).then(|| e.snapshot_path.clone()),
-            base_path: if is_prompt {
-                None
-            } else {
+            snapshot_path: is_file_change.then(|| e.snapshot_path.clone()),
+            base_path: if is_file_change {
                 self.history.prev_snapshot(idx).map(Path::to_path_buf)
+            } else {
+                None
             },
         }
     }
 
     /// Whether one entry passes the filter.
-    pub fn keeps(entry: &HistoryEntry, filter: &Filter) -> bool {
+    pub fn keeps(&self, entry: &HistoryEntry, filter: &Filter) -> bool {
         if let Some(p) = &filter.project
             && !entry.project_roots.iter().any(|r| r == p)
         {
@@ -406,7 +441,7 @@ impl Store {
         // An empty agent id matches no entry, because an entry without a
         // session has no agent.
         if let Some(a) = &filter.agent
-            && entry.session_id.as_deref() != Some(a.as_str())
+            && self.entry_chain_id(entry) != Some(a.as_str())
         {
             return false;
         }
@@ -424,7 +459,7 @@ impl Store {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| Self::keeps(e, filter))
+            .filter(|(_, e)| self.keeps(e, filter))
             .map(|(i, _)| i)
             .collect()
     }
@@ -447,11 +482,11 @@ impl Store {
     }
 
     /// The edited files inside `project` (or all files), newest first. A
-    /// prompt has no file: its `file_path` is synthetic.
+    /// prompt and a compaction have no file: their `file_path` is synthetic.
     pub fn files(&self, project: Option<&Path>) -> Vec<FileInfo> {
         let mut by_path: HashMap<&PathBuf, FileInfo> = HashMap::new();
         for e in &self.history.entries {
-            if e.is_prompt() {
+            if !e.is_file_change() {
                 continue;
             }
             if let Some(p) = project
@@ -475,9 +510,10 @@ impl Store {
         files
     }
 
-    /// The agent sessions inside `project` (or all agents), newest first. An
-    /// entry without a session id has no agent. `history.entries` is newest
-    /// first, so the first prompt of each session is its newest prompt.
+    /// The session chains inside `project` (or all chains), newest first, as
+    /// agents. An entry without a session id has no agent. `history.entries`
+    /// is newest first, so the first entry of each chain is its newest entry,
+    /// and the first prompt is its newest prompt.
     pub fn agents(&self, project: Option<&Path>) -> Vec<Agent> {
         let mut order: Vec<&str> = Vec::new();
         let mut by_id: HashMap<&str, Agent> = HashMap::new();
@@ -490,12 +526,14 @@ impl Store {
             {
                 continue;
             }
-            let agent = by_id.entry(sid).or_insert_with(|| {
-                order.push(sid);
+            let chain = self.chain_id(sid);
+            let agent = by_id.entry(chain).or_insert_with(|| {
+                order.push(chain);
                 Agent {
+                    chain_id: chain.to_string(),
                     session_id: sid.to_string(),
                     source: e.source,
-                    title: self.history.session_titles.get(sid).cloned(),
+                    title: None,
                     archived: self.is_archived(Some(sid)),
                     last_ts: e.timestamp,
                     prompt_count: 0,
@@ -503,6 +541,9 @@ impl Store {
                     last_prompt: String::new(),
                 }
             });
+            if agent.title.is_none() {
+                agent.title = self.history.session_titles.get(sid).cloned();
+            }
             if let Some(text) = e.prompt_text() {
                 if agent.prompt_count == 0 {
                     // The newest prompt also gives the agent its display
@@ -537,7 +578,7 @@ impl Store {
             {
                 continue;
             }
-            if Self::keeps(e, filter) {
+            if self.keeps(e, filter) {
                 if entries.len() < limit {
                     entries.push(self.wire(idx));
                 }
@@ -593,6 +634,59 @@ mod tests {
             session_id: None,
             session_cwd: None,
         }
+    }
+
+    /// A session that continues another session joins its session chain.
+    /// The Agents panel shows one agent for the chain, the prompt numbers
+    /// continue across the sessions, and the agent filter keeps the entries
+    /// of all the sessions of the chain.
+    #[test]
+    fn the_sessions_of_a_chain_are_one_agent() {
+        let mut store = Store::from_entries(vec![
+            prompt_entry("start", "root", 30),
+            prompt_entry("continue", "child", 20),
+            prompt_entry("branch", "other-child", 10),
+            prompt_entry("alone", "solo", 5),
+        ]);
+        store.extend_parents([
+            ("child".to_string(), "root".to_string()),
+            ("other-child".to_string(), "root".to_string()),
+        ]);
+        store.commit();
+
+        let agents = store.agents(None);
+        let chains: Vec<(&str, &str, usize)> = agents
+            .iter()
+            .map(|a| (a.chain_id.as_str(), a.session_id.as_str(), a.prompt_count))
+            .collect();
+        assert_eq!(chains, vec![("solo", "solo", 1), ("root", "other-child", 3)]);
+
+        let filter = Filter { agent: Some("root".to_string()), ..Filter::default() };
+        let texts: Vec<(String, Option<usize>, Option<String>)> = store
+            .filtered(&filter)
+            .into_iter()
+            .map(|i| {
+                let e = store.wire(i);
+                (e.prompt_text().unwrap().to_string(), e.ordinal, e.chain_id)
+            })
+            .collect();
+        let root = Some("root".to_string());
+        assert_eq!(
+            texts,
+            vec![
+                ("branch".to_string(), Some(3), root.clone()),
+                ("continue".to_string(), Some(2), root.clone()),
+                ("start".to_string(), Some(1), root),
+            ]
+        );
+    }
+
+    /// A loop in the parent links does not stop the chain id calculation.
+    #[test]
+    fn a_loop_in_the_parent_links_ends() {
+        let mut store = Store::default();
+        store.extend_parents([("a".to_string(), "b".to_string()), ("b".to_string(), "a".to_string())]);
+        assert!(["a", "b"].contains(&store.chain_id("a")));
     }
 
     #[test]

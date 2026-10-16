@@ -58,6 +58,11 @@ pub enum EntryKind {
         text: String,
         response: Option<String>,
     },
+    /// The agent replaced the earlier messages of the session with a
+    /// summary, because the context window was full or the user asked for
+    /// it. `file_path` is a synthetic unique key, as for a prompt. `summary`
+    /// is the text that the agent received in place of the earlier messages.
+    Compaction { summary: String },
 }
 
 /// One entry of the history, as the server sends it.
@@ -77,6 +82,13 @@ pub struct Entry {
     pub kind: EntryKind,
     /// The agent session that made the entry, when the source has one.
     pub session_id: Option<String>,
+    /// The first session of the session chain that holds `session_id`. A
+    /// compaction can continue a Claude Code session in a new session, and
+    /// the new session names the old one. The server follows these links
+    /// back to the first session. The Agents panel shows one agent for each
+    /// session chain. Equal to `session_id` for a session without links.
+    #[serde(default)]
+    pub chain_id: Option<String>,
     /// The title of that session, when the source records one.
     pub session_title: Option<String>,
     /// The newest summary of that session that Claude Code shows while the
@@ -113,10 +125,26 @@ pub trait EntryFields {
         matches!(self.kind(), EntryKind::Prompt { .. })
     }
 
+    fn is_compaction(&self) -> bool {
+        matches!(self.kind(), EntryKind::Compaction { .. })
+    }
+
+    fn is_file_change(&self) -> bool {
+        matches!(self.kind(), EntryKind::FileChange)
+    }
+
     fn prompt_text(&self) -> Option<&str> {
         match self.kind() {
             EntryKind::Prompt { text, .. } => Some(text),
-            EntryKind::FileChange => None,
+            EntryKind::FileChange | EntryKind::Compaction { .. } => None,
+        }
+    }
+
+    /// The summary of a compaction. `None` for the other kinds.
+    fn compaction_summary(&self) -> Option<&str> {
+        match self.kind() {
+            EntryKind::Compaction { summary } => Some(summary),
+            EntryKind::FileChange | EntryKind::Prompt { .. } => None,
         }
     }
 
@@ -125,7 +153,7 @@ pub trait EntryFields {
     fn response_text(&self) -> Option<&str> {
         match self.kind() {
             EntryKind::Prompt { response, .. } => response.as_deref(),
-            EntryKind::FileChange => None,
+            EntryKind::FileChange | EntryKind::Compaction { .. } => None,
         }
     }
 
@@ -158,7 +186,8 @@ pub trait EntryFields {
 
     /// Split [`Self::display_path`] into (project chain names, tail). For a
     /// file change the tail is the path relative to the innermost project.
-    /// For a prompt the tail is the prompt text on one line. Without a
+    /// For a prompt the tail is the prompt text on one line. For a
+    /// compaction the tail is [`COMPACTION_LABEL`]. Without a
     /// project, the names list is empty and the tail is a short fallback.
     fn display_path_segments(&self, names: &HashMap<PathBuf, String>) -> (Vec<String>, String) {
         let chain: Vec<String> = self
@@ -166,8 +195,10 @@ pub trait EntryFields {
             .iter()
             .map(|p| project_name(p, names))
             .collect();
-        if let EntryKind::Prompt { text, .. } = self.kind() {
-            return (chain, single_line(text));
+        match self.kind() {
+            EntryKind::Prompt { text, .. } => return (chain, single_line(text)),
+            EntryKind::Compaction { .. } => return (chain, COMPACTION_LABEL.to_string()),
+            EntryKind::FileChange => {}
         }
         let Some(deepest) = self.project_root() else {
             return (Vec::new(), short_path(self.file_path(), 3));
@@ -180,6 +211,9 @@ pub trait EntryFields {
         (chain, rel)
     }
 }
+
+/// The text that a list row shows for a compaction.
+pub const COMPACTION_LABEL: &str = "── context compacted ──";
 
 impl EntryFields for Entry {
     fn kind(&self) -> &EntryKind {
@@ -338,12 +372,14 @@ impl KindFilter {
         }
     }
 
-    /// Whether one entry passes the filter.
+    /// Whether one entry passes the filter. The prompts view also shows
+    /// the compactions, because a compaction marks a point in the
+    /// conversation, not a file change.
     pub fn keeps(self, entry: &impl EntryFields) -> bool {
         match self {
             KindFilter::All => true,
-            KindFilter::Prompts => entry.is_prompt(),
-            KindFilter::Changes => !entry.is_prompt(),
+            KindFilter::Prompts => !entry.is_file_change(),
+            KindFilter::Changes => entry.is_file_change(),
         }
     }
 }
@@ -357,8 +393,9 @@ pub struct Filter {
     pub project: Option<PathBuf>,
     /// Keep the entries of this file.
     pub file: Option<PathBuf>,
-    /// Keep the entries of this agent session. An empty string keeps no
-    /// entry: an agent view without a selected agent is empty.
+    /// Keep the entries of the session chain with this id (see
+    /// [`Entry::chain_id`]). An empty string keeps no entry: an agent view
+    /// without a selected agent is empty.
     pub agent: Option<String>,
     pub kind: KindFilter,
     /// Keep the entries newer than this time.
@@ -465,18 +502,24 @@ pub struct FilesResponse {
     pub files: Vec<FileInfo>,
 }
 
-/// One agent session, as the Agents panel lists it.
+/// One session chain, as the Agents panel lists it (see
+/// [`Entry::chain_id`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Agent {
+    /// The id of the session chain. [`Filter::agent`] takes this id.
+    pub chain_id: String,
+    /// The session of the newest entry of the chain. The run state and
+    /// `claude --resume` use this session.
     pub session_id: String,
     pub source: EditSource,
+    /// The title of the newest session of the chain that has a title.
     pub title: Option<String>,
-    /// True when the agent deleted the files of the session (see
+    /// True when the agent deleted the files of `session_id` (see
     /// [`Entry::session_archived`]).
     #[serde(default)]
     pub archived: bool,
-    /// The time of the newest prompt of the agent, or of its newest entry
-    /// when the agent has no prompt.
+    /// The time of the newest prompt of the chain, or of its newest entry
+    /// when the chain has no prompt.
     pub last_ts: DateTime<Local>,
     pub prompt_count: usize,
     /// The project chain of the newest entry of the agent.
@@ -736,6 +779,7 @@ mod tests {
                 response: Some("Fixed.".to_string()),
             },
             session_id: Some("s1".to_string()),
+            chain_id: Some("s1".to_string()),
             session_title: Some("Bug fix".to_string()),
             session_summary: Some("I fixed the bug.".to_string()),
             session_cwd: Some(PathBuf::from("/dev/proj")),
@@ -783,6 +827,7 @@ mod tests {
         round_trip(&AgentsResponse {
             version: 3,
             agents: vec![Agent {
+                chain_id: "s0".to_string(),
                 session_id: "s1".to_string(),
                 source: EditSource::ClaudeCode,
                 title: None,

@@ -245,6 +245,9 @@ impl Embedder {
                     new_path: entry.snapshot_path.clone(),
                     old_path: store.prev_snapshot(idx).map(|p| p.to_path_buf()),
                 }),
+                // The agent wrote the summary of a compaction. It repeats the
+                // earlier prompts, so the index does not hold it.
+                EntryKind::Compaction { .. } => {}
             }
         }
         jobs.sort_by_key(|j| match j.kind {
