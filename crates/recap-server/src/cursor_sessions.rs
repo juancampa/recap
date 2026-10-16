@@ -48,7 +48,8 @@
 //!    time falls inside the window (± [`WINDOW_GRACE_MS`]) is attributed to
 //!    that composer. This is the fuzzy fallback that covers old history; it's
 //!    ambiguous only when two composers touched the same file at overlapping
-//!    times.
+//!    times. A composer with exact edits (see below) gets no window match,
+//!    because the window match also takes the user's own saves.
 //!
 //! The join stays fuzzy because a Local History snapshot carries no author and
 //! no content id — hence the timestamp/window match. An edit that comes from a
@@ -107,7 +108,8 @@ struct ComposerMeta {
 pub struct CursorSessions {
     /// Exact per-edit records, indexed by absolute file path.
     patches: HashMap<PathBuf, Vec<Patch>>,
-    /// Composer windows + file sets for the fuzzy fallback.
+    /// Composer windows + file sets for the fuzzy fallback. Only the
+    /// composers without exact edits.
     composers: Vec<Composer>,
     /// composerId → human-readable display name.
     names: HashMap<String, String>,
@@ -210,7 +212,11 @@ impl CursorSessions {
             if let Some(name) = name {
                 names.insert(id.clone(), name);
             }
-            if let (Some(created), Some(updated)) = (created, updated) {
+            // The window fallback is only for an old composer, which has no
+            // exact edits. A composer with exact edits has a record of each
+            // change that its agent made. The fallback would also assign the
+            // user's own saves of the same files to that composer.
+            if let (Some(created), Some(updated), true) = (created, updated, cached.edits.is_empty()) {
                 composers.push(Composer {
                     files: cached.files.into_iter().collect(),
                     id,
