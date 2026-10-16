@@ -6,9 +6,9 @@
 //! behind the most matched lines. The output is JSON, one object per hunk.
 
 use crate::claude::BashCall;
-use crate::history::{EditSource, HistoryStore};
+use crate::history::HistoryStore;
+use recap_api::{Attribution, EditSource, EntryFields, HunkBlame};
 use chrono::{DateTime, Local};
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -210,49 +210,6 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
         Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
         None => Some((s.parse().ok()?, 1)),
     }
-}
-
-/// One session-and-prompt group that contributed lines to a hunk.
-#[derive(Debug, Clone, Serialize)]
-pub struct Attribution {
-    pub source: EditSource,
-    /// The Claude session or the Cursor composer. `None` for a manual edit.
-    pub session_id: Option<String>,
-    /// The Cursor composer name. Claude has no session name.
-    pub session_name: Option<String>,
-    /// The synthetic key of the prompt entry, the `file_path` of the prompt.
-    pub prompt_key: Option<String>,
-    pub prompt_time: Option<String>,
-    pub prompt: Option<String>,
-    pub response: Option<String>,
-    /// The newest edit of this group, RFC 3339.
-    pub edit_time: String,
-    pub matched_lines: usize,
-    /// The part of `matched_lines` that only a Bash command of the session
-    /// holds: the agent wrote the file with a shell command, so recap has no
-    /// snapshot of it. Weaker evidence than a snapshot line.
-    pub bash_lines: usize,
-}
-
-/// The attribution of one hunk.
-#[derive(Debug, Clone, Serialize)]
-pub struct HunkBlame {
-    pub file: String,
-    pub hunk_index: usize,
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
-    /// The number of `+` and `-` lines that were allowed to vote.
-    pub voting_lines: usize,
-    /// The group with the most matched lines, when it explains at least a
-    /// quarter of the voting lines. `None` otherwise; the groups are then
-    /// all in `others`.
-    pub winner: Option<Attribution>,
-    /// The other groups, sorted by matched lines.
-    pub others: Vec<Attribution>,
-    /// The file header plus this hunk, for `git apply --cached`.
-    pub patch: String,
 }
 
 /// The trimmed added and removed lines of one edit entry.
@@ -540,7 +497,8 @@ fn rfc3339(t: &DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{HistoryEntry, HistoryEntryKind};
+    use crate::history::HistoryEntry;
+    use recap_api::EntryKind;
 
     const TWO_FILES: &str = "\
 diff --git a/src/old.rs b/src/new.rs
@@ -633,7 +591,7 @@ index 1111111..2222222 100644
             base_path: None,
             project_roots: Vec::new(),
             source: EditSource::ClaudeCode,
-            kind: HistoryEntryKind::FileChange,
+            kind: EntryKind::FileChange,
             session_id: Some(session.to_string()),
             session_cwd: None,
         }
@@ -647,7 +605,7 @@ index 1111111..2222222 100644
             base_path: None,
             project_roots: Vec::new(),
             source: EditSource::ClaudeCode,
-            kind: HistoryEntryKind::Prompt {
+            kind: EntryKind::Prompt {
                 text: text.to_string(),
                 response: Some(format!("done: {text}")),
             },

@@ -1,22 +1,14 @@
 mod app;
-mod blame;
-mod claude;
-mod cursor_sessions;
-mod cursor_workspace;
-mod diff;
-mod embed;
-mod history;
-mod log;
-mod nvim;
 mod persist;
 mod prompt;
+mod reltime;
 mod search_history;
-mod session;
+mod service;
 mod settings;
 mod ui;
 
 use anyhow::Result;
-use app::{App, KindFilter, Sources};
+use app::{App, KindFilter};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -25,14 +17,17 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use history::{EditSource, HistoryStore};
+use recap_api::{Api, BlameRequest, EditSource, EmbedStatus, Entry, EntryFields, Filter, Page, RunningSession, SearchKind};
+use recap_client::Client;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, SystemTime},
+    sync::{mpsc, Arc},
+    time::Duration,
 };
 
 fn copy_to_clipboard(text: &str) {
@@ -144,20 +139,19 @@ fn findterm_bin() -> Option<PathBuf> {
 /// in the session's working directory (see [`open_resume_window`]). No-op for
 /// entries without a session id
 /// (Cursor / Neovim) — there is no session to resume.
-fn focus_or_resume_session(entry: &history::HistoryEntry) {
+fn focus_or_resume_session(entry: &Entry, running: &HashMap<String, RunningSession>) {
     // Only Claude Code sessions are resumable via `claude --resume`. Cursor
     // entries also carry a session id (their composerId) for grouping, but it
     // is not a Claude session — never feed it to the resume path.
-    if entry.source != history::EditSource::ClaudeCode {
+    if entry.source != EditSource::ClaudeCode {
         return;
     }
     let Some(session_id) = entry.session_id.clone() else {
         return;
     };
 
-    // Consult a fresh scan rather than the cached snapshot so a session that
-    // started/stopped since the last refresh is handled correctly.
-    let running = session::RunningSessions::scan();
+    // The server scans the running sessions every 2 seconds, so this list is
+    // at most 2 seconds old.
     if let Some(rs) = running.get(&session_id) {
         if let Some(findterm) = findterm_bin() {
             let _ = Command::new(findterm)
@@ -258,78 +252,52 @@ fn restore_terminal() {
 /// Build the embedding index without the TUI, then run one query against it.
 /// The first build of the diff index needs 10 to 20 minutes, so it helps to
 /// run it in a plain terminal and watch the progress.
-fn run_index_cli(app: &mut App, queries: &[String]) -> Result<()> {
-    use app::EmbedStatus;
+fn run_index_cli(api: &dyn Api, queries: &[String]) -> Result<()> {
     use std::time::Instant;
 
-    load_store(app);
-
-    app.start_embedding(true);
+    api.start_embedding()?;
     let build = Instant::now();
     let mut last_done = usize::MAX;
     loop {
-        app.drain_embed_events();
-        match app.embed.status.clone() {
+        match api.status()?.embed {
             EmbedStatus::Ready => break,
-            EmbedStatus::Failed(e) => return Err(anyhow::anyhow!(e)),
+            EmbedStatus::Failed { error } => return Err(anyhow::anyhow!(error)),
             EmbedStatus::Off => break,
-            EmbedStatus::Starting | EmbedStatus::Indexing => {}
+            EmbedStatus::Starting => {}
+            EmbedStatus::Indexing { done, total } => {
+                if done != last_done {
+                    last_done = done;
+                    eprint!("\rembedded {done}/{total}      ");
+                }
+            }
         }
-        if app.embed.done != last_done {
-            last_done = app.embed.done;
-            let rate = app.embed.done as f32 / build.elapsed().as_secs_f32().max(0.001);
-            eprint!(
-                "\rembedded {}/{} ({rate:.0}/s)      ",
-                app.embed.done, app.embed.total
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(500));
     }
-    eprintln!(
-        "\nindex ready: {} vectors ({} prompts, {} edits) in {:.0}s",
-        app.embed.index.len(),
-        app.embed.index.count_of(embed::EmbedKind::Prompt),
-        app.embed.index.count_of(embed::EmbedKind::Diff),
-        build.elapsed().as_secs_f32()
-    );
+    eprintln!("\nindex ready in {:.0}s", build.elapsed().as_secs_f32());
 
+    let names: HashMap<PathBuf, String> = api
+        .projects()?
+        .projects
+        .into_iter()
+        .map(|p| (p.root, p.name))
+        .collect();
     for q in queries {
         let asked = Instant::now();
-        app.semantic_search(q, 50);
+        let matches = api.search(SearchKind::Semantic, q, &Filter::default())?.matches;
         println!("\nquery: {q}   ({:.0} ms)", asked.elapsed().as_secs_f32() * 1000.0);
-        for (rank, m) in app.search.matches.iter().take(15).enumerate() {
-            let entry = &app.store.entries[m.entry_idx];
+        for (rank, m) in matches.iter().take(15).enumerate() {
+            let entry = api.entry(&m.id)?;
             let kind = if entry.is_prompt() { "prompt" } else { "edit  " };
             println!(
                 "{:>2}. {:.3} {kind} {} {}",
                 rank + 1,
-                m.score as f32 / 10_000.0,
+                m.score as f32 / recap_api::SEMANTIC_SCORE_SCALE,
                 entry.timestamp.format("%Y-%m-%d"),
-                entry.display_path(&app.store.project_names)
+                entry.display_path(&names)
             );
         }
     }
     Ok(())
-}
-
-/// Load the whole history without the TUI. Progress goes to stderr.
-fn load_store(app: &mut App) {
-    let started = std::time::Instant::now();
-    // `recap list` calls this again for each widening of its period. Only the
-    // first call starts from an empty store, so only it prints the header.
-    if app.store.entries.is_empty() {
-        eprintln!("loading history…");
-    }
-    app.start_background_load();
-    while app.loading {
-        app.drain_load_events(50);
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    eprintln!(
-        "{} entries in {:.1}s",
-        app.store.entries.len(),
-        started.elapsed().as_secs_f32()
-    );
 }
 
 /// `recap blame [--stdin] [--] [<git diff args>...]`: attribute the hunks of
@@ -338,7 +306,7 @@ fn load_store(app: &mut App) {
 /// (default `HEAD`) in the current directory. A test of "is stdin a
 /// terminal" is not enough: an agent harness runs the command with a stdin
 /// that is not a terminal and never closes, and the read then never ends.
-fn run_blame_cli(app: &mut App, git_args: &[String], stdin: bool) -> Result<()> {
+fn run_blame_cli(api: &dyn Api, git_args: &[String], stdin: bool) -> Result<()> {
     let root = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -370,14 +338,12 @@ fn run_blame_cli(app: &mut App, git_args: &[String], stdin: bool) -> Result<()> 
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
-    let files = blame::parse_unified(&diff_text);
-    load_store(app);
-    let bash = match claude::projects_dir() {
-        Some(dir) => claude::bash_calls(&dir),
-        None => Vec::new(),
-    };
-    let blames = blame::attribute(&app.store, &files, &repo_root, &bash);
+    let blames = api.blame(&BlameRequest {
+        diff: diff_text,
+        repo_root,
+    })?;
     let unattributed = blames.iter().filter(|b| b.winner.is_none()).count();
+    let files: std::collections::HashSet<&str> = blames.iter().map(|b| b.file.as_str()).collect();
     eprintln!(
         "{} hunks in {} files, {unattributed} unattributed",
         blames.len(),
@@ -476,32 +442,47 @@ fn parse_list_filter(text: &str) -> Result<KindFilter> {
 /// it reaches [`LIST_WINDOW_CAP`]. The second load is incremental: the
 /// loaders remember the files that they already read.
 fn run_list_cli(
-    app: &mut App,
+    api: &dyn Api,
     limit: usize,
     window: Option<Duration>,
-    filter: KindFilter,
+    kind: KindFilter,
 ) -> Result<()> {
     let mut window = window;
-    loop {
-        app.load_since = window.map(|w| SystemTime::now() - w);
-        load_store(app);
-        if app.store.entries.iter().filter(|e| filter.keeps(e)).count() >= limit {
-            break;
+    let entries: Vec<Entry> = loop {
+        let filter = Filter {
+            kind,
+            after: window.and_then(|w| chrono::Duration::from_std(w).ok().map(|w| chrono::Local::now() - w)),
+            ..Filter::default()
+        };
+        let page = Page {
+            limit: Some(limit),
+            ..Page::default()
+        };
+        let entries: Vec<Entry> = api
+            .history(&filter, &page)?
+            .groups
+            .into_iter()
+            .flat_map(|g| g.entries)
+            .collect();
+        if entries.len() >= limit {
+            break entries;
         }
         match window {
-            None => break,
-            Some(w) if w >= LIST_WINDOW_CAP => break,
+            None => break entries,
+            Some(w) if w >= LIST_WINDOW_CAP => break entries,
             Some(w) => window = Some(w.saturating_mul(2).min(LIST_WINDOW_CAP)),
         }
-    }
-    let store = &app.store;
-    let rows: Vec<ListRow> = store
-        .entries
+    };
+    let names: HashMap<PathBuf, String> = api
+        .projects()?
+        .projects
+        .into_iter()
+        .map(|p| (p.root, p.name))
+        .collect();
+    let rows: Vec<ListRow> = entries
         .iter()
-        .enumerate()
-        .filter(|(_, e)| filter.keeps(e))
         .take(limit)
-        .map(|(i, e)| {
+        .map(|e| {
             let is_prompt = e.is_prompt();
             let project = e.project_root();
             ListRow {
@@ -509,25 +490,15 @@ fn run_list_cli(
                 kind: if is_prompt { "prompt" } else { "diff" },
                 source: e.source,
                 project,
-                project_name: project
-                    .and_then(|p| store.project_names.get(p))
-                    .map(String::as_str),
+                project_name: project.and_then(|p| names.get(p)).map(String::as_str),
                 session_id: e.session_id.as_deref(),
-                session_title: e
-                    .session_id
-                    .as_deref()
-                    .and_then(|s| store.session_titles.get(s))
-                    .map(String::as_str),
+                session_title: e.session_title.as_deref(),
                 session_cwd: e.session_cwd.as_deref(),
                 prompt: e.prompt_text(),
                 response: e.response_text(),
                 file: (!is_prompt).then(|| e.file_path.as_path()),
-                snapshot_path: (!is_prompt).then(|| e.snapshot_path.as_path()),
-                base_path: if is_prompt {
-                    None
-                } else {
-                    store.prev_snapshot(i)
-                },
+                snapshot_path: e.snapshot_path.as_deref(),
+                base_path: e.base_path.as_deref(),
             }
         })
         .collect();
@@ -535,9 +506,61 @@ fn run_list_cli(
     Ok(())
 }
 
+/// `recap serve [--port <n>] [--test] [--poll <seconds>]`: run the server
+/// until SIGINT or SIGTERM. The prod server uses port 7717 and the prod
+/// cache. `--test` uses port 7718 and a fresh copy of the prod cache (see
+/// [`recap_server::cache::prepare_test_cache`]).
+fn run_serve(args: &[String]) -> Result<()> {
+    let value = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+    };
+    let test = args.iter().any(|a| a == "--test");
+    let port = match value("--port") {
+        Some(v) => v
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("--port: `{v}` is not a port number"))?,
+        None if test => recap_client::TEST_PORT,
+        None => recap_client::PROD_PORT,
+    };
+    let poll = match value("--poll") {
+        Some(v) => Duration::from_secs_f32(
+            v.parse::<f32>()
+                .map_err(|_| anyhow::anyhow!("--poll: `{v}` is not a number of seconds"))?,
+        ),
+        None => DEFAULT_POLL,
+    };
+    recap_server::logger::init();
+    log::info!(
+        "recap {} starts: port {port}, poll {}, {} server",
+        env!("CARGO_PKG_VERSION"),
+        recap_server::logger::ms(poll),
+        if test { "test" } else { "prod" }
+    );
+    if test {
+        recap_server::cache::prepare_test_cache()?;
+    } else {
+        recap_server::paths::set_cache_root(recap_server::paths::prod_cache_root())?;
+        recap_server::cache::migrate(recap_server::paths::cache_root())?;
+    }
+    log::info!("cache {}", recap_server::paths::cache_root().display());
+    let server = recap_server::Server::start(poll);
+    recap_server::http::run(server, port)
+}
+
+/// The interval between two loads of the sources.
+const DEFAULT_POLL: Duration = Duration::from_secs(5);
+
 fn main() -> Result<()> {
     let absolute_time = std::env::args().any(|a| a == "--absolute" || a == "-a");
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("serve") {
+        return run_serve(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("service") {
+        return service::run(&args[2..]);
+    }
     let index_only = args.iter().any(|a| a == "--index");
     let blame_cmd = args.get(1).map(String::as_str) == Some("blame");
     let list_cmd = args.get(1).map(String::as_str) == Some("list");
@@ -549,8 +572,8 @@ fn main() -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50);
-    // The loaders read only the files that changed within this period. The
-    // default keeps the command fast; `--since all` reads everything.
+    // The command starts with the entries of this period, and doubles the
+    // period until it has enough entries. `--since all` reads everything.
     let list_window = match args.iter().position(|a| a == "--since") {
         Some(i) => parse_window(args.get(i + 1).map(String::as_str).unwrap_or("7d"))?,
         None => Some(Duration::from_secs(7 * 24 * 3600)),
@@ -586,32 +609,30 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
-    // Start with an empty store and kick the background loader off
-    // immediately so the TUI can render within the first frame. Batches
-    // stream in newest-first via `App::drain_load_events`.
-    let sources = Sources::detect();
-    let store = HistoryStore::from_entries(Vec::new());
-
-    let mut app = App::new(store, sources);
-    let persisted = persist::PersistedState::load();
-    // The index command searches the whole corpus. A persisted project or file
-    // selection would narrow the groups that the query ranks, so skip it.
-    if !index_only && !blame_cmd && !list_cmd {
-        app.apply_persisted(&persisted);
-    }
-    // CLI flag forces absolute time on; otherwise honor the persisted toggle.
-    app.absolute_time = absolute_time || persisted.absolute_time;
+    // `--server <url>` overrides `RECAP_URL`. Without both, the client
+    // uses the prod server.
+    let client = match args.iter().position(|a| a == "--server") {
+        Some(i) => Client::new(args.get(i + 1).cloned().unwrap_or_default()),
+        None => Client::from_env(),
+    };
 
     if index_only {
-        return run_index_cli(&mut app, &queries);
+        return run_index_cli(&client, &queries);
     }
     if blame_cmd {
-        return run_blame_cli(&mut app, &git_args, blame_stdin);
+        return run_blame_cli(&client, &git_args, blame_stdin);
     }
     if list_cmd {
-        return run_list_cli(&mut app, list_limit, list_window, list_filter);
+        return run_list_cli(&client, list_limit, list_window, list_filter);
     }
-    app.start_background_load();
+
+    let (tx, rx) = mpsc::channel();
+    recap_client::watch(client.clone(), tx);
+    let mut app = App::new(Arc::new(client));
+    let persisted = persist::PersistedState::load();
+    app.apply_persisted(&persisted);
+    // CLI flag forces absolute time on; otherwise honor the persisted toggle.
+    app.absolute_time = absolute_time || persisted.absolute_time;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -619,7 +640,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, &rx);
 
     app.persisted_state().save();
 
@@ -803,7 +824,7 @@ fn panel_under(rects: ui::LayoutRects, x: u16, y: u16) -> Option<app::Panel> {
 /// Move the project selection to the row index `target` in the projects
 /// list (where row 0 = "All projects"). No-op for out-of-range targets.
 fn select_project(app: &mut App, target: usize, visible: usize) {
-    let total_rows = app.store.projects.len() + 1;
+    let total_rows = app.view.projects.len() + 1;
     if target >= total_rows {
         return;
     }
@@ -833,7 +854,7 @@ fn select_file(app: &mut App, target: usize, visible: usize) {
     let new_path = if target == 0 {
         None
     } else {
-        app.files.get(target - 1).cloned()
+        app.files.get(target - 1).map(|f| f.path.clone())
     };
     if app.selected_file_path != new_path {
         app.selected_file_path = new_path;
@@ -873,7 +894,11 @@ fn select_history_row(app: &mut App, target: usize, visible: usize) {
     app.rebuild_display_after_external_mutation(visible);
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    messages: &mpsc::Receiver<recap_client::Message>,
+) -> Result<()> {
     loop {
         let size = terminal.size()?;
         let area = Rect {
@@ -912,10 +937,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             .map(|r| (r.height as usize).saturating_sub(2))
             .unwrap_or(full);
 
-        app.drain_load_events(visible_history);
-        app.drain_embed_events();
+        while let Ok(message) = messages.try_recv() {
+            match message {
+                recap_client::Message::Connected => app.on_reconnect(visible_history),
+                recap_client::Message::Event(event) => app.on_event(event, visible_history),
+                recap_client::Message::Disconnected(error) => app.on_disconnect(error),
+            }
+        }
         app.maybe_run_pending_search(visible_history);
-        app.maybe_rescan_running();
         app.ensure_summaries_visible(visible_history);
         let list_width = (rects.history.width as usize).saturating_sub(2);
         app.recompute_row_heights(list_width, visible_history);
@@ -1108,8 +1137,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                             }
                         }
                         KeyCode::Char('o') => {
-                            if let Some(entry) = app.current_entry() {
-                                focus_or_resume_session(entry);
+                            if let Some(entry) = app.current_entry().cloned() {
+                                // An archived session must be back in the
+                                // projects directory before `claude --resume`.
+                                if !entry.session_archived || app.restore_session(&entry) {
+                                    focus_or_resume_session(&entry, &app.running);
+                                }
                             }
                         }
                         KeyCode::Char('r') if !ctrl => app.reload(visible_history),

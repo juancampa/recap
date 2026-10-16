@@ -2,30 +2,7 @@ use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-pub enum DiffLine {
-    Added(String),
-    Removed(String),
-    Context(String),
-    Header(String),
-    /// One source line of a prompt entry's body. The renderer formats it
-    /// with the same wrapping, indent and Markdown highlighting the History
-    /// panel uses (see `ui::prompt_line_spans`).
-    Prompt(String),
-    /// One source line of the agent's final response to a prompt entry. The
-    /// renderer formats it like a `Prompt` line, in the response color.
-    Response(String),
-    /// Per-child separator emitted when a collapsed group's diff is the
-    /// concatenation of its children. The renderer formats this with the
-    /// same spans the history panel uses, keyed by `entry_idx`.
-    ChildSeparator { entry_idx: usize },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DiffSummary {
-    pub added: usize,
-    pub removed: usize,
-}
+pub use recap_api::{DiffLine, DiffSummary};
 
 /// Cheap diff that only counts added/removed lines, for the history sidebar.
 pub fn compute_summary(old_path: Option<&Path>, new_path: &Path) -> DiffSummary {

@@ -247,6 +247,19 @@ impl EmbedClient {
         ))
     }
 
+    /// True if a server already answers `/health` on the port. The prod
+    /// recap server and the test recap server share the port, so the second
+    /// one uses the model server of the first one.
+    pub fn is_ready(&self) -> bool {
+        matches!(
+            self.agent
+                .get(&format!("{}/health", self.base))
+                .timeout(Duration::from_secs(2))
+                .call(),
+            Ok(r) if r.status() == 200
+        )
+    }
+
     /// Embed a batch of document texts. The returned vectors are truncated to
     /// `dims` and normalized.
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -369,8 +382,7 @@ pub struct EmbedDb {
 }
 
 fn db_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".cache/recap/embeddings.db"))
+    Some(crate::paths::cache_root().join("embeddings.db"))
 }
 
 impl EmbedDb {

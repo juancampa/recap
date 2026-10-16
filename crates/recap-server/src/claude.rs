@@ -18,6 +18,11 @@
 //! are separate lines; a tool-use line discards the candidate response. User
 //! lines that the harness writes (`<task-notification>`, `<system-reminder>`,
 //! command output) are not prompts and do not end the turn.
+//!
+//! Claude Code deletes a session file after `cleanupPeriodDays` (30 days by
+//! default). The loader keeps a compressed copy of each session in
+//! [`archive_dir`], and reads the copy when the session file is gone. See
+//! [`transcripts`].
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -28,7 +33,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind};
+use crate::history::{find_project_chain, HistoryEntry};
+use recap_api::{EditSource, EntryKind};
 
 #[derive(Debug, Deserialize)]
 struct Line {
@@ -46,6 +52,13 @@ struct Line {
     /// History panel's title column, next to the Cursor composer names.
     #[serde(rename = "aiTitle")]
     ai_title: Option<String>,
+    /// `away_summary` on the `system` line that holds the summary of the
+    /// session that Claude Code shows while the session is idle.
+    subtype: Option<String>,
+    /// The text of a `system` line. A `Value`, because a line of another
+    /// type can hold a `content` that is not a string, and a parse error
+    /// drops the whole line.
+    content: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,79 +74,78 @@ pub fn projects_dir() -> Option<PathBuf> {
 }
 
 fn cache_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".cache/recap/claude")
+    crate::paths::cache_root().join("claude")
 }
 
 /// Scan all Claude project dirs, emitting one batch per session via
 /// `on_batch`. Sessions are processed newest-first (sorted by `.jsonl`
-/// mtime descending). Each call also carries the session titles that the
-/// session file records (session id → title). `on_batch` returning `false`
-/// aborts the scan.
+/// mtime descending). Each call also carries the session titles and the
+/// session summaries that the session file records (session id → text).
+/// `on_batch` returning `false` aborts the scan.
 /// Read the session files. `since` limits the scan: the loader skips a file
 /// whose mtime is older, because such a file holds no newer entry. `None`
 /// reads every file.
+///
+/// The loader also reads the archived sessions (see [`transcripts`]), and
+/// copies each live session that it reads to `archive_dir`. The function
+/// returns the ids of the archived sessions.
 pub fn load(
     projects_dir: &Path,
+    archive_dir: &Path,
     mtimes: &mut HashMap<PathBuf, SystemTime>,
     seen_keys: &mut HashSet<PathBuf>,
     since: Option<SystemTime>,
-    on_batch: &mut dyn FnMut(Vec<HistoryEntry>, HashMap<String, String>) -> bool,
-) -> Result<()> {
+    on_batch: &mut dyn FnMut(Vec<HistoryEntry>, HashMap<String, String>, HashMap<String, String>) -> bool,
+) -> Result<HashSet<String>> {
     let mut chain_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
-    let read = match fs::read_dir(projects_dir) {
-        Ok(r) => r,
-        Err(_) => return Ok(()),
-    };
+    let all = transcripts(projects_dir, archive_dir);
+    let archived: HashSet<String> = all.iter().filter(|t| t.archived).map(|t| t.id.clone()).collect();
 
-    let mut sessions: Vec<(PathBuf, SystemTime)> = Vec::new();
-    for proj in read.flatten() {
-        let proj_path = proj.path();
-        if !proj_path.is_dir() {
+    let mut sessions: Vec<(Transcript, SystemTime)> = Vec::new();
+    for t in all {
+        let Some(mtime) = fs::metadata(&t.path).ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        // Skip session files whose jsonl hasn't grown since the last scan.
+        if let Some(prev) = mtimes.get(&t.path).copied()
+            && mtime <= prev
+        {
             continue;
         }
-        let inner = match fs::read_dir(&proj_path) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        for f in inner.flatten() {
-            let p = f.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let Some(mtime) = fs::metadata(&p).ok().and_then(|m| m.modified().ok()) else {
-                continue;
-            };
-            // Skip session files whose jsonl hasn't grown since the last scan.
-            if let Some(prev) = mtimes.get(&p).copied()
-                && mtime <= prev
-            {
-                continue;
-            }
-            if since.is_some_and(|cut| mtime < cut) {
-                continue;
-            }
-            sessions.push((p, mtime));
+        if since.is_some_and(|cut| mtime < cut) {
+            continue;
         }
+        sessions.push((t, mtime));
     }
     sessions.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (path, mtime) in sessions {
+    for (t, mtime) in sessions {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         let mut titles: HashMap<String, String> = HashMap::new();
-        if let Err(e) = load_session(&path, &mut batch, &mut chain_cache, seen_keys, &mut titles) {
-            crate::log_warn!("recap: skipped session {}: {e}", path.display());
+        let mut summaries: HashMap<String, String> = HashMap::new();
+        let loaded = t.read().and_then(|content| {
+            load_session(&t.id, &content, &mut batch, &mut chain_cache, seen_keys, &mut titles, &mut summaries)
+        });
+        if let Err(e) = loaded {
+            log::warn!("skipped session {}: {e}", t.path.display());
         }
-        mtimes.insert(path, mtime);
+        if !t.archived
+            && let Err(e) = archive_session(projects_dir, archive_dir, &t.project, &t.id)
+        {
+            log::warn!("cannot archive session {}: {e}", t.path.display());
+        }
+        mtimes.insert(t.path, mtime);
         // A session whose file did not grow emits no entry, but it can still
-        // carry a title that an earlier scan did not see.
-        if (!batch.is_empty() || !titles.is_empty()) && !on_batch(batch, titles) {
-            return Ok(());
+        // carry a title or a summary that an earlier scan did not see.
+        if (!batch.is_empty() || !titles.is_empty() || !summaries.is_empty())
+            && !on_batch(batch, titles, summaries)
+        {
+            return Ok(archived);
         }
     }
 
-    Ok(())
+    Ok(archived)
 }
 
 /// One `Bash` tool call of a session. `recap blame` searches these commands
@@ -147,89 +159,261 @@ pub struct BashCall {
     pub command: String,
 }
 
-/// Every `Bash` tool call in every session under `projects_dir`.
-pub fn bash_calls(projects_dir: &Path) -> Vec<BashCall> {
+/// Every `Bash` tool call in every session under `projects_dir`, and in
+/// every archived session (see [`transcripts`]).
+pub fn bash_calls(projects_dir: &Path, archive_dir: &Path) -> Vec<BashCall> {
     let mut out = Vec::new();
-    let Ok(read) = fs::read_dir(projects_dir) else {
-        return out;
-    };
-    for proj in read.flatten() {
-        let Ok(inner) = fs::read_dir(proj.path()) else {
+    for t in transcripts(projects_dir, archive_dir) {
+        let Ok(content) = t.read() else {
             continue;
         };
-        for f in inner.flatten() {
-            let path = f.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        let session_id = t.id;
+        for raw in content.lines() {
+            // A cheap text test before the JSON parse: most lines hold
+            // no Bash call.
+            if !raw.contains("\"name\":\"Bash\"") {
                 continue;
             }
-            let Ok(content) = fs::read_to_string(&path) else {
+            let Ok(line) = serde_json::from_str::<Line>(raw) else {
                 continue;
             };
-            let session_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("session")
-                .to_string();
-            for raw in content.lines() {
-                // A cheap text test before the JSON parse: most lines hold
-                // no Bash call.
-                if !raw.contains("\"name\":\"Bash\"") {
+            if line.kind.as_deref() != Some("assistant") {
+                continue;
+            }
+            let Some(ts) = line
+                .timestamp
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            else {
+                continue;
+            };
+            let Some(arr) = line
+                .message
+                .as_ref()
+                .and_then(|m| m.content.as_ref())
+                .and_then(|c| c.as_array())
+            else {
+                continue;
+            };
+            for item in arr {
+                if item.get("type").and_then(|t| t.as_str()) != Some("tool_use")
+                    || item.get("name").and_then(|n| n.as_str()) != Some("Bash")
+                {
                     continue;
                 }
-                let Ok(line) = serde_json::from_str::<Line>(raw) else {
-                    continue;
-                };
-                if line.kind.as_deref() != Some("assistant") {
-                    continue;
-                }
-                let Some(ts) = line
-                    .timestamp
-                    .as_deref()
-                    .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                let Some(command) = item
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|c| c.as_str())
                 else {
                     continue;
                 };
-                let Some(arr) = line
-                    .message
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref())
-                    .and_then(|c| c.as_array())
-                else {
-                    continue;
-                };
-                for item in arr {
-                    if item.get("type").and_then(|t| t.as_str()) != Some("tool_use")
-                        || item.get("name").and_then(|n| n.as_str()) != Some("Bash")
-                    {
-                        continue;
-                    }
-                    let Some(command) = item
-                        .get("input")
-                        .and_then(|i| i.get("command"))
-                        .and_then(|c| c.as_str())
-                    else {
-                        continue;
-                    };
-                    out.push(BashCall {
-                        session_id: session_id.clone(),
-                        timestamp: ts.with_timezone(&Local),
-                        command: command.to_string(),
-                    });
-                }
+                out.push(BashCall {
+                    session_id: session_id.clone(),
+                    timestamp: ts.with_timezone(&Local),
+                    command: command.to_string(),
+                });
             }
         }
     }
     out
 }
 
+// ── The transcript archive ───────────────────────────────────────────────────
+//
+// The code in this section is the only code that knows how Claude Code lays
+// out a session in the projects directory. `transcripts` and `session_files`
+// read that layout, and `restore_session` writes it. If Claude Code changes
+// the layout, change the three functions together.
+
+/// The directory of recap's copies of the Claude Code session files. It has
+/// the layout of the projects directory, and each file name has the suffix
+/// [`ARCHIVE_SUFFIX`].
+pub fn archive_dir() -> PathBuf {
+    crate::paths::cache_root().join("claude-archive")
+}
+
+/// The suffix of each file in [`archive_dir`]: the file is compressed with
+/// zstd.
+const ARCHIVE_SUFFIX: &str = ".zst";
+
+/// The suffix of a session transcript in the projects directory.
+const TRANSCRIPT_SUFFIX: &str = ".jsonl";
+
+/// One session transcript that the loader can read.
+struct Transcript {
+    /// The name of the project directory, for example `-Users-juan-git-recap`.
+    project: String,
+    /// The session id: the file name without [`TRANSCRIPT_SUFFIX`].
+    id: String,
+    /// `<projects>/<project>/<id>.jsonl`, or the archive copy of it.
+    path: PathBuf,
+    /// True when Claude Code deleted the session file, and `path` is the
+    /// archive copy.
+    archived: bool,
+}
+
+impl Transcript {
+    fn read(&self) -> Result<String> {
+        if !self.archived {
+            return Ok(fs::read_to_string(&self.path)?);
+        }
+        let data = zstd::decode_all(fs::File::open(&self.path)?)?;
+        Ok(String::from_utf8(data)?)
+    }
+}
+
+/// Every session transcript: each `<project>/<id>.jsonl` in `projects_dir`,
+/// and each archive copy in `archive_dir` whose session file does not exist.
+///
+/// [`restore_session`] writes an archived session back to this layout. A
+/// change to how this function or [`session_files`] reads the projects
+/// directory must also change [`restore_session`].
+fn transcripts(projects_dir: &Path, archive_dir: &Path) -> Vec<Transcript> {
+    let mut out = Vec::new();
+    for (root, suffix, archived) in [
+        (projects_dir, TRANSCRIPT_SUFFIX.to_string(), false),
+        (archive_dir, format!("{TRANSCRIPT_SUFFIX}{ARCHIVE_SUFFIX}"), true),
+    ] {
+        let Ok(read) = fs::read_dir(root) else {
+            continue;
+        };
+        for proj in read.flatten() {
+            let proj_path = proj.path();
+            if !proj_path.is_dir() {
+                continue;
+            }
+            let Some(project) = proj.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(inner) = fs::read_dir(&proj_path) else {
+                continue;
+            };
+            for f in inner.flatten() {
+                let path = f.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(id) = f.file_name().to_str().and_then(|n| n.strip_suffix(&suffix)).map(str::to_string)
+                else {
+                    continue;
+                };
+                if archived && projects_dir.join(&project).join(format!("{id}{TRANSCRIPT_SUFFIX}")).exists() {
+                    continue;
+                }
+                out.push(Transcript { project: project.clone(), id, path, archived });
+            }
+        }
+    }
+    out
+}
+
+/// The files of the session `id` of `project` under `root`, relative to
+/// `root` and without `suffix`. Claude Code keeps a session as the
+/// transcript `<project>/<id>.jsonl` and the optional directory
+/// `<project>/<id>/` (subagent transcripts, large tool results). The
+/// archive has the same layout, with [`ARCHIVE_SUFFIX`] on each file name.
+/// [`archive_session`] and [`restore_session`] copy the files that this
+/// function returns.
+fn session_files(root: &Path, project: &str, id: &str, suffix: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let transcript = PathBuf::from(project).join(format!("{id}{TRANSCRIPT_SUFFIX}"));
+    if root.join(with_suffix(&transcript, suffix)).is_file() {
+        out.push(transcript);
+    }
+    add_dir_files(root, &PathBuf::from(project).join(id), suffix, &mut out);
+    out
+}
+
+/// Add each file under `root/dir` to `out`, relative to `root` and without
+/// `suffix`. The function ignores a file without `suffix`, for example a
+/// temporary file of [`crate::cache::write_atomic`].
+fn add_dir_files(root: &Path, dir: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(read) = fs::read_dir(root.join(dir)) else {
+        return;
+    };
+    for item in read.flatten() {
+        let rel = dir.join(item.file_name());
+        let Ok(kind) = item.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            add_dir_files(root, &rel, suffix, out);
+        } else if kind.is_file()
+            && let Some(name) = item.file_name().to_str().and_then(|n| n.strip_suffix(suffix))
+        {
+            out.push(dir.join(name));
+        }
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Copy the files of a live session to `archive_dir`. Each archive copy has
+/// the mtime of its source file. The function skips a file whose copy has
+/// the same mtime, because that file did not change.
+fn archive_session(projects_dir: &Path, archive_dir: &Path, project: &str, id: &str) -> Result<()> {
+    for rel in session_files(projects_dir, project, id, "") {
+        let src = projects_dir.join(&rel);
+        let dst = archive_dir.join(with_suffix(&rel, ARCHIVE_SUFFIX));
+        // Read the mtime before the content. If Claude Code appends to the
+        // file during the copy, the copy gets the older mtime, and the next
+        // load copies the file again.
+        let mtime = fs::metadata(&src)?.modified()?;
+        if fs::metadata(&dst).and_then(|m| m.modified()).ok() == Some(mtime) {
+            continue;
+        }
+        let data = zstd::encode_all(fs::File::open(&src)?, 0)?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        crate::cache::write_atomic(&dst, &data)?;
+        fs::File::options().write(true).open(&dst)?.set_modified(mtime)?;
+    }
+    Ok(())
+}
+
+/// Write the archived files of the session `id` back to `projects_dir`, so
+/// `claude --resume` can open the session again. The function does not
+/// replace a file that exists, because Claude Code wrote it.
+///
+/// The restored files get the current time as mtime, not the original one.
+/// With the original mtime, the cleanup of Claude Code can delete the files
+/// again before `claude --resume` reads them.
+pub fn restore_session(projects_dir: &Path, archive_dir: &Path, id: &str) -> Result<()> {
+    let archived = transcripts(projects_dir, archive_dir);
+    let Some(t) = archived.iter().find(|t| t.archived && t.id == id) else {
+        anyhow::bail!("the archive has no session {id} that Claude Code deleted");
+    };
+    for rel in session_files(archive_dir, &t.project, id, ARCHIVE_SUFFIX) {
+        let dst = projects_dir.join(&rel);
+        if dst.exists() {
+            continue;
+        }
+        let data = zstd::decode_all(fs::File::open(archive_dir.join(with_suffix(&rel, ARCHIVE_SUFFIX)))?)?;
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        crate::cache::write_atomic(&dst, &data)?;
+    }
+    log::info!("restored the archived Claude Code session {id} to {}", projects_dir.join(&t.project).display());
+    Ok(())
+}
+
+/// Read the transcript `content` of the session `session_id`.
 fn load_session(
-    path: &Path,
+    session_id: &str,
+    content: &str,
     out: &mut Vec<HistoryEntry>,
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     seen_keys: &mut HashSet<PathBuf>,
     titles: &mut HashMap<String, String>,
+    summaries: &mut HashMap<String, String>,
 ) -> Result<()> {
-    let content = fs::read_to_string(path)?;
     let raw_lines: Vec<Line> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -263,11 +447,7 @@ fn load_session(
     }
 
     // Second pass: replay edits in document order, snapshotting after each.
-    let session_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string();
+    let session_id = session_id.to_string();
     let session_cache = cache_root().join(&session_id);
 
     // The session title. Claude Code appends an `ai-title` line each time it
@@ -279,6 +459,18 @@ fn load_session(
         l.ai_title.as_deref().filter(|t| !t.trim().is_empty())
     }) {
         titles.insert(session_id.clone(), title.to_string());
+    }
+
+    // The session summary. Claude Code appends an `away_summary` line each
+    // time the session becomes idle, so the last line holds the current
+    // summary.
+    if let Some(summary) = raw_lines.iter().rev().find_map(|l| {
+        if l.kind.as_deref() != Some("system") || l.subtype.as_deref() != Some("away_summary") {
+            return None;
+        }
+        l.content.as_ref()?.as_str().filter(|t| !t.trim().is_empty())
+    }) {
+        summaries.insert(session_id.clone(), summary.to_string());
     }
 
     // The session's working directory, taken from the first line that records
@@ -308,7 +500,7 @@ fn load_session(
         if !is_new && response.is_none() {
             return;
         }
-        if let HistoryEntryKind::Prompt { response: slot, .. } = &mut prompt.kind {
+        if let EntryKind::Prompt { response: slot, .. } = &mut prompt.kind {
             *slot = response;
         }
         seen_keys.insert(prompt.file_path.clone());
@@ -470,7 +662,7 @@ fn load_session(
                 base_path,
                 project_roots,
                 source: EditSource::ClaudeCode,
-                kind: HistoryEntryKind::FileChange,
+                kind: EntryKind::FileChange,
                 session_id: Some(session_id.clone()),
                 session_cwd: session_cwd.clone(),
             });
@@ -595,7 +787,7 @@ fn extract_prompt(
         base_path: None,
         project_roots,
         source: EditSource::ClaudeCode,
-        kind: HistoryEntryKind::Prompt {
+        kind: EntryKind::Prompt {
             text,
             response: None,
         },
@@ -632,7 +824,14 @@ fn apply_edit(
             .values()
             .find(|c| c.contains(old))
             .cloned()
-            .or_else(|| fs::read_to_string(file_path).ok().filter(|c| c.contains(old)))
+            // macOS can ask the user before the server reads a file in a
+            // protected folder, and the read waits for the answer.
+            .or_else(|| {
+                (!crate::paths::in_protected_folder(file_path))
+                    .then(|| fs::read_to_string(file_path).ok())
+                    .flatten()
+                    .filter(|c| c.contains(old))
+            })
             .unwrap_or_else(|| old.to_string());
         state.insert(file_path.to_path_buf(), seed);
     }
@@ -668,9 +867,9 @@ fn write_snapshot(
     };
     let path = session_cache.join(name);
     if !path.exists()
-        && let Err(e) = fs::write(&path, content)
+        && let Err(e) = crate::cache::write_atomic(&path, content.as_bytes())
     {
-        crate::log_warn!("recap: snapshot write failed: {e}");
+        log::warn!("snapshot write failed: {e}");
         return None;
     }
     Some(path)
@@ -679,6 +878,7 @@ fn write_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recap_api::EntryFields;
 
     #[test]
     fn a_harness_tag_is_not_a_prompt() {
@@ -729,38 +929,60 @@ mod tests {
     /// one, because a rename appends a new line.
     #[test]
     fn the_last_ai_title_line_names_the_session() {
-        let dir = std::env::temp_dir().join(format!("recap-claude-title-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("titled.jsonl");
         let lines = vec![
             serde_json::json!({ "type": "ai-title", "aiTitle": "First name" }).to_string(),
             user("u1", "hello"),
             serde_json::json!({ "type": "ai-title", "aiTitle": "Page embed argument handling" })
                 .to_string(),
         ];
-        fs::write(&path, lines.join("\n")).unwrap();
         let mut out = Vec::new();
         let mut chain_cache = HashMap::new();
         let mut titles = HashMap::new();
+        let mut summaries = HashMap::new();
         let mut seen = HashSet::new();
-        load_session(&path, &mut out, &mut chain_cache, &mut seen, &mut titles).unwrap();
+        load_session("titled", &lines.join("\n"), &mut out, &mut chain_cache, &mut seen, &mut titles, &mut summaries)
+            .unwrap();
         assert_eq!(
             titles.get("titled").map(String::as_str),
             Some("Page embed argument handling")
         );
     }
 
-    /// Write `lines` as the session `name` and load it. Each test uses its
-    /// own name, because the tests run in parallel.
+    /// The summary that Claude Code shows while the session is idle. The
+    /// app keeps the last one, because each idle period appends a new line.
+    #[test]
+    fn the_last_away_summary_line_summarizes_the_session() {
+        let summary = |text: &str| {
+            serde_json::json!({ "type": "system", "subtype": "away_summary", "content": text }).to_string()
+        };
+        let lines = vec![
+            summary("I read the loader."),
+            user("u1", "hello"),
+            serde_json::json!({ "type": "attachment", "content": { "kind": "file" } }).to_string(),
+            summary("I added the archive."),
+        ];
+        let mut summaries = HashMap::new();
+        load_session(
+            "summarized",
+            &lines.join("\n"),
+            &mut Vec::new(),
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+            &mut summaries,
+        )
+        .unwrap();
+        assert_eq!(summaries.get("summarized").map(String::as_str), Some("I added the archive."));
+    }
+
+    /// Load `lines` as the session `name`. Each test uses its own name,
+    /// because the tests run in parallel.
     fn load_lines(name: &str, lines: &[String], seen: &mut HashSet<PathBuf>) -> Vec<HistoryEntry> {
-        let dir = std::env::temp_dir().join(format!("recap-claude-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{name}.jsonl"));
-        fs::write(&path, lines.join("\n")).unwrap();
         let mut out = Vec::new();
         let mut chain_cache = HashMap::new();
         let mut titles = HashMap::new();
-        load_session(&path, &mut out, &mut chain_cache, seen, &mut titles).unwrap();
+        let mut summaries = HashMap::new();
+        load_session(name, &lines.join("\n"), &mut out, &mut chain_cache, seen, &mut titles, &mut summaries).unwrap();
         out
     }
 
@@ -851,6 +1073,88 @@ mod tests {
         let _ = fs::remove_dir_all(cache_root().join("stale"));
     }
 
+    fn bash_tool(uuid: &str, command: &str) -> String {
+        line(
+            "assistant",
+            uuid,
+            serde_json::json!([{ "type": "tool_use", "id": "t1", "name": "Bash",
+                "input": { "command": command } }]),
+        )
+    }
+
+    /// Load all the sessions under `projects` and `archive`. Returns the
+    /// prompt texts and the archived session ids.
+    fn load_prompts(projects: &Path, archive: &Path) -> (Vec<String>, HashSet<String>) {
+        let mut prompts = Vec::new();
+        let mut on_batch = |batch: Vec<HistoryEntry>, _titles: HashMap<String, String>, _summaries: HashMap<String, String>| -> bool {
+            prompts.extend(batch.iter().filter_map(|e| e.prompt_text().map(str::to_string)));
+            true
+        };
+        let archived =
+            load(projects, archive, &mut HashMap::new(), &mut HashSet::new(), None, &mut on_batch).unwrap();
+        (prompts, archived)
+    }
+
+    /// The loader copies a session to the archive. After Claude Code deletes
+    /// the session, the loader reads the copy, and the restore writes the
+    /// same files back.
+    #[test]
+    fn a_deleted_session_loads_from_the_archive_and_restores() {
+        let root = std::env::temp_dir().join(format!("recap-claude-archive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let projects = root.join("projects");
+        let archive = root.join("archive");
+        let project = projects.join("-tmp-proj");
+        let transcript = [user("u1", "archive me"), bash_tool("a1", "sed -i s/a/b/ x.rs")].join("\n");
+        fs::create_dir_all(project.join("s1/subagents")).unwrap();
+        fs::write(project.join("s1.jsonl"), &transcript).unwrap();
+        fs::write(project.join("s1/subagents/agent-a.jsonl"), "subagent").unwrap();
+
+        let (prompts, archived) = load_prompts(&projects, &archive);
+        assert_eq!(prompts, vec!["archive me"]);
+        assert!(archived.is_empty());
+        assert!(archive.join("-tmp-proj/s1.jsonl.zst").is_file());
+        assert!(archive.join("-tmp-proj/s1/subagents/agent-a.jsonl.zst").is_file());
+
+        // Claude Code deletes the session.
+        fs::remove_dir_all(&project).unwrap();
+        let (prompts, archived) = load_prompts(&projects, &archive);
+        assert_eq!(prompts, vec!["archive me"]);
+        assert_eq!(archived, HashSet::from(["s1".to_string()]));
+        let bash = bash_calls(&projects, &archive);
+        assert_eq!(bash.len(), 1);
+        assert_eq!(bash[0].session_id, "s1");
+
+        restore_session(&projects, &archive, "s1").unwrap();
+        assert_eq!(fs::read_to_string(project.join("s1.jsonl")).unwrap(), transcript);
+        assert_eq!(fs::read_to_string(project.join("s1/subagents/agent-a.jsonl")).unwrap(), "subagent");
+        let (_, archived) = load_prompts(&projects, &archive);
+        assert!(archived.is_empty());
+        assert!(restore_session(&projects, &archive, "s1").is_err(), "a live session is not archived");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The restore never replaces a file that Claude Code wrote.
+    #[test]
+    fn a_restore_keeps_the_files_that_exist() {
+        let root = std::env::temp_dir().join(format!("recap-claude-restore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let projects = root.join("projects");
+        let archive = root.join("archive");
+        let project = projects.join("-tmp-proj");
+        fs::create_dir_all(project.join("s2/tool-results")).unwrap();
+        fs::write(project.join("s2.jsonl"), user("u1", "hi")).unwrap();
+        fs::write(project.join("s2/tool-results/r.txt"), "old").unwrap();
+        archive_session(&projects, &archive, "-tmp-proj", "s2").unwrap();
+
+        fs::remove_file(project.join("s2.jsonl")).unwrap();
+        fs::write(project.join("s2/tool-results/r.txt"), "new").unwrap();
+        restore_session(&projects, &archive, "s2").unwrap();
+        assert_eq!(fs::read_to_string(project.join("s2.jsonl")).unwrap(), user("u1", "hi"));
+        assert_eq!(fs::read_to_string(project.join("s2/tool-results/r.txt")).unwrap(), "new");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Reads the real transcripts. Prints how many prompts carry a response.
     #[test]
     #[ignore]
@@ -861,7 +1165,7 @@ mod tests {
         let mut prompts = 0;
         let mut with_response = 0;
         let mut harness = 0;
-        let mut on_batch = |batch: Vec<HistoryEntry>, _titles: HashMap<String, String>| -> bool {
+        let mut on_batch = |batch: Vec<HistoryEntry>, _titles: HashMap<String, String>, _summaries: HashMap<String, String>| -> bool {
             for e in &batch {
                 if e.is_prompt() {
                     prompts += 1;
@@ -875,7 +1179,7 @@ mod tests {
             }
             true
         };
-        load(&dir, &mut mtimes, &mut seen, None, &mut on_batch).unwrap();
+        load(&dir, &archive_dir(), &mut mtimes, &mut seen, None, &mut on_batch).unwrap();
         eprintln!("prompts={prompts} with_response={with_response} tag-prefixed={harness}");
         assert!(with_response > 0);
     }

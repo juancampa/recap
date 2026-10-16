@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone};
 use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
+use recap_api::{EditSource, EntryFields, EntryKind};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,32 +22,7 @@ struct RawEntry {
     timestamp: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EditSource {
-    Cursor,
-    ClaudeCode,
-    Neovim,
-}
-
-#[derive(Debug, Clone)]
-pub enum HistoryEntryKind {
-    /// A file edit. `snapshot_path` points at the captured file content;
-    /// `file_path` is the real on-disk path.
-    FileChange,
-    /// A user prompt sent to the LLM. `snapshot_path` is unused; `file_path`
-    /// is a synthetic unique key (e.g. `claude:<session>:<uuid>`) that keeps
-    /// `build_groups` from coalescing distinct prompts. `response` is the
-    /// final text the agent wrote for this prompt, after its last tool use.
-    /// `None` when the turn has no final text: an interrupted turn, a queued
-    /// prompt, or a session that still runs.
-    Prompt {
-        text: String,
-        response: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HistoryEntry {
     pub timestamp: DateTime<Local>,
     /// The original file this entry belongs to (decoded path), or for
@@ -65,7 +41,7 @@ pub struct HistoryEntry {
     /// Each entry contains a project marker (.git, Cargo.toml, etc).
     pub project_roots: Vec<PathBuf>,
     pub source: EditSource,
-    pub kind: HistoryEntryKind,
+    pub kind: EntryKind,
     /// Originating agent session id, when the source has one. Claude Code
     /// entries carry their `<session>.jsonl` id here so the UI can check
     /// whether that session is still running (see [`crate::session`]) and
@@ -80,128 +56,16 @@ pub struct HistoryEntry {
     pub session_cwd: Option<PathBuf>,
 }
 
-impl HistoryEntry {
-    pub fn file_name(&self) -> &str {
-        self.file_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
+impl EntryFields for HistoryEntry {
+    fn kind(&self) -> &EntryKind {
+        &self.kind
     }
-
-    pub fn is_prompt(&self) -> bool {
-        matches!(self.kind, HistoryEntryKind::Prompt { .. })
+    fn file_path(&self) -> &Path {
+        &self.file_path
     }
-
-    pub fn prompt_text(&self) -> Option<&str> {
-        match &self.kind {
-            HistoryEntryKind::Prompt { text, .. } => Some(text),
-            HistoryEntryKind::FileChange => None,
-        }
+    fn project_roots(&self) -> &[PathBuf] {
+        &self.project_roots
     }
-
-    /// The agent's final response to a prompt entry. `None` for a file
-    /// change and for a prompt whose turn has no final text.
-    pub fn response_text(&self) -> Option<&str> {
-        match &self.kind {
-            HistoryEntryKind::Prompt { response, .. } => response.as_deref(),
-            HistoryEntryKind::FileChange => None,
-        }
-    }
-
-    /// Innermost project root, if any.
-    pub fn project_root(&self) -> Option<&Path> {
-        self.project_roots.last().map(|p| p.as_path())
-    }
-
-    /// Render the path as "outer → inner → relative/path/in/inner".
-    /// Falls back to last-N-components when no project context exists.
-    /// `names` provides a lookup for worktree-aware display names.
-    pub fn display_path(&self, names: &HashMap<PathBuf, String>) -> String {
-        const ARROW: &str = " → ";
-        let (chain, rel) = self.display_path_segments(names);
-        // The tail may be multi-line (prompt text); flatten for one-line display.
-        let rel = single_line(&rel);
-        if chain.is_empty() {
-            rel
-        } else {
-            format!("{}{}{}", chain.join(ARROW), ARROW, rel)
-        }
-    }
-
-    /// Split `display_path` into (project chain names, tail). For file-change
-    /// entries the tail is the relative path within the innermost project.
-    /// For prompt entries the tail is the prompt text flattened to a single
-    /// line. When there is no project context, the names list is empty and
-    /// the tail is a short fallback (file path tail or full prompt).
-    pub fn display_path_segments(
-        &self,
-        names: &HashMap<PathBuf, String>,
-    ) -> (Vec<String>, String) {
-        if let HistoryEntryKind::Prompt { text, .. } = &self.kind {
-            let chain = self.chain_names(names);
-            return (chain, single_line(text));
-        }
-
-        let Some(deepest) = self.project_root() else {
-            return (Vec::new(), short_path(&self.file_path, 3));
-        };
-
-        let chain = self.chain_names(names);
-
-        let rel = self
-            .file_path
-            .strip_prefix(deepest)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| self.file_path.to_string_lossy().into_owned());
-
-        (chain, rel)
-    }
-
-    fn chain_names(&self, names: &HashMap<PathBuf, String>) -> Vec<String> {
-        self.project_roots
-            .iter()
-            .map(|p| match names.get(p) {
-                Some(s) => s.clone(),
-                None => p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string(),
-            })
-            .collect()
-    }
-}
-
-/// Collapse newlines and runs of whitespace into a single space, so a
-/// multi-line prompt fits in one row of the History panel.
-pub fn single_line(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut last_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !last_space && !out.is_empty() {
-                out.push(' ');
-                last_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
-}
-
-fn short_path(path: &Path, n: usize) -> String {
-    let parts: Vec<_> = path.components().collect();
-    let start = parts.len().saturating_sub(n);
-    parts[start..]
-        .iter()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn parse_resource_path(resource: &str) -> PathBuf {
@@ -561,7 +425,7 @@ impl HistoryStore {
                     base_path: None,
                     project_roots: project_roots.clone(),
                     source: EditSource::Cursor,
-                    kind: HistoryEntryKind::FileChange,
+                    kind: EntryKind::FileChange,
                     // Attribution is applied as a post-pass once the (expensive)
                     // composer map is built off-thread; see `crate::app`.
                     session_id: None,
@@ -593,7 +457,7 @@ mod tests {
             base_path: None,
             project_roots: roots.iter().map(PathBuf::from).collect(),
             source: EditSource::Cursor,
-            kind: HistoryEntryKind::FileChange,
+            kind: EntryKind::FileChange,
             session_id: None,
             session_cwd: None,
         }
@@ -607,7 +471,7 @@ mod tests {
             base_path: None,
             project_roots: roots.iter().map(PathBuf::from).collect(),
             source: EditSource::ClaudeCode,
-            kind: HistoryEntryKind::Prompt {
+            kind: EntryKind::Prompt {
                 text: text.to_string(),
                 response: None,
             },
@@ -653,44 +517,6 @@ mod tests {
     fn display_path_no_project_falls_back() {
         let e = entry("/tmp/loose/file.txt", &[]);
         assert_eq!(e.display_path(&HashMap::new()), "tmp/loose/file.txt");
-    }
-
-    #[test]
-    fn align_durations_pads_unused_columns() {
-        let parts = vec![
-            DurationParts { days: 0, hours: 0, minutes: 5 },
-            DurationParts { days: 0, hours: 3, minutes: 12 },
-            DurationParts { days: 25, hours: 0, minutes: 7 },
-        ];
-        let out = super::align_durations(&parts);
-        // All same width; days column appears for everyone since one entry has days.
-        let widths: Vec<usize> = out.iter().map(|s| s.chars().count()).collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]));
-        assert_eq!(out[0], "        5m");
-        assert_eq!(out[1], "    3h 12m");
-        assert_eq!(out[2], "25d 0h  7m");
-    }
-
-    #[test]
-    fn align_durations_skips_day_column_when_unused() {
-        let parts = vec![
-            DurationParts { days: 0, hours: 0, minutes: 5 },
-            DurationParts { days: 0, hours: 3, minutes: 12 },
-        ];
-        let out = super::align_durations(&parts);
-        assert_eq!(out[0], "    5m");
-        assert_eq!(out[1], "3h 12m");
-    }
-
-    #[test]
-    fn align_durations_minutes_only_when_no_hours() {
-        let parts = vec![
-            DurationParts { days: 0, hours: 0, minutes: 5 },
-            DurationParts { days: 0, hours: 0, minutes: 47 },
-        ];
-        let out = super::align_durations(&parts);
-        assert_eq!(out[0], " 5m");
-        assert_eq!(out[1], "47m");
     }
 
     #[test]
@@ -751,88 +577,8 @@ mod tests {
         let prompt_idx = store
             .entries
             .iter()
-            .position(|e| matches!(e.kind, HistoryEntryKind::Prompt { .. }))
+            .position(|e| matches!(e.kind, EntryKind::Prompt { .. }))
             .expect("prompt present");
         assert_eq!(store.prev_snapshot(prompt_idx), None);
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DurationParts {
-    pub days: u64,
-    pub hours: u64,
-    pub minutes: u64,
-}
-
-pub fn duration_parts(dt: &DateTime<Local>) -> DurationParts {
-    let total_mins = Local::now().signed_duration_since(*dt).num_minutes().max(0) as u64;
-    DurationParts {
-        days: total_mins / (60 * 24),
-        hours: (total_mins / 60) % 24,
-        minutes: total_mins % 60,
-    }
-}
-
-fn digit_count(n: u64) -> usize {
-    n.checked_ilog10().map(|x| x as usize + 1).unwrap_or(1)
-}
-
-/// Format a batch of relative durations with vertically-aligned d/h/m
-/// columns. The minute column is always shown; the hour column appears when
-/// any entry has hours (or days); the day column appears when any entry has
-/// days. Returned strings all share the same width so callers can render
-/// them flush left and have units line up across rows.
-pub fn align_relative_times(timestamps: &[DateTime<Local>]) -> Vec<String> {
-    let parts: Vec<DurationParts> = timestamps.iter().map(duration_parts).collect();
-    align_durations(&parts)
-}
-
-fn align_durations(parts: &[DurationParts]) -> Vec<String> {
-    let any_days = parts.iter().any(|p| p.days > 0);
-    // Days imply hours so the column stays present even when an entry's
-    // hours field is 0 (e.g. `3d  0h 12m`).
-    let any_hours = any_days || parts.iter().any(|p| p.hours > 0);
-
-    let d_width = parts
-        .iter()
-        .filter(|p| p.days > 0)
-        .map(|p| digit_count(p.days) + 1)
-        .max()
-        .unwrap_or(0);
-    let h_width = parts
-        .iter()
-        .filter(|p| p.days > 0 || p.hours > 0)
-        .map(|p| digit_count(p.hours) + 1)
-        .max()
-        .unwrap_or(0);
-    let m_width = parts
-        .iter()
-        .map(|p| digit_count(p.minutes) + 1)
-        .max()
-        .unwrap_or(2);
-
-    parts
-        .iter()
-        .map(|p| {
-            let mut out = String::new();
-            if any_days {
-                if p.days > 0 {
-                    out.push_str(&format!("{:>w$}", format!("{}d", p.days), w = d_width));
-                } else {
-                    out.push_str(&" ".repeat(d_width));
-                }
-                out.push(' ');
-            }
-            if any_hours {
-                if p.days > 0 || p.hours > 0 {
-                    out.push_str(&format!("{:>w$}", format!("{}h", p.hours), w = h_width));
-                } else {
-                    out.push_str(&" ".repeat(h_width));
-                }
-                out.push(' ');
-            }
-            out.push_str(&format!("{:>w$}", format!("{}m", p.minutes), w = m_width));
-            out
-        })
-        .collect()
 }

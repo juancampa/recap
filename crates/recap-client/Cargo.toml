@@ -1,0 +1,11 @@
+[package]
+name = "recap-client"
+version = "0.1.0"
+edition = "2024"
+description = "A blocking Rust client for the recap HTTP API."
+
+[dependencies]
+recap-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

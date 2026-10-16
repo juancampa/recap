@@ -1,6 +1,6 @@
 use crate::app::{App, DisplayRow, KindFilter, Mode, Panel, RunState, SearchKind, SearchPhase};
-use crate::diff::{DiffLine, DiffSummary};
-use crate::history::{align_relative_times, EditSource, HistoryEntry};
+use crate::reltime::align_relative_times;
+use recap_api::{DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
 use crate::search_history::SearchMode;
 use crate::settings::{Settings, SETTINGS_ITEMS};
 use crate::prompt::{
@@ -142,14 +142,20 @@ const NEOVIM_COLOR: Color = Color::Rgb(120, 200, 100);
 const SOURCE_WIDTH: usize = 6;
 /// Green used for the "session still running" play glyph.
 const RUNNING_COLOR: Color = Color::Rgb(90, 220, 120);
+/// The glyph of a session that Claude Code deleted and recap archived.
+const ARCHIVED_GLYPH: &str = "◌";
 
 /// Width (cells) of the per-session color-bar column: a box-drawing bar plus
 /// a trailing space.
 const BAR_COL_WIDTH: usize = 2;
 /// Cells reserved at the right edge of a row for the trailing "running" glyph.
 pub const RUNNING_RESERVE: usize = 2;
-/// Height (rows) of the History footer box (2 border + 4 content lines).
-pub const HISTORY_FOOTER_HEIGHT: u16 = 6;
+/// The most lines that the session summary uses in the History footer.
+const SUMMARY_LINES: usize = 3;
+/// Height (rows) of the History footer box: 2 border lines, 4 field lines,
+/// and [`SUMMARY_LINES`]. The height stays the same for an entry without a
+/// summary, so the list above does not move when the selection changes.
+pub const HISTORY_FOOTER_HEIGHT: u16 = 6 + SUMMARY_LINES as u16;
 
 /// Sixteen bright, well-separated hues rotated across agent sessions so
 /// consecutive-but-distinct sessions read apart at a glance. A session's
@@ -311,23 +317,26 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
     spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
-/// Append the trailing "running" glyph flush against the right edge of a row
-/// of the given inner width. No-op when the session isn't running.
-fn append_running(spans: &mut Vec<Span<'static>>, inner_width: usize, running: bool) {
-    if !running {
-        return;
-    }
+/// Append the trailing session glyph flush against the right edge of a row
+/// of the given inner width: a green play glyph when the session runs, a gray
+/// dotted circle when the session is archived. No-op for the other states.
+fn append_run_state(spans: &mut Vec<Span<'static>>, inner_width: usize, state: RunState) {
+    let glyph = match state {
+        RunState::Running => Span::styled(
+            "▶",
+            Style::default()
+                .fg(RUNNING_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RunState::Archived => Span::styled(ARCHIVED_GLYPH, Style::default().fg(Color::Gray)),
+        RunState::Stopped | RunState::Unknown => return,
+    };
     let used = spans_width(spans);
     // Park the glyph in the last column; keep at least one space of gap.
     let target = inner_width.saturating_sub(1);
     let pad = if target > used { target - used } else { 1 };
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        "▶",
-        Style::default()
-            .fg(RUNNING_COLOR)
-            .add_modifier(Modifier::BOLD),
-    ));
+    spans.push(glyph);
 }
 
 /// Fixed-width (2 cell) indicator column shown between the source label and the
@@ -413,7 +422,7 @@ fn source_label(src: EditSource) -> (&'static str, Color) {
 /// entry and the two other columns say which session. Blank when `show` is
 /// false, so a run of consecutive rows sharing one session prints the label
 /// only on the first row and the rest read as a continuation of the block.
-fn source_span_for(entry: &HistoryEntry, show: bool, state: RunState) -> Span<'static> {
+fn source_span_for(entry: &Entry, show: bool, state: RunState) -> Span<'static> {
     if !show {
         return Span::raw(" ".repeat(SOURCE_WIDTH));
     }
@@ -429,7 +438,7 @@ fn source_span_for(entry: &HistoryEntry, show: bool, state: RunState) -> Span<'s
 /// there would claim knowledge the app does not have.
 fn shade_for(color: Color, state: RunState) -> Color {
     match state {
-        RunState::Stopped => dim_color(color),
+        RunState::Stopped | RunState::Archived => dim_color(color),
         RunState::Running | RunState::Unknown => color,
     }
 }
@@ -607,6 +616,7 @@ fn draw_history_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let entry_idx = app.current_entry_idx();
     let running = entry_idx.map(|i| app.is_entry_running(i)).unwrap_or(false);
+    let archived = entry_idx.map(|i| app.entry_run_state(i)) == Some(RunState::Archived);
     let (src_label, src_color) = source_label(entry.source);
 
     let mut lines: Vec<Line> = Vec::with_capacity(4);
@@ -639,6 +649,22 @@ fn draw_history_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(session_spans));
 
+    // The summary that Claude Code shows while the session is idle.
+    if let Some(summary) = entry.session_summary.as_deref() {
+        const LABEL_WIDTH: usize = 8;
+        let width = (inner.width as usize).saturating_sub(LABEL_WIDTH).max(1);
+        let wrapped = prompt::wrap(&prompt::highlight(summary, RESPONSE_COLOR), width, SUMMARY_LINES);
+        for (i, line) in wrapped.iter().enumerate() {
+            let mut spans = vec![if i == 0 {
+                footer_label("Summary")
+            } else {
+                Span::raw(" ".repeat(LABEL_WIDTH))
+            }];
+            spans.extend(prompt_line_spans(line, None));
+            lines.push(Line::from(spans));
+        }
+    }
+
     // Working directory.
     let dir = entry
         .session_cwd
@@ -666,6 +692,16 @@ fn draw_history_footer(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("o", key),
                 Span::styled(" to focus", hint_gray),
             ])
+        } else if archived {
+            Line::from(vec![
+                Span::styled(
+                    format!("{ARCHIVED_GLYPH} Archived"),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("   press ", hint_gray),
+                Span::styled("o", key),
+                Span::styled(" to restore and resume", hint_gray),
+            ])
         } else {
             Line::from(vec![
                 Span::styled("○ Not running", Style::default().fg(Color::Gray)),
@@ -692,7 +728,7 @@ fn draw_history_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     } else if let Some(idx) = entry_idx {
         app.diff_summaries
-            .get(&idx)
+            .get(&app.view.entries[idx].id)
             .map(|s| format!("+{} -{}", s.added, s.removed))
             .unwrap_or_default()
     } else {
@@ -944,12 +980,8 @@ fn leading_marker(is_group: bool, expanded: bool, auto_expand: bool) -> Vec<Span
 /// Title of the agent session an entry belongs to, if the source records
 /// one: the Cursor composer name, or the Claude Code `aiTitle`. `None` for
 /// an unattributed edit and for a session that has no title yet.
-fn session_title<'a>(app: &'a App, entry: &HistoryEntry) -> Option<&'a str> {
-    entry
-        .session_id
-        .as_deref()
-        .and_then(|sid| app.store.session_titles.get(sid))
-        .map(|s| s.as_str())
+fn session_title(entry: &Entry) -> Option<&str> {
+    entry.session_title.as_deref()
 }
 
 /// Build the project column of one row.
@@ -1059,7 +1091,7 @@ fn project_column_continuation(chain_empty: bool, width: usize) -> String {
 
 /// Width (chars) of an entry's project chain as `project_column` renders it
 /// with every segment visible: the names joined by ` → `.
-fn chain_chars_of(entry: &HistoryEntry, names: &HashMap<PathBuf, String>) -> usize {
+fn chain_chars_of(entry: &Entry, names: &HashMap<PathBuf, String>) -> usize {
     let (chain, _) = entry.display_path_segments(names);
     if chain.is_empty() {
         0
@@ -1107,7 +1139,7 @@ fn date_row_line(day: NaiveDate, today: NaiveDate, inner_width: usize) -> Line<'
 
 #[allow(clippy::too_many_arguments)]
 fn group_row_line(
-    entry: &HistoryEntry,
+    entry: &Entry,
     project_names: &HashMap<PathBuf, String>,
     leading: Vec<Span<'static>>,
     ts: &str,
@@ -1117,7 +1149,6 @@ fn group_row_line(
     match_indices: Option<&[u32]>,
     chain_mask: &[bool],
     show_head: bool,
-    running: bool,
     inner_width: usize,
     reserved_lines: usize,
     prompt_max: usize,
@@ -1322,7 +1353,7 @@ fn group_row_line(
             }
             spans.extend(prompt_line_spans(seg, None));
             if i == 0 {
-                append_running(&mut spans, inner_width, running);
+                append_run_state(&mut spans, inner_width, run_state);
             }
             lines.push(Line::from(spans));
         }
@@ -1364,7 +1395,7 @@ fn group_row_line(
         spans.push(Span::styled(file_part.to_string(), file_base));
     }
 
-    append_running(&mut spans, inner_width, running);
+    append_run_state(&mut spans, inner_width, run_state);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
     lines.extend(date_row);
     lines.push(Line::from(spans));
@@ -1453,7 +1484,7 @@ fn compute_chain_visuals(
 /// path. No column padding — fields are space-separated. The whole row gets
 /// a dark gray background that fills the panel width to read as a header.
 fn separator_line(
-    entry: &HistoryEntry,
+    entry: &Entry,
     project_names: &HashMap<PathBuf, String>,
     ts: &str,
     summary: Option<&DiffSummary>,
@@ -1526,10 +1557,21 @@ fn separator_line(
     Line::from(spans)
 }
 
+/// The help bar text for the semantic search state, or `None` while the
+/// state needs no report.
+fn embed_label(status: &EmbedStatus) -> Option<String> {
+    match status {
+        EmbedStatus::Off | EmbedStatus::Ready => None,
+        EmbedStatus::Starting => Some("  [embed: starting…]".to_string()),
+        EmbedStatus::Indexing { done, total } => Some(format!("  [embedding {done}/{total}]")),
+        EmbedStatus::Failed { error } => Some(format!("  [embed: {error}]")),
+    }
+}
+
 fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active_panel == Panel::Projects;
     let block = Block::default()
-        .title(format!(" Projects ({}) ", app.store.projects.len()))
+        .title(format!(" Projects ({}) ", app.view.projects.len()))
         .borders(Borders::ALL)
         .border_type(if active {
             BorderType::Thick
@@ -1543,7 +1585,7 @@ fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let visible = inner.height as usize;
-    let total_rows = app.store.projects.len() + 1;
+    let total_rows = app.view.projects.len() + 1;
     let sel_display = app.selected_project_idx.map(|i| i + 1).unwrap_or(0);
 
     let first_visible_row = app.project_scroll.min(total_rows);
@@ -1558,9 +1600,9 @@ fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
     };
     let last_proj = last_visible_row.saturating_sub(1);
 
-    let visible_timestamps: Vec<DateTime<Local>> = app.store.projects[first_proj..last_proj]
+    let visible_timestamps: Vec<DateTime<Local>> = app.view.projects[first_proj..last_proj]
         .iter()
-        .filter_map(|p| app.store.project_latest.get(p).copied())
+        .map(|p| p.latest)
         .collect();
     let formatted_ts = format_panel_timestamps(&visible_timestamps, app.absolute_time);
     let ts_width = formatted_ts.first().map(|s| s.chars().count()).unwrap_or(0);
@@ -1592,27 +1634,18 @@ fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
             )])
         } else {
             let i = row_idx - 1;
-            let proj = &app.store.projects[i];
+            let proj = &app.view.projects[i];
             let selected = sel_display == row_idx;
-            let chain = app
-                .store
-                .project_chains
-                .get(proj)
-                .map(|c| {
-                    c.iter()
-                        .map(|p| match app.store.project_names.get(p) {
-                            Some(s) => s.clone(),
-                            None => p
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" → ")
-                })
-                .unwrap_or_else(|| App::project_label(proj));
-            let count = app.store.project_counts.get(proj).copied().unwrap_or(0);
+            let chain = if proj.chain.is_empty() {
+                App::project_label(&proj.root)
+            } else {
+                proj.chain
+                    .iter()
+                    .map(|p| recap_api::project_name(p, &app.view.project_names))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            };
+            let count = proj.count;
             let count_str = format!("({})", count);
             let ts = formatted_ts
                 .get(i - first_proj)
@@ -1690,7 +1723,7 @@ fn draw_projects(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, inner);
 
     // Scrollbar
-    let total = app.store.projects.len() + 1;
+    let total = app.view.projects.len() + 1;
     if total > visible {
         let mut sb = ScrollbarState::new(total).position(app.project_scroll);
         f.render_stateful_widget(
@@ -1772,7 +1805,7 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
         Some(f) => app
             .files
             .iter()
-            .position(|p| p == f)
+            .position(|p| &p.path == f)
             .map(|i| i + 1)
             .unwrap_or(0),
     };
@@ -1791,7 +1824,7 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
 
     let visible_timestamps: Vec<DateTime<Local>> = app.files[first_file..last_file]
         .iter()
-        .filter_map(|p| app.file_latest.get(p).copied())
+        .map(|p| p.latest)
         .collect();
     let formatted_ts = format_panel_timestamps(&visible_timestamps, app.absolute_time);
     let ts_width = formatted_ts.first().map(|s| s.chars().count()).unwrap_or(0);
@@ -1825,12 +1858,12 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
             )])
         } else {
             let i = row_idx - 1;
-            let file = &app.files[i];
+            let file = &app.files[i].path;
             let selected = sel_display == row_idx;
-            let chain = app.file_chains.get(file).cloned().unwrap_or_default();
+            let chain = &app.files[i].chain;
             let label =
-                file_display_for_panel(file, &chain, &app.store.project_names, project_selected);
-            let count = app.file_counts.get(file).copied().unwrap_or(0);
+                file_display_for_panel(file, chain, &app.view.project_names, project_selected);
+            let count = app.files[i].count;
             let count_str = format!("({})", count);
             let ts = formatted_ts
                 .get(i - first_file)
@@ -1950,8 +1983,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = (first..last)
         .map(|i| {
             let agent = &app.agents[i];
-            let state = app.run_state_of(agent.source, Some(&agent.session_id));
-            let running = state == RunState::Running;
+            let state = app.run_state_of(agent.source, Some(&agent.session_id), agent.archived);
 
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(10);
             spans.push(Span::raw("  "));
@@ -1981,7 +2013,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             let chain: Vec<String> = agent
                 .project_roots
                 .iter()
-                .map(|p| match app.store.project_names.get(p) {
+                .map(|p| match app.view.project_names.get(p) {
                     Some(s) => s.clone(),
                     None => p
                         .file_name()
@@ -2005,7 +2037,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             let empty: Vec<prompt::Piece> = Vec::new();
             let one = prompt::wrap_line(hl.first().unwrap_or(&empty), budget, false, 1);
             spans.extend(prompt_line_spans(&one[0], None));
-            append_running(&mut spans, inner_width, running);
+            append_run_state(&mut spans, inner_width, state);
 
             let mut style = Style::default();
             if sel == Some(i) {
@@ -2104,7 +2136,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     child_local,
                 } => app.groups[*group_idx].entry_indices[*child_local],
             };
-            app.store.entries[entry_idx].timestamp
+            app.view.entries[entry_idx].timestamp
         })
         .collect();
     let formatted_ts = format_panel_timestamps(&visible_timestamps, app.absolute_time);
@@ -2126,8 +2158,8 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
             DisplayRow::Child { group_idx, .. } => *group_idx,
         };
         let entry_idx = app.groups[group_idx].entry_indices[0];
-        let entry = &app.store.entries[entry_idx];
-        let (chain, _) = entry.display_path_segments(&app.store.project_names);
+        let entry = &app.view.entries[entry_idx];
+        let (chain, _) = entry.display_path_segments(&app.view.project_names);
         chain
     };
 
@@ -2174,7 +2206,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                 child_local,
             } => app.groups[*group_idx].entry_indices[*child_local],
         };
-        app.store.entries[entry_idx].session_id.clone()
+        app.view.entries[entry_idx].session_id.clone()
     };
     let mut prev_session: Option<String> = app
         .history_scroll
@@ -2246,7 +2278,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
             // The first row of a day carries the date row above it.
             let date_row = app.row_starts_day(row_idx).then(|| {
                 date_row_line(
-                    app.store.entries[entry_idx].timestamp.date_naive(),
+                    app.view.entries[entry_idx].timestamp.date_naive(),
                     today,
                     inner_width,
                 )
@@ -2256,14 +2288,14 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                 DisplayRow::Group(gi) => {
                     let group = &app.groups[*gi];
                     let is_group = group.entry_indices.len() > 1;
-                    let entry = &app.store.entries[entry_idx];
+                    let entry = &app.view.entries[entry_idx];
                     let count = group.entry_indices.len();
                     let time_color = if epochs[*gi] == 0 {
                         TIME_COLOR_RECENT
                     } else {
                         TIME_COLOR_OLD
                     };
-                    let summary = app.diff_summaries.get(&entry_idx);
+                    let summary = app.diff_summaries.get(&app.view.entries[entry_idx].id);
 
                     let leading = leading_marker(is_group, group.expanded, app.effective_auto_expand());
                     // Multi-entry groups display the child count instead of
@@ -2287,11 +2319,11 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     let session_name = if is_group {
                         None
                     } else {
-                        session_title(app, entry)
+                        session_title(entry)
                     };
                     group_row_line(
                         entry,
-                        &app.store.project_names,
+                        &app.view.project_names,
                         leading,
                         &ts,
                         ts_width,
@@ -2300,7 +2332,6 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         match_indices,
                         mask,
                         show_source,
-                        app.is_entry_running(entry_idx),
                         inner_width,
                         app.row_height(row_idx),
                         app.prompt_lines,
@@ -2309,13 +2340,13 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         app.prompt_ordinal(entry),
                         &app.settings,
                         date_row,
-                        app.project_col_width(chain_chars_of(entry, &app.store.project_names)),
+                        app.project_col_width(chain_chars_of(entry, &app.view.project_names)),
                         branch_last_flags.get(local_idx).copied().unwrap_or(true),
                         session_end_flags.get(local_idx).copied().unwrap_or(false),
                     )
                 }
                 DisplayRow::Child { .. } => {
-                    let entry = &app.store.entries[entry_idx];
+                    let entry = &app.view.entries[entry_idx];
                     let fname = entry.file_name();
                     let time_color = match row {
                         DisplayRow::Child { group_idx, .. } => {
@@ -2327,7 +2358,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         }
                         _ => TIME_COLOR_RECENT,
                     };
-                    let summary = app.diff_summaries.get(&entry_idx);
+                    let summary = app.diff_summaries.get(&app.view.entries[entry_idx].id);
                     let show_source = show_source_flags.get(local_idx).copied().unwrap_or(true);
 
                     // A child row repeats the column layout of its group row,
@@ -2356,7 +2387,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     let title_width = title_col_width(inner_width, &app.settings);
                     if title_width > 0 {
                         spans.push(title_span(
-                            session_title(app, entry),
+                            session_title(entry),
                             entry.session_id.as_deref(),
                             show_source,
                             title_width,
@@ -2374,7 +2405,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                             .fg(if is_selected { Color::White } else { Color::Gray })
                     };
                     spans.push(Span::styled(fname.to_string(), fname_style));
-                    append_running(&mut spans, inner_width, app.is_entry_running(entry_idx));
+                    append_run_state(&mut spans, inner_width, app.entry_run_state(entry_idx));
                     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
                     lines.extend(date_row);
                     lines.push(Line::from(spans));
@@ -2411,7 +2442,7 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
     // Title shows the current file path
     let title = app
         .current_entry()
-        .map(|e| format!(" {} ", e.display_path(&app.store.project_names)))
+        .map(|e| format!(" {} ", e.display_path(&app.view.project_names)))
         .unwrap_or_else(|| " Diff ".to_string());
 
     let block = Block::default()
@@ -2604,19 +2635,19 @@ fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line
             DiffLine::Response(s) => {
                 Line::from(text_spans(s, Style::default().fg(RESPONSE_COLOR)))
             }
-            DiffLine::ChildSeparator { entry_idx } => {
-                let entry = &app.store.entries[*entry_idx];
+            DiffLine::ChildSeparator(id) => {
+                // The server sent the diff for the entries of the selected
+                // group, so the view holds each of them.
+                let Some(entry) = app.view.get(id) else {
+                    return Line::from(Span::styled(format!("── {id}"), Style::default().fg(Color::DarkGray)));
+                };
                 let ts_vec = format_panel_timestamps(&[entry.timestamp], app.absolute_time);
                 let ts = ts_vec.into_iter().next().unwrap_or_default();
-                let summary = app.diff_summaries.get(entry_idx);
-                let session_name = entry
-                    .session_id
-                    .as_deref()
-                    .and_then(|sid| app.store.session_titles.get(sid))
-                    .map(|s| s.as_str());
+                let summary = app.diff_summaries.get(id);
+                let session_name = session_title(entry);
                 separator_line(
                     entry,
-                    &app.store.project_names,
+                    &app.view.project_names,
                     &ts,
                     summary,
                     session_name,
@@ -3075,7 +3106,13 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::DIM),
                 ));
             }
-            if let Some(label) = app.embed.label() {
+            if let Some(error) = &app.error {
+                spans.push(Span::styled(
+                    format!("  [server: {error}]"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            if let Some(label) = embed_label(&app.embed) {
                 spans.push(Span::styled(
                     label,
                     Style::default()
@@ -3092,8 +3129,16 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use crate::app::{App, Sources};
-    use crate::history::{HistoryEntry, HistoryEntryKind, HistoryStore};
+    use crate::app::App;
+    use recap_api::EntryKind;
+    use recap_server::history::HistoryEntry;
+    use recap_server::store::Store;
+    use std::sync::Arc;
+
+    /// An App whose server holds `entries` and runs no loader.
+    fn test_app(entries: Vec<HistoryEntry>) -> App {
+        App::new(Arc::new(recap_server::Server::from_entries(entries)))
+    }
     use ratatui::{backend::TestBackend, Terminal};
 
     fn prompt(text: &str, session: &str) -> HistoryEntry {
@@ -3104,7 +3149,7 @@ mod render_tests {
             base_path: None,
             project_roots: vec![PathBuf::from("/dev/proj")],
             source: EditSource::ClaudeCode,
-            kind: HistoryEntryKind::Prompt { text: text.to_string(), response: None },
+            kind: EntryKind::Prompt { text: text.to_string(), response: None },
             session_id: Some(session.to_string()),
             session_cwd: Some(PathBuf::from("/dev/proj")),
         }
@@ -3114,11 +3159,11 @@ mod render_tests {
         HistoryEntry {
             timestamp: Local::now() - chrono::Duration::minutes(3),
             file_path: PathBuf::from(path),
-            snapshot_path: PathBuf::from("/dev/null"),
+            snapshot_path: PathBuf::from(format!("/snapshots{path}/{source:?}/{}", session.unwrap_or(""))),
             base_path: None,
             project_roots: vec![PathBuf::from("/dev/proj")],
             source,
-            kind: HistoryEntryKind::FileChange,
+            kind: EntryKind::FileChange,
             session_id: session.map(str::to_string),
             session_cwd: Some(PathBuf::from("/dev/proj")),
         }
@@ -3178,11 +3223,10 @@ mod render_tests {
     /// so one test covers both sources.
     #[test]
     fn the_title_column_shows_the_session_title() {
-        let mut store = HistoryStore::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
-        store
-            .session_titles
-            .insert("sessionAAAA-1111".to_string(), "Page embed".to_string());
-        let mut app = App::new(store, Sources::default());
+        let mut store = Store::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
+        store.extend_titles([("sessionAAAA-1111".to_string(), "Page embed".to_string())]);
+        store.commit();
+        let mut app = App::new(Arc::new(recap_server::Server::from_store(store)));
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
 
@@ -3200,11 +3244,10 @@ mod render_tests {
     /// The user can hide the title column, and then the row drops it.
     #[test]
     fn hiding_the_title_column_removes_it() {
-        let mut store = HistoryStore::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
-        store
-            .session_titles
-            .insert("sessionAAAA-1111".to_string(), "Page embed".to_string());
-        let mut app = App::new(store, Sources::default());
+        let mut store = Store::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
+        store.extend_titles([("sessionAAAA-1111".to_string(), "Page embed".to_string())]);
+        store.commit();
+        let mut app = App::new(Arc::new(recap_server::Server::from_store(store)));
         app.settings.show_title = false;
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
@@ -3217,8 +3260,8 @@ mod render_tests {
     fn the_date_row_names_the_day_twice() {
         let mut old = prompt("older ask", "sessionAAAA-1111");
         old.timestamp = Local::now() - chrono::Duration::days(3);
-        let store = HistoryStore::from_entries(vec![prompt("new ask", "sessionAAAA-1111"), old]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("new ask", "sessionAAAA-1111"), old]);
+        let mut app = test_app(store);
         app.settings.date_separator = true;
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
@@ -3247,8 +3290,8 @@ mod render_tests {
             PathBuf::from("/dev/proj"),
             PathBuf::from("/dev/proj/inner"),
         ];
-        let store = HistoryStore::from_entries(vec![prompt("flat ask", "sessionBBBB-2222"), deep]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("flat ask", "sessionBBBB-2222"), deep]);
+        let mut app = test_app(store);
         app.settings.align_project = true;
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
@@ -3279,12 +3322,12 @@ mod render_tests {
             ];
             e
         };
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             deep("/dev/proj/inner/a.rs"),
             deep("/dev/proj/inner/b.rs"),
             deep("/dev/proj/inner/c.rs"),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
 
@@ -3308,11 +3351,11 @@ mod render_tests {
     /// session, so Cursor and Claude Code read apart at a glance.
     #[test]
     fn each_source_keeps_its_own_color() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             file_edit("/dev/proj/a.rs", Some("sessionAAAA-1111"), EditSource::Cursor),
             file_edit("/dev/proj/b.rs", Some("sessionBBBB-2222"), EditSource::ClaudeCode),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
 
@@ -3330,11 +3373,11 @@ mod render_tests {
     /// band does not join the band of the next session.
     #[test]
     fn the_last_row_of_a_session_breaks_its_bar() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             file_edit("/dev/proj/a.rs", Some("sessionAAAA-1111"), EditSource::Cursor),
             file_edit("/dev/proj/b.rs", Some("sessionBBBB-2222"), EditSource::Cursor),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
         // Each row holds one entry of its own session, so both rows end
@@ -3360,8 +3403,8 @@ mod render_tests {
     /// The settings menu lists every setting with its check box.
     #[test]
     fn the_settings_menu_lists_the_columns() {
-        let store = HistoryStore::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("fix it", "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.settings_menu.open = true;
         app.settings.show_change = false;
         let out = render(&app, 190, 24);
@@ -3383,8 +3426,8 @@ mod render_tests {
     /// but only once the mode remembers a query.
     #[test]
     fn the_search_prompt_offers_the_query_list_it_holds() {
-        let store = HistoryStore::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("fix it", "sessionAAAA-1111")]);
+        let mut app = test_app(store);
 
         app.search_open();
         assert!(
@@ -3409,11 +3452,11 @@ mod render_tests {
     fn history_renders_bar_wrapping_and_footer() {
         let long = "this is a very long single line prompt that should wrap across \
                     several rows in the history list when the panel is narrow enough";
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt(long, "sessionAAAA-1111"),
             prompt("short one", "sessionBBBB-2222"),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         // Mirror what the event loop does each frame.
         app.recompute_row_heights(40, 18);
         let out = render(&app, 84, 26);
@@ -3425,7 +3468,7 @@ mod render_tests {
             .display_rows
             .iter()
             .position(|r| matches!(r, DisplayRow::Group(gi) if {
-                let e = &app.store.entries[app.groups[*gi].entry_indices[0]];
+                let e = &app.view.entries[app.groups[*gi].entry_indices[0]];
                 e.prompt_text() == Some(long)
             }))
             .unwrap();
@@ -3439,13 +3482,38 @@ mod render_tests {
         );
     }
     #[test]
+    fn an_archived_session_shows_its_glyph_and_the_restore_hint() {
+        let mut app = test_app(vec![prompt("fix it", "sessionAAAA-1111")]);
+        app.view.entries[0].session_archived = true;
+        app.recompute_row_heights(40, 18);
+        let out = render(&app, 100, 26);
+        assert!(out.contains("◌ Archived"), "footer archived line missing\n{out}");
+        assert!(out.contains("to restore and resume"), "footer restore hint missing\n{out}");
+        assert!(out.contains(ARCHIVED_GLYPH), "row glyph missing\n{out}");
+    }
+
+    #[test]
+    fn the_footer_shows_the_session_summary_under_the_session() {
+        let mut app = test_app(vec![prompt("fix it", "sessionAAAA-1111")]);
+        app.view.entries[0].session_summary = Some("I fixed the bug in the loader.".to_string());
+        app.recompute_row_heights(40, 18);
+        let out = render(&app, 100, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        let session = rows.iter().position(|r| r.contains("Session claude")).expect("session line");
+        assert!(
+            rows[session + 1].contains("Summary I fixed the bug in the loader."),
+            "the summary is not under the session line\n{out}"
+        );
+    }
+
+    #[test]
     fn prompt_rows_carry_their_count_in_brackets() {
         // Two prompts in one session. `store.entries` sorts newest first, so
         // the older prompt is number 1 and the newer one is number 2.
         let mut older = prompt("first ask", "sessionAAAA-1111");
         older.timestamp = Local::now() - chrono::Duration::minutes(30);
-        let store = HistoryStore::from_entries(vec![prompt("second ask", "sessionAAAA-1111"), older]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("second ask", "sessionAAAA-1111"), older]);
+        let mut app = test_app(store);
         // Wide enough that the title column leaves the short prompts on one
         // line (see `title_col_width`).
         app.recompute_row_heights(90, 18);
@@ -3457,8 +3525,8 @@ mod render_tests {
 
     #[test]
     fn prompt_count_uses_the_timestamp_gray() {
-        let store = HistoryStore::from_entries(vec![prompt("only ask", "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("only ask", "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.recompute_row_heights(60, 18);
         let out = history_half(&render(&app, 120, 20), 120);
         let (x, y) = find(&out, "[1]");
@@ -3471,8 +3539,8 @@ mod render_tests {
 
     #[test]
     fn stopped_claude_session_dims_its_source_label() {
-        let store = HistoryStore::from_entries(vec![prompt("an ask", "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt("an ask", "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.recompute_row_heights(60, 18);
         let out = history_half(&render(&app, 120, 20), 120);
         let (x, y) = find(&out, "claude");
@@ -3489,12 +3557,12 @@ mod render_tests {
     #[test]
     fn neovim_keeps_a_bright_source_label() {
         // Neovim reports no run state, so the label must stay bright.
-        let store = HistoryStore::from_entries(vec![file_edit(
+        let store = (vec![file_edit(
             "/dev/proj/src/main.rs",
             None,
             EditSource::Neovim,
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(60, 18);
         let out = history_half(&render(&app, 120, 20), 120);
         let (x, y) = find(&out, "nvim");
@@ -3507,11 +3575,11 @@ mod render_tests {
 
     #[test]
     fn a_real_linebreak_indents_without_a_marker() {
-        let store = HistoryStore::from_entries(vec![prompt(
+        let store = (vec![prompt(
             "alpha bravo\nsecond paragraph",
             "sessionAAAA-1111",
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(100, 18);
         let out = history_half(&render(&app, 200, 20), 200);
 
@@ -3543,8 +3611,8 @@ mod render_tests {
     fn a_soft_wrap_marks_its_indent() {
         let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo \
                     lima mike november oscar papa quebec romeo sierra tango uniform";
-        let store = HistoryStore::from_entries(vec![prompt(long, "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt(long, "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.recompute_row_heights(100, 18);
         let out = history_half(&render(&app, 200, 20), 200);
 
@@ -3568,8 +3636,8 @@ mod render_tests {
         // The list item hangs by HANG_INDENT and carries two leading spaces of
         // its own, so its soft wrap sits WRAP_INDENT past that.
         let text = "do these:\n  - keep the wrapped words nested under the item text they belong to";
-        let store = HistoryStore::from_entries(vec![prompt(text, "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt(text, "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.prompt_lines = 6;
         app.recompute_row_heights(90, 18);
         let out = history_half(&render(&app, 190, 20), 190);
@@ -3614,7 +3682,7 @@ mod render_tests {
     /// A prompt with a response. The synthetic key stays the prompt text.
     fn turn(text: &str, response: &str, session: &str) -> HistoryEntry {
         let mut e = prompt(text, session);
-        e.kind = HistoryEntryKind::Prompt {
+        e.kind = EntryKind::Prompt {
             text: text.to_string(),
             response: Some(response.to_string()),
         };
@@ -3623,12 +3691,12 @@ mod render_tests {
 
     #[test]
     fn the_response_hangs_under_its_prompt_in_the_response_color() {
-        let store = HistoryStore::from_entries(vec![turn(
+        let store = (vec![turn(
             "fix the bug",
             "Fixed the null check.",
             "sessionAAAA-1111",
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.recompute_row_heights(90, 18);
         let out = render(&app, 190, 20);
 
@@ -3701,12 +3769,12 @@ mod render_tests {
 
     #[test]
     fn a_mouse_drag_selects_and_copies_the_diff_panel_text() {
-        let store = HistoryStore::from_entries(vec![turn(
+        let store = (vec![turn(
             "fix the bug",
             "Fixed the null check.",
             "sessionAAAA-1111",
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.active_panel = Panel::Diff;
         app.recompute_row_heights(60, 18);
 
@@ -3750,12 +3818,12 @@ mod render_tests {
 
     #[test]
     fn a_diff_selection_spans_rows_and_drops_when_the_panel_scrolls() {
-        let store = HistoryStore::from_entries(vec![turn(
+        let store = (vec![turn(
             "fix the bug",
             "Fixed the null check.",
             "sessionAAAA-1111",
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.active_panel = Panel::Diff;
         app.recompute_row_heights(60, 18);
 
@@ -3792,8 +3860,8 @@ mod render_tests {
     #[test]
     fn the_diff_panel_drops_the_caret_and_keeps_the_shared_indent() {
         let text = "run the tests\n  - keep every wrapped word nested under the item it belongs to";
-        let store = HistoryStore::from_entries(vec![prompt(text, "sessionAAAA-1111")]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt(text, "sessionAAAA-1111")]);
+        let mut app = test_app(store);
         app.recompute_row_heights(60, 18);
         // File mode: History on the left, Diff on the right.
         let out = diff_half(&render(&app, 110, 20), 110);
@@ -3824,11 +3892,11 @@ mod render_tests {
     fn every_panel_highlights_inline_code() {
         // The same prompt reaches History, Agents and Diff. Each must color
         // the backticked run apart from the prose.
-        let store = HistoryStore::from_entries(vec![prompt(
+        let store = (vec![prompt(
             "please run `cargo test` now",
             "sessionAAAA-1111",
         )]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.toggle_mode(18, 18);
         app.recompute_row_heights(50, 18);
         let out = render(&app, 200, 20);
@@ -3855,11 +3923,11 @@ mod render_tests {
 
     #[test]
     fn agent_mode_shows_the_agents_panel_and_filters_history() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt("ask from A", "sessionAAAA-1111"),
             prompt("ask from B", "sessionBBBB-2222"),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.toggle_mode(18, 18);
         app.recompute_row_heights(50, 18);
         let out = render(&app, 160, 20);
@@ -3871,7 +3939,7 @@ mod render_tests {
         assert_eq!(app.groups.len(), 1, "History must show one agent only");
         let entry_idx = app.groups[0].entry_indices[0];
         assert_eq!(
-            app.store.entries[entry_idx].session_id.as_deref(),
+            app.view.entries[entry_idx].session_id.as_deref(),
             app.selected_agent.as_deref()
         );
     }
@@ -3880,12 +3948,12 @@ mod render_tests {
     fn agent_rows_count_the_prompts_of_one_session() {
         let mut older = prompt("first ask", "sessionAAAA-1111");
         older.timestamp = Local::now() - chrono::Duration::minutes(30);
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt("newest ask", "sessionAAAA-1111"),
             older,
             prompt("other ask", "sessionBBBB-2222"),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.toggle_mode(18, 18);
 
         assert_eq!(app.agents.len(), 2);
@@ -3900,11 +3968,11 @@ mod render_tests {
 
     #[test]
     fn agent_mode_hides_entries_without_a_session() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             file_edit("/dev/proj/src/main.rs", None, EditSource::Neovim),
             prompt("an ask", "sessionAAAA-1111"),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.toggle_mode(18, 18);
         assert_eq!(app.agents.len(), 1);
         assert_eq!(app.agents[0].session_id, "sessionAAAA-1111");

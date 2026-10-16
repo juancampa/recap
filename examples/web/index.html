@@ -1,0 +1,176 @@
+<!doctype html>
+<!--
+  A minimal web client of the recap HTTP API. It uses plain JavaScript and
+  has no build step. The server sends this file at GET /.
+  A browser does not let a page from file:// read the API. To serve a
+  changed copy of this file, run ./run.sh.
+
+  The page lists the projects, the newest history entries of the selected
+  project, and the diff of the selected entry. It reads the events at
+  /v1/events and gets the lists again when the data changes.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>recap</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e0e0e3;
+    --sel: #e8f0fe; --add: #1a7f37; --del: #cf222e; --prompt: #0550ae;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161618; --fg: #e6e6e9; --muted: #9a9aa2; --line: #2e2e33;
+      --sel: #23324d; --add: #56d364; --del: #f85149; --prompt: #79c0ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    display: grid; grid-template-rows: 1fr auto; height: 100vh;
+  }
+  main { display: grid; grid-template-columns: 18rem 28rem 1fr; min-height: 0; }
+  section { overflow: auto; border-right: 1px solid var(--line); min-width: 0; }
+  h2 {
+    margin: 0; padding: 6px 10px; font-size: 12px; color: var(--muted);
+    position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--line);
+  }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    padding: 3px 10px; cursor: pointer; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  li.sel { background: var(--sel); }
+  .muted { color: var(--muted); }
+  pre { margin: 0; padding: 6px 10px; white-space: pre-wrap; word-break: break-word; }
+  .added { color: var(--add); }
+  .removed { color: var(--del); }
+  .prompt { color: var(--prompt); }
+  .header { color: var(--muted); font-weight: bold; }
+  footer { padding: 4px 10px; border-top: 1px solid var(--line); color: var(--muted); }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; grid-auto-rows: minmax(12rem, auto); }
+    section { border-right: none; border-bottom: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<main>
+  <section><h2>Projects</h2><ul id="projects"></ul></section>
+  <section><h2>History</h2><ul id="history"></ul></section>
+  <section><h2>Diff</h2><pre id="diff"></pre></section>
+</main>
+<footer id="status">connecting…</footer>
+<script>
+// The number of history entries that the page asks for.
+const LIMIT = 300;
+
+// The client state. The server owns all the data.
+const state = { project: null, entry: null };
+
+async function get(path) {
+  const response = await fetch(path);
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status} ${await response.text()}`);
+  return response.json();
+}
+
+function ago(time) {
+  const s = (Date.now() - new Date(time).getTime()) / 1000;
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
+}
+
+function item(text, selected, onclick) {
+  const li = document.createElement('li');
+  li.textContent = text;
+  li.title = text;
+  if (selected) li.className = 'sel';
+  li.onclick = onclick;
+  return li;
+}
+
+function entryLabel(entry) {
+  if (entry.kind.type === 'prompt') {
+    const text = entry.kind.text.replace(/\s+/g, ' ');
+    return `${ago(entry.timestamp)} > ${text}`;
+  }
+  const root = entry.project_roots[entry.project_roots.length - 1] || '';
+  const path = entry.file_path.startsWith(root + '/') ? entry.file_path.slice(root.length + 1) : entry.file_path;
+  return `${ago(entry.timestamp)}   ${path}`;
+}
+
+async function showProjects() {
+  const { projects } = await get('/v1/projects');
+  const ul = document.getElementById('projects');
+  ul.replaceChildren(
+    item('All projects', state.project === null, () => select(null)),
+    ...projects.map(p => item(`${p.name} (${p.count})`, p.root === state.project, () => select(p.root))),
+  );
+}
+
+async function showHistory() {
+  const params = new URLSearchParams({ limit: LIMIT });
+  if (state.project) params.set('project', state.project);
+  const { groups } = await get(`/v1/history?${params}`);
+  const ul = document.getElementById('history');
+  // Each group shows its newest entry. A click shows the diff of the group.
+  ul.replaceChildren(...groups.map(group => {
+    const ids = group.entries.map(e => e.id).join(',');
+    const count = group.entries.length > 1 ? ` [${group.entries.length}]` : '';
+    return item(entryLabel(group.entries[0]) + count, ids === state.entry, () => {
+      state.entry = ids;
+      showHistory();
+      showDiff();
+    });
+  }));
+}
+
+async function showDiff() {
+  const pre = document.getElementById('diff');
+  if (!state.entry) { pre.replaceChildren(); return; }
+  const lines = await get(`/v1/diff?ids=${state.entry}`);
+  const prefix = { added: '+', removed: '-', context: ' ', prompt: '> ', response: '< ', header: '', child_separator: '=== ' };
+  pre.replaceChildren(...lines.map(line => {
+    const span = document.createElement('span');
+    span.className = line.type === 'response' ? 'prompt' : line.type.replace('child_separator', 'header');
+    span.textContent = prefix[line.type] + line.text + '\n';
+    return span;
+  }));
+}
+
+async function showStatus() {
+  const s = await get('/v1/status');
+  const embed = s.embed.state === 'indexing' ? `indexing ${s.embed.done}/${s.embed.total}` : s.embed.state;
+  document.getElementById('status').textContent =
+    `version ${s.version} · ${s.entries} entries · ${s.loading ? 'loading · ' : ''}` +
+    `${s.running} running sessions · embeddings ${embed}`;
+}
+
+function select(project) {
+  state.project = project;
+  state.entry = null;
+  refresh();
+}
+
+function refresh() {
+  Promise.all([showProjects(), showHistory(), showDiff(), showStatus()]).catch(error => {
+    document.getElementById('status').textContent = String(error);
+  });
+}
+
+// The server sends one event for each change. The page gets all views again.
+const events = new EventSource('/v1/events');
+events.onopen = refresh;
+events.onmessage = message => {
+  const event = JSON.parse(message.data);
+  if (event.type === 'changed') refresh();
+  else showStatus().catch(() => {});
+};
+events.onerror = () => { document.getElementById('status').textContent = 'the server does not answer, retrying…'; };
+</script>
+</body>
+</html>

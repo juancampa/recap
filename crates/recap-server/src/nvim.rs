@@ -24,7 +24,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind};
+use crate::history::{find_project_chain, HistoryEntry};
+use recap_api::{EditSource, EntryKind};
 
 const UF_START_MAGIC: &[u8] = b"Vim\x9FUnDo\xE5";
 const UF_VERSION: u16 = 3;
@@ -119,8 +120,7 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 fn cache_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".cache/recap/nvim")
+    crate::paths::cache_root().join("nvim")
 }
 
 /// Scan the Neovim undodir, emitting one batch per undofile via `on_batch`.
@@ -166,7 +166,7 @@ pub fn load(
     for (path, mtime) in files {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         if let Err(e) = process_undofile(&path, &mut batch, &mut chain_cache, seen_keys) {
-            crate::log_warn!("recap: skipped undofile {}: {e}", path.display());
+            log::warn!("skipped undofile {}: {e}", path.display());
         }
         mtimes.insert(path, mtime);
         if !batch.is_empty() && !on_batch(batch) {
@@ -190,6 +190,10 @@ fn process_undofile(
     let file_path = decode_undofile_name(undofile_name)
         .context("could not decode undofile name to a file path")?;
 
+    // macOS can ask the user before the server reads this file.
+    if crate::paths::in_protected_folder(&file_path) {
+        return Ok(());
+    }
     let on_disk = match fs::read(&file_path) {
         Ok(b) => b,
         Err(_) => return Ok(()),
@@ -244,7 +248,7 @@ fn process_undofile(
                 base_path: None,
                 project_roots: project_roots.clone(),
                 source: EditSource::Neovim,
-                kind: HistoryEntryKind::FileChange,
+                kind: EntryKind::FileChange,
                 session_id: None,
                 session_cwd: None,
             });
@@ -304,8 +308,8 @@ fn write_snapshot(
     if trailing_newline && !state.is_empty() {
         buf.push(b'\n');
     }
-    if let Err(e) = fs::write(&path, &buf) {
-        crate::log_warn!("recap: nvim snapshot write failed: {e}");
+    if let Err(e) = crate::cache::write_atomic(&path, &buf) {
+        log::warn!("nvim snapshot write failed: {e}");
         return None;
     }
     Some(path)
@@ -816,4 +820,5 @@ mod tests {
         apply_undo_entry(&mut state, &entry);
         assert_eq!(state, vec![b"A".to_vec(), b"B".to_vec()]);
     }
+
 }

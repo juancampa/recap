@@ -2,13 +2,13 @@
 //! integration. Two jobs, both from `globalStorage/state.vscdb`:
 //!
 //! - **Prompts.** Each composer's user messages (type-1 bubbles) become
-//!   [`HistoryEntryKind::Prompt`] entries keyed to the `composerId`, exactly
+//!   [`EntryKind::Prompt`] entries keyed to the `composerId`, exactly
 //!   like Claude Code prompts — so a Cursor session shows its prompts and
 //!   edits together under one colored session bar. Each prompt carries the
 //!   agent's final response of its turn; see [`attach_responses`].
 //! - **Agent edits.** Every `edit_file*` / `search_replace` tool call records
 //!   the whole file content before and after the call, as two blobs in the
-//!   same store. Each call becomes a [`HistoryEntryKind::FileChange`] entry
+//!   same store. Each call becomes a [`EntryKind::FileChange`] entry
 //!   with an exact composer and an exact diff base. Cursor writes these
 //!   content ids from 2026-01; an older call has none.
 //! - **Edit attribution.** VS Code Local History records the *user's* saves
@@ -54,7 +54,8 @@
 //! no content id — hence the timestamp/window match. An edit that comes from a
 //! content blob skips both layers: the tool call names its composer.
 
-use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind};
+use crate::history::{find_project_chain, HistoryEntry};
+use recap_api::{EditSource, EntryKind};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -277,8 +278,10 @@ impl CursorSessions {
 }
 
 /// The format version of the cache file. A change to the cached types bumps
-/// it; a file with another version gets a full rebuild.
-const CACHE_VERSION: u32 = 1;
+/// it; a file with another version gets a full rebuild. Version 2 stores the
+/// snapshot paths relative to the cache root. The migration in
+/// [`crate::cache`] changes a version 1 file.
+const CACHE_VERSION: u32 = 2;
 
 /// The scan results, one per composer, in `~/.cache/recap/cursor/sessions.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -302,7 +305,9 @@ struct CachedComposer {
 }
 
 /// A [`HistoryEntry`] of the Cursor source in the cache file. The timestamp
-/// is unix milliseconds, the precision of Cursor's own timestamps.
+/// is unix milliseconds, the precision of Cursor's own timestamps. The
+/// snapshot paths are relative to the cache root, so a copy of the cache at
+/// another location stays valid.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedEntry {
     ts_ms: i64,
@@ -319,14 +324,14 @@ struct CachedEntry {
 impl From<&HistoryEntry> for CachedEntry {
     fn from(e: &HistoryEntry) -> Self {
         let prompt = match &e.kind {
-            HistoryEntryKind::Prompt { text, response } => Some((text.clone(), response.clone())),
-            HistoryEntryKind::FileChange => None,
+            EntryKind::Prompt { text, response } => Some((text.clone(), response.clone())),
+            EntryKind::FileChange => None,
         };
         Self {
             ts_ms: e.timestamp.timestamp_millis(),
             file_path: e.file_path.clone(),
-            snapshot_path: e.snapshot_path.clone(),
-            base_path: e.base_path.clone(),
+            snapshot_path: relative_to_cache(&e.snapshot_path),
+            base_path: e.base_path.as_deref().map(relative_to_cache),
             project_roots: e.project_roots.clone(),
             prompt,
             session_id: e.session_id.clone(),
@@ -338,22 +343,39 @@ impl From<&HistoryEntry> for CachedEntry {
 impl From<CachedEntry> for HistoryEntry {
     fn from(c: CachedEntry) -> Self {
         let kind = match c.prompt {
-            Some((text, response)) => HistoryEntryKind::Prompt { text, response },
-            None => HistoryEntryKind::FileChange,
+            Some((text, response)) => EntryKind::Prompt { text, response },
+            None => EntryKind::FileChange,
         };
         Self {
             timestamp: DateTime::from_timestamp_millis(c.ts_ms)
                 .unwrap_or_default()
                 .with_timezone(&Local),
             file_path: c.file_path,
-            snapshot_path: c.snapshot_path,
-            base_path: c.base_path,
+            snapshot_path: absolute_in_cache(c.snapshot_path),
+            base_path: c.base_path.map(absolute_in_cache),
             project_roots: c.project_roots,
             source: EditSource::Cursor,
             kind,
             session_id: c.session_id,
             session_cwd: c.session_cwd,
         }
+    }
+}
+
+/// `path` without the cache root, if the path is inside the cache root.
+fn relative_to_cache(path: &Path) -> PathBuf {
+    path.strip_prefix(crate::paths::cache_root())
+        .unwrap_or(path)
+        .to_path_buf()
+}
+
+/// A path of the cache file as an absolute path. An empty path (the snapshot
+/// of a prompt) stays empty.
+fn absolute_in_cache(path: PathBuf) -> PathBuf {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        path
+    } else {
+        crate::paths::cache_root().join(path)
     }
 }
 
@@ -387,16 +409,14 @@ impl SessionsCache {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let tmp = path.with_extension("json.tmp");
             let data = serde_json::to_vec(&Self {
                 version: CACHE_VERSION,
                 composers: self.composers.clone(),
             })?;
-            fs::write(&tmp, data)?;
-            fs::rename(&tmp, &path)
+            crate::cache::write_atomic(&path, &data)
         };
         if let Err(e) = write() {
-            crate::log_warn!("recap: cursor sessions cache write failed: {e}");
+            log::warn!("cursor sessions cache write failed: {e}");
         }
     }
 }
@@ -595,7 +615,7 @@ fn attach_responses(
                     break;
                 }
             }
-            if let HistoryEntryKind::Prompt { response: slot, .. } = &mut prompts[idx].kind {
+            if let EntryKind::Prompt { response: slot, .. } = &mut prompts[idx].kind {
                 *slot = response;
             }
         }
@@ -605,7 +625,7 @@ fn attach_responses(
 /// Scan the message bubbles of one composer, extracting three things:
 ///
 /// - the **set of files edited** (for the fuzzy window attribution),
-/// - the **user prompts** (type-1 bubbles), as [`HistoryEntryKind::Prompt`]
+/// - the **user prompts** (type-1 bubbles), as [`EntryKind::Prompt`]
 ///   entries keyed to the composer — the Cursor analogue of Claude prompts,
 /// - the **edit records** of the agent's edit tool calls.
 ///
@@ -775,7 +795,7 @@ fn build_edits(
         return Vec::new();
     };
     if let Err(e) = fs::create_dir_all(&cache) {
-        crate::log_warn!("recap: cursor blob cache unavailable: {e}");
+        log::warn!("cursor blob cache unavailable: {e}");
         return Vec::new();
     }
     let Ok(mut stmt) = conn.prepare("SELECT value FROM cursorDiskKV WHERE key = ?1") else {
@@ -803,7 +823,7 @@ fn build_edits(
             base_path: Some(before),
             project_roots,
             source: EditSource::Cursor,
-            kind: HistoryEntryKind::FileChange,
+            kind: EntryKind::FileChange,
             session_id: Some(record.composer),
             session_cwd: None,
         });
@@ -828,21 +848,20 @@ fn materialize(stmt: &mut rusqlite::Statement<'_>, cache: &Path, key: &str) -> O
         Ok(text) => text.into_bytes(),
         Err(_) => stmt.query_row([key], |row| row.get::<_, Vec<u8>>(0)).ok()?,
     };
-    match fs::write(&path, &content) {
+    match crate::cache::write_atomic(&path, &content) {
         Ok(()) => Some(path),
         Err(e) => {
-            crate::log_warn!("recap: cursor blob write failed: {e}");
+            log::warn!("cursor blob write failed: {e}");
             None
         }
     }
 }
 
 fn blob_cache_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".cache/recap/cursor"))
+    Some(crate::paths::cache_root().join("cursor"))
 }
 
-/// Build a [`HistoryEntryKind::Prompt`] entry from a type-1 (user) bubble, or
+/// Build a [`EntryKind::Prompt`] entry from a type-1 (user) bubble, or
 /// `None` when the text is empty or there is no usable timestamp. The bubble
 /// carries no `session_cwd`, but its `createdAt` (RFC3339) and the composer's
 /// repo roots give the timestamp and project chain. The synthetic `file_path`
@@ -881,7 +900,7 @@ fn prompt_entry(
         base_path: None,
         project_roots,
         source: EditSource::Cursor,
-        kind: HistoryEntryKind::Prompt {
+        kind: EntryKind::Prompt {
             text,
             response: None,
         },
@@ -998,6 +1017,7 @@ fn global_state_db() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recap_api::EntryFields;
 
     /// Non-hermetic smoke test against the local Cursor install. Ignored by
     /// default (`cargo test -- --ignored --nocapture` to run); verifies the

@@ -1,378 +1,92 @@
-use crate::cursor_workspace;
-use crate::diff::{build_diff, compute_summary, DiffLine, DiffSummary};
-use crate::embed::{cosine, EmbedClient, EmbedConfig, EmbedDb, EmbedIndex, EmbedKind, EmbedServer};
-use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind, HistoryStore};
+//! The state of the TUI. The server owns the history data (see the crate
+//! `recap-server`). The App holds a copy of the part of that data that the
+//! panels show, and all the UI state: the selection, the scroll positions,
+//! the search prompts and the settings.
+
 use crate::search_history::{SearchHistories, SearchMode};
-use crate::{claude, nvim};
 use chrono::{DateTime, Local, NaiveDate};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use regex::{Regex, RegexBuilder};
+pub use recap_api::{Agent, KindFilter, SearchKind};
+use recap_api::{
+    Api, ApiError, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields, EntryId,
+    Event, FileInfo, Filter, HistoryResponse, Page, Project, RunningSession, SEMANTIC_SCORE_SCALE,
+};
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// External entry sources we can rescan on demand. Holds per-source mtime
-/// caches and per-source dedup keys (snapshot_path for FileChange,
-/// synthetic file_path for Prompt) so a reload only emits truly-new
-/// entries. Each source has its own seen-set because the three sources
-/// produce disjoint synthetic paths today, and split sets let the
-/// background loader threads each own their state without locks.
+/// The copy of the server data that the History panel and the Projects panel
+/// show. The App replaces or merges it from the API responses. It calculates
+/// no data of its own.
 #[derive(Default)]
-pub struct Sources {
-    pub cursor_dir: Option<PathBuf>,
-    pub claude_dir: Option<PathBuf>,
-    pub nvim_dir: Option<PathBuf>,
-    pub cursor_mtimes: HashMap<PathBuf, SystemTime>,
-    pub claude_mtimes: HashMap<PathBuf, SystemTime>,
-    pub nvim_mtimes: HashMap<PathBuf, SystemTime>,
-    pub cursor_seen: HashSet<PathBuf>,
-    pub claude_seen: HashSet<PathBuf>,
-    pub nvim_seen: HashSet<PathBuf>,
-    /// `~/.cursor/plans/X.plan.md` → workspace folder it was opened in.
-    /// Computed once at detect time from Cursor's workspaceStorage.
-    pub plan_project_map: HashMap<PathBuf, PathBuf>,
-    /// Cached `find_project_chain` results for resolved plan workspaces, so
-    /// we don't re-walk filesystem ancestors per plan entry.
-    plan_chain_cache: HashMap<PathBuf, Vec<PathBuf>>,
-    /// Cursor composer-attribution map + the DB mtime it was built from, so a
-    /// reload rebuilds it (a multi-second, multi-GB scan) only when Cursor's
-    /// store actually changed. See [`crate::cursor_sessions`].
-    cursor_sessions: Option<std::sync::Arc<crate::cursor_sessions::CursorSessions>>,
-    cursor_sessions_mtime: Option<SystemTime>,
+pub struct View {
+    /// The store version of the last history response.
+    pub version: u64,
+    /// The entries that pass the current filter, newest first.
+    pub entries: Vec<Entry>,
+    /// The position of each entry in `entries`.
+    index: HashMap<EntryId, usize>,
+    /// All projects, newest first.
+    pub projects: Vec<Project>,
+    /// The display name of each project root.
+    pub project_names: HashMap<PathBuf, String>,
 }
 
-impl Sources {
-    /// Pull every source's directory once (Cursor/VSCode history, Claude
-    /// projects dir, neovim undodir). Missing sources stay `None`.
-    pub fn detect() -> Self {
-        Self {
-            cursor_dir: cursor_history_dir(),
-            claude_dir: claude::projects_dir(),
-            nvim_dir: nvim::undodir(),
-            plan_project_map: cursor_workspace::build_plan_project_map(),
-            ..Self::default()
-        }
+impl View {
+    pub fn index_of(&self, id: &EntryId) -> Option<usize> {
+        self.index.get(id).copied()
     }
 
-    /// `find_project_chain` walks up from a file looking for project
-    /// markers. For `~/.cursor/plans/<x>.plan.md` that walk yields nothing
-    /// (the plan dir has no marker). Override the chain using the workspace
-    /// storage map: plans we recognize get their workspace's chain; the
-    /// rest fall back to a synthetic `cursor plans` project so they don't
-    /// disappear into "no project".
-    fn attach_plan_project(&mut self, entries: &mut [HistoryEntry]) {
-        for entry in entries.iter_mut() {
-            if !cursor_workspace::is_plan_file(&entry.file_path) {
-                continue;
-            }
-            if let Some(workspace) = self.plan_project_map.get(&entry.file_path).cloned() {
-                let chain = self
-                    .plan_chain_cache
-                    .entry(workspace.clone())
-                    .or_insert_with(|| chain_for_dir(&workspace))
-                    .clone();
-                if !chain.is_empty() {
-                    entry.project_roots = chain;
-                    continue;
-                }
-            }
-            if let Some(root) = cursor_workspace::cursor_plans_root() {
-                entry.project_roots = vec![root];
-            }
-        }
-    }
-}
-
-/// Tag for routing a thread's final cache state back to the right `Sources`
-/// slot when it finishes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    Cursor,
-    Claude,
-    Nvim,
-}
-
-/// Messages emitted by the background loader threads. Batches stream while
-/// the threads run; each thread emits exactly one `SourceFinished` carrying
-/// back its updated mtime and seen-key caches so the next reload can pick
-/// up where this scan left off.
-pub enum LoadEvent {
-    Batch(Vec<HistoryEntry>),
-    /// The Cursor composer-attribution map, built off-thread. Carries the DB
-    /// mtime it was built from so the receiver can cache it. Applied as a
-    /// post-pass over already-loaded Cursor entries.
-    CursorSessions {
-        sessions: std::sync::Arc<crate::cursor_sessions::CursorSessions>,
-        mtime: Option<SystemTime>,
-    },
-    /// Agent session id → session title, from the Claude Code session files.
-    SessionTitles(HashMap<String, String>),
-    SourceFinished {
-        kind: SourceKind,
-        mtimes: HashMap<PathBuf, SystemTime>,
-        seen: HashSet<PathBuf>,
-    },
-}
-
-/// The searchable text of a prompt entry: the prompt, then the response
-/// after a blank line when the turn has one.
-fn turn_text(entry: &HistoryEntry) -> String {
-    let prompt = entry.prompt_text().unwrap_or("");
-    match entry.response_text() {
-        Some(response) => format!("{prompt}\n\n{response}"),
-        None => prompt.to_string(),
-    }
-}
-
-/// Stable cache key for an entry's searchable text. FileChange entries key on
-/// their snapshot file (one per edit); Prompt entries key on the synthetic
-/// `file_path` they already use as their unique id. Both survive the
-/// re-sort of `store.entries` that follows a load-batch merge.
-fn content_cache_key(entry: &HistoryEntry) -> PathBuf {
-    match &entry.kind {
-        HistoryEntryKind::Prompt { .. } => entry.file_path.clone(),
-        // A Cursor blob snapshot is named after its content hash, so two edits
-        // that end at the same content share the name. Their diffs differ, so
-        // the key must carry the base too.
-        HistoryEntryKind::FileChange => match &entry.base_path {
-            Some(base) => PathBuf::from(format!(
-                "{}::{}",
-                base.display(),
-                entry.snapshot_path.display()
-            )),
-            None => entry.snapshot_path.clone(),
-        },
-    }
-}
-
-/// Project chain as if a file inside `dir` were the entry. Probes `dir/.`
-/// so `dir` itself is eligible as a project root.
-fn chain_for_dir(dir: &Path) -> Vec<PathBuf> {
-    let probe = dir.join(".");
-    let mut chain = find_project_chain(&probe);
-    // If the workspace folder itself isn't a project marker (e.g.
-    // `~/git/mnode` containing several sub-projects), fall back to using
-    // the folder as the only "project" so display names still show it.
-    if chain.is_empty() {
-        chain.push(dir.to_path_buf());
-    }
-    chain
-}
-
-fn cursor_history_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    for candidate in [
-        "Library/Application Support/Cursor/User/History",
-        "Library/Application Support/Code/User/History",
-        ".config/Cursor/User/History",
-        ".config/Code/User/History",
-    ] {
-        let p = PathBuf::from(&home).join(candidate);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-
-
-/// How many entries the freshly-loaded index already covers. The indexer
-/// counted every entry as work before it read the store, so the UI subtracts
-/// these to show a true total.
-fn count_known(index: &EmbedIndex, entries: &[HistoryEntry]) -> usize {
-    entries
-        .iter()
-        .filter(|e| index.contains(&content_cache_key(e).to_string_lossy()))
-        .count()
-}
-
-// ── Semantic search state ────────────────────────────────────────────────────
-
-/// What the embedding subsystem is doing. The help bar prints this.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EmbedStatus {
-    /// recap has not started the server yet. `F` starts it.
-    Off,
-    /// The server process runs and loads the model.
-    Starting,
-    /// The indexer embeds entries that the store does not hold yet.
-    Indexing,
-    /// Every entry has a vector.
-    Ready,
-    /// The server or the indexer stopped with this message.
-    Failed(String),
-}
-
-/// One entry that the indexer must embed. The job carries everything the
-/// worker thread needs, so the thread never touches [`HistoryStore`].
-pub struct EmbedJob {
-    key: String,
-    kind: EmbedKind,
-    /// The prompt body. `None` for a file change, whose text the worker
-    /// builds from the two snapshots.
-    text: Option<String>,
-    new_path: PathBuf,
-    old_path: Option<PathBuf>,
-}
-
-/// Messages from the indexer thread.
-pub enum EmbedEvent {
-    /// The vectors that the store already held, read once at startup.
-    Index(EmbedIndex),
-    /// One embedded batch, already written to sqlite.
-    Batch(Vec<(String, EmbedKind, Vec<f32>)>),
-    Done,
-    Failed(String),
-}
-
-/// Everything the semantic search owns.
-pub struct EmbedState {
-    pub cfg: EmbedConfig,
-    pub index: EmbedIndex,
-    pub client: Option<EmbedClient>,
-    /// Killed on drop, which stops the server when recap exits.
-    server: Option<EmbedServer>,
-    rx: Option<mpsc::Receiver<EmbedEvent>>,
-    pub status: EmbedStatus,
-    /// Entries embedded and entries queued in the current indexer round.
-    pub done: usize,
-    pub total: usize,
-}
-
-impl EmbedState {
-    fn new() -> EmbedState {
-        let cfg = EmbedConfig::load();
-        let index = EmbedIndex::new(cfg.dims);
-        EmbedState {
-            cfg,
-            index,
-            client: None,
-            server: None,
-            rx: None,
-            status: EmbedStatus::Off,
-            done: 0,
-            total: 0,
-        }
+    pub fn get(&self, id: &EntryId) -> Option<&Entry> {
+        self.index_of(id).map(|i| &self.entries[i])
     }
 
-    /// Text for the help bar, or `None` while the state needs no report.
-    pub fn label(&self) -> Option<String> {
-        match &self.status {
-            EmbedStatus::Off => None,
-            EmbedStatus::Starting => Some("  [embed: starting…]".to_string()),
-            EmbedStatus::Indexing => {
-                Some(format!("  [embedding {}/{}]", self.done, self.total))
-            }
-            EmbedStatus::Ready => None,
-            EmbedStatus::Failed(e) => Some(format!("  [embed: {e}]")),
-        }
-    }
-}
-
-/// Read the two file contents that a file-change entry diffs.
-///
-/// This function and [`diff_text`] hold the shared definition of "the
-/// searchable text of an entry": the `f` search and the embedding indexer
-/// both build their text from them, so the two searches never disagree about
-/// what one entry says.
-fn entry_snapshots(store: &HistoryStore, idx: usize) -> (String, String) {
-    let entry = &store.entries[idx];
-    let new = std::fs::read_to_string(&entry.snapshot_path).unwrap_or_default();
-    let old = match store.prev_snapshot(idx) {
-        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
-        None => String::new(),
-    };
-    (old, new)
-}
-
-/// Concatenate the `+` and `-` bodies of a diff, one per line.
-fn diff_text(old: &str, new: &str) -> String {
-    let mut text = String::new();
-    for line in crate::diff::build_diff_from(old, new) {
-        if let DiffLine::Added(l) | DiffLine::Removed(l) = line {
-            text.push_str(&l);
-            text.push('\n');
-        }
-    }
-    text
-}
-
-/// Embed every job, write each batch to sqlite, and report the batch back so
-/// the UI thread can search it right away.
-fn run_indexer(
-    cfg: EmbedConfig,
-    client: EmbedClient,
-    jobs: Vec<EmbedJob>,
-    load_index: bool,
-    tx: mpsc::Sender<EmbedEvent>,
-) {
-    if let Err(e) = client.wait_ready(Duration::from_secs(120)) {
-        let _ = tx.send(EmbedEvent::Failed(e.to_string()));
-        return;
-    }
-    let mut db = match EmbedDb::open(&cfg) {
-        Ok(db) => db,
-        Err(e) => {
-            let _ = tx.send(EmbedEvent::Failed(e.to_string()));
-            return;
-        }
-    };
-
-    // The first round reads what earlier runs already embedded.
-    let mut known = std::collections::HashSet::new();
-    if load_index {
-        match db.load_index() {
-            Ok(index) => {
-                known = db.keys().unwrap_or_default();
-                let _ = tx.send(EmbedEvent::Index(index));
-            }
-            Err(e) => {
-                let _ = tx.send(EmbedEvent::Failed(e.to_string()));
-                return;
-            }
-        }
+    fn project_position(&self, root: &Path) -> Option<usize> {
+        self.projects.iter().position(|p| p.root == root)
     }
 
-    let todo: Vec<&EmbedJob> = jobs.iter().filter(|j| !known.contains(&j.key)).collect();
-    for chunk in todo.chunks(crate::embed::BATCH) {
-        let texts: Vec<String> = chunk
+    fn set_projects(&mut self, projects: Vec<Project>) {
+        self.project_names = projects
             .iter()
-            .map(|job| match &job.text {
-                Some(t) => t.clone(),
-                None => {
-                    let new = std::fs::read_to_string(&job.new_path).unwrap_or_default();
-                    let old = match &job.old_path {
-                        Some(p) => std::fs::read_to_string(p).unwrap_or_default(),
-                        None => String::new(),
-                    };
-                    diff_text(&old, &new)
-                }
-            })
+            .map(|p| (p.root.clone(), p.name.clone()))
             .collect();
-
-        let vecs = match client.embed_documents(&texts) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = tx.send(EmbedEvent::Failed(e.to_string()));
-                return;
-            }
-        };
-        let rows: Vec<(String, EmbedKind, Vec<f32>)> = chunk
-            .iter()
-            .zip(vecs)
-            .map(|(job, vec)| (job.key.clone(), job.kind, vec))
-            .collect();
-        if let Err(e) = db.insert_batch(&rows) {
-            let _ = tx.send(EmbedEvent::Failed(e.to_string()));
-            return;
-        }
-        if tx.send(EmbedEvent::Batch(rows)).is_err() {
-            return; // The UI closed.
-        }
+        self.projects = projects;
     }
-    let _ = tx.send(EmbedEvent::Done);
+
+    fn reindex(&mut self) {
+        self.index = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
+    }
+
+    /// Replace all entries with the entries of a full history response.
+    fn replace(&mut self, response: HistoryResponse) {
+        self.version = response.version;
+        self.entries = response.groups.into_iter().flat_map(|g| g.entries).collect();
+        self.reindex();
+    }
+
+    /// Merge the response to a history request with `since`. The response
+    /// holds each changed entry that passes the filter, and the id of each
+    /// changed entry that does not pass it any more. The function returns
+    /// the ids of all changed entries.
+    fn apply(&mut self, response: HistoryResponse) -> HashSet<EntryId> {
+        let fresh: Vec<Entry> = response.groups.into_iter().flat_map(|g| g.entries).collect();
+        let mut changed: HashSet<EntryId> = response.removed.into_iter().collect();
+        changed.extend(fresh.iter().map(|e| e.id.clone()));
+        self.entries.retain(|e| !changed.contains(&e.id));
+        self.entries.extend(fresh);
+        self.entries
+            .sort_by(|a, b| recap_api::newest_first((&a.timestamp, &a.id), (&b.timestamp, &b.id)));
+        self.version = response.version;
+        self.reindex();
+        changed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,44 +146,6 @@ impl Mode {
     }
 }
 
-/// Which entry kinds the History panel shows. The filter narrows
-/// [`App::filtered_indices`], which every History search reads, so a search
-/// never reaches an entry that the filter hides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KindFilter {
-    All,
-    Prompts,
-    Changes,
-}
-
-impl KindFilter {
-    /// The next value that the `p` key selects.
-    pub fn next(self) -> KindFilter {
-        match self {
-            KindFilter::All => KindFilter::Prompts,
-            KindFilter::Prompts => KindFilter::Changes,
-            KindFilter::Changes => KindFilter::All,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            KindFilter::All => "all",
-            KindFilter::Prompts => "prompts",
-            KindFilter::Changes => "changes",
-        }
-    }
-
-    /// Whether one entry passes the filter.
-    pub fn keeps(self, entry: &HistoryEntry) -> bool {
-        match self {
-            KindFilter::All => true,
-            KindFilter::Prompts => entry.is_prompt(),
-            KindFilter::Changes => !entry.is_prompt(),
-        }
-    }
-}
-
 /// Whether the agent session behind an entry still runs.
 ///
 /// `Unknown` covers the sources that report nothing: Neovim has no session,
@@ -479,13 +155,12 @@ impl KindFilter {
 pub enum RunState {
     Running,
     Stopped,
+    /// The session does not run, and Claude Code deleted its files. The
+    /// server reads its entries from the archive copy (see
+    /// [`recap_api::Entry::session_archived`]).
+    Archived,
     Unknown,
 }
-
-/// Identifies one history entry across a re-sort. `store.entries` re-sorts on
-/// every load batch, so an index is not stable; the file path and the
-/// timestamp together are.
-pub type EntryId = (PathBuf, DateTime<Local>);
 
 /// What the app must restore when it returns to File mode.
 ///
@@ -501,22 +176,6 @@ struct ModeReturn {
     agent_row: Option<EntryId>,
 }
 
-/// One agent session, as the Agents panel shows it. Rebuilt by
-/// [`App::recompute_agents`] from `store.entries`.
-#[derive(Debug, Clone)]
-pub struct Agent {
-    pub session_id: String,
-    pub source: EditSource,
-    /// Time of the agent's newest prompt, or of its newest entry when the
-    /// agent has no prompt.
-    pub last_ts: DateTime<Local>,
-    pub prompt_count: usize,
-    /// Project chain of the agent's newest entry, outermost → innermost.
-    pub project_roots: Vec<PathBuf>,
-    /// Text of the agent's newest prompt. Empty when the agent has none.
-    pub last_prompt: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPhase {
     /// No search interaction.
@@ -527,22 +186,13 @@ pub enum SearchPhase {
     Active,
 }
 
-/// Which corpus the current search runs against. `Path` fuzzy-matches the
-/// rendered display path (project chain + filename / inline prompt). `Content`
-/// regex-matches the diff body (added + removed lines) for FileChange entries
-/// and the full prompt text for Prompt entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchKind {
-    Path,
-    Content,
-    /// Ranks entries by the cosine similarity of their embedding against the
-    /// embedded query. See [`crate::embed`].
-    Semantic,
-}
-
+/// One History search result. The server finds the matches and sends the
+/// entry ids. The App adds the position of each entry in `view.entries`.
 #[derive(Debug, Clone)]
 pub struct SearchMatch {
-    /// Index into `store.entries`.
+    pub id: EntryId,
+    /// Index into `view.entries`. [`App::remap_search_matches`] updates it
+    /// after a merge changes the order of the entries.
     pub entry_idx: usize,
     /// Character indices (over `display_path`) that participated in the match.
     /// Empty for content matches — they don't highlight in the History panel
@@ -576,7 +226,6 @@ pub struct SearchState {
     /// Content search only: when the query last changed, while the corpus scan
     /// is still deferred. See [`App::maybe_run_pending_search`].
     pending_since: Option<Instant>,
-    matcher: Matcher,
 }
 
 /// How long typing has to pause before a content (`f`) search scans the corpus.
@@ -589,19 +238,6 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 /// regex matches nearly every entry, so that keystroke's sweep is pure cost —
 /// and it's the keystroke that would otherwise pay for the whole cold corpus.
 const CONTENT_MIN_CHARS: usize = 2;
-
-/// How many results a semantic search keeps. The list is ranked, so a long
-/// tail of weak matches adds noise and no information.
-const SEMANTIC_TOP_K: usize = 50;
-
-/// How far below the best score a result may fall and still appear. Qwen3
-/// cosine scores cluster between 0.2 and 0.8, so an absolute floor is
-/// fragile; the distance to the best result is stable.
-const SEMANTIC_REL_FLOOR: f32 = 0.15;
-
-/// Scale that packs a cosine score into `SearchMatch::score`, which the path
-/// search already uses for its own ranking.
-const SEMANTIC_SCORE_SCALE: f32 = 10_000.0;
 
 /// How many rows after (or before) a revealed search match stay visible, so
 /// the match does not sit on the last (or the first) line of the panel.
@@ -630,7 +266,6 @@ impl Default for SearchState {
             restore: None,
             content_regex: None,
             pending_since: None,
-            matcher: Matcher::new(Config::DEFAULT),
         }
     }
 }
@@ -736,10 +371,7 @@ impl Default for DiffSearchState {
 /// lines for prompt entries), so `/` in the Diff panel feels like the same
 /// search restricted to whatever the Diff currently shows.
 fn diff_line_text(dl: &DiffLine) -> Option<&str> {
-    match dl {
-        DiffLine::Added(s) | DiffLine::Removed(s) | DiffLine::Prompt(s) | DiffLine::Response(s) => Some(s),
-        DiffLine::Context(_) | DiffLine::Header(_) | DiffLine::ChildSeparator { .. } => None,
-    }
+    dl.search_text()
 }
 
 impl PanelSearchState {
@@ -818,25 +450,22 @@ const MIN_PROMPT_LINES: usize = 1;
 const MAX_PROMPT_LINES: usize = 20;
 
 pub struct App {
-    pub store: HistoryStore,
+    /// The server. The App reads all history data through it.
+    api: Arc<dyn Api>,
+    /// The copy of the server data that the panels show. See [`View`].
+    pub view: View,
     pub active_panel: Panel,
 
+    /// Index into `view.projects`. `None` is the "All projects" row.
     pub selected_project_idx: Option<usize>,
     pub project_scroll: usize,
 
-    /// Files (file_path) visible in the Files panel — derived from
-    /// `store.entries` filtered by `selected_project_idx`, sorted newest
-    /// first by `file_latest`. Prompt entries are excluded since their
-    /// `file_path` is a synthetic per-prompt key.
-    pub files: Vec<PathBuf>,
-    pub file_latest: HashMap<PathBuf, DateTime<Local>>,
-    pub file_counts: HashMap<PathBuf, usize>,
-    /// Project chain (outermost → innermost) for each listed file. Cached
-    /// off the first entry encountered for that path so the UI doesn't have
-    /// to re-walk `store.entries` per visible row.
-    pub file_chains: HashMap<PathBuf, Vec<PathBuf>>,
+    /// The files of the Files panel for the selected project, newest first.
+    /// The server sends them. The list has no prompts, because the
+    /// `file_path` of a prompt is not a real file.
+    pub files: Vec<FileInfo>,
     /// `None` → "All files" row. Path-based (not index) so the selection
-    /// survives a re-sort after a load batch arrives.
+    /// survives a change of the list.
     pub selected_file_path: Option<PathBuf>,
     pub file_scroll: usize,
 
@@ -846,23 +475,17 @@ pub struct App {
     /// Which entry kinds History shows. See [`KindFilter`].
     pub kind_filter: KindFilter,
 
-    /// Agents visible in the Agents panel — derived from `store.entries`
-    /// filtered by `selected_project_idx`, newest first. Entries without a
-    /// session id (Neovim edits, unattributed Cursor saves) have no agent, so
-    /// they do not appear here and Agent mode does not reach them.
+    /// The agents of the Agents panel for the selected project, newest
+    /// first. The server sends them. Entries without a session id (Neovim
+    /// edits, unattributed Cursor saves) have no agent, so Agent mode does
+    /// not reach them.
     pub agents: Vec<Agent>,
     /// Session id of the selected agent. Stored by id (not index) so the
-    /// selection survives the re-sort that each load batch causes.
+    /// selection survives a change of the list.
     pub selected_agent: Option<String>,
     pub agent_scroll: usize,
     /// Selection memory for the `m` toggle. See [`ModeReturn`].
     mode_return: ModeReturn,
-
-    /// Position of each prompt inside its own agent session, counted from the
-    /// oldest prompt as 1. Keyed by the prompt's synthetic `file_path`, which
-    /// is unique and stable across the entry re-sort. The History panel prints
-    /// the number in front of the prompt text.
-    pub prompt_ordinals: HashMap<PathBuf, usize>,
 
     pub groups: Vec<HistoryGroup>,
     pub display_rows: Vec<DisplayRow>,
@@ -922,21 +545,12 @@ pub struct App {
     /// `display_rows`. It is part of the row-height cache key.
     display_gen: u64,
 
-    /// Lazily-computed +/- line counts, keyed by entry index.
-    pub diff_summaries: HashMap<usize, DiffSummary>,
-
-    /// Lazily-computed per-entry searchable text for content search. For
-    /// FileChange entries the value is the concatenation of `+`/`-` diff
-    /// lines; for Prompt entries it's the full prompt text. Keyed by
-    /// `snapshot_path` (FileChange) or the synthetic prompt `file_path`
-    /// (Prompt) so the cache survives the entry-vec re-sort that happens
-    /// when a load batch is merged.
-    content_cache: HashMap<PathBuf, String>,
+    /// The +/- line counts of the entries that the History panel showed.
+    /// The server calculates them. A merge removes the counts of the entries
+    /// that changed.
+    pub diff_summaries: HashMap<EntryId, DiffSummary>,
 
     pub search: SearchState,
-    /// The semantic-search subsystem: the model server, the vector index and
-    /// the indexer thread. See [`crate::embed`].
-    pub embed: EmbedState,
     pub project_search: PanelSearchState,
     pub file_search: PanelSearchState,
     pub diff_search: DiffSearchState,
@@ -954,57 +568,45 @@ pub struct App {
     /// otherwise every edit to the file collapses into one group.
     pub auto_expand: bool,
 
-    /// External entry sources for incremental reloads (`r` keybinding).
-    pub sources: Sources,
+    /// The running Claude Code sessions, by session id. The server scans the
+    /// session registry and sends each change as an event. The sessions
+    /// drive the "running" indicator column and the `o` (focus/resume) key.
+    pub running: HashMap<String, RunningSession>,
 
-    /// Snapshot of currently-running Claude Code sessions, indexed by session
-    /// id. Drives the "running" indicator column and the `o` (focus/resume)
-    /// keybinding. Refreshed on a timer via [`Self::maybe_rescan_running`].
-    pub running: crate::session::RunningSessions,
-    running_scanned_at: Option<Instant>,
-
-    /// True while at least one loader thread is running. Drives the
-    /// `[loading]` indicator in the help bar.
+    /// True while the server loads its sources. Drives the `[loading]`
+    /// indicator in the help bar.
     pub loading: bool,
 
-    /// Receiver for batches/finish events from the loader threads. `None`
-    /// when no scan is in flight.
-    rx: Option<mpsc::Receiver<LoadEvent>>,
+    /// The state of the semantic search on the server.
+    pub embed: EmbedStatus,
 
-    /// Number of loader threads that haven't reported `SourceFinished` yet.
-    loading_sources: u8,
+    /// The error of the last API call that failed. The help bar shows it.
+    /// The next successful connection clears it.
+    pub error: Option<String>,
 
-    /// The oldest file mtime that the next load reads. Each loader skips a
-    /// file that is older, which makes a load of a short period much faster.
-    /// `None` reads the full history, which is what the TUI does.
-    pub load_since: Option<SystemTime>,
-
-    /// Persisted project selection (by root path) awaiting resolution to an
-    /// index. The projects list is empty at startup and fills in async, so the
-    /// path is held here and resolved against `store.projects` as batches
-    /// arrive. Only honored while `loading`; cleared once loading finishes.
+    /// Persisted project selection (by root path) that the projects list
+    /// does not hold yet. While the server loads, the project can arrive
+    /// later. Cleared when the server finishes the load.
     pending_project_restore: Option<PathBuf>,
-    /// Persisted file selection awaiting its entries to load. Keeps
-    /// `selected_file_path` from being dropped by `recompute_files` before the
-    /// file's first entry has streamed in. Cleared once loading finishes.
+    /// Persisted file selection whose entries the server did not load yet.
+    /// Keeps `selected_file_path` from being dropped by `recompute_files`.
+    /// Cleared when the server finishes the load.
     pending_file_restore: Option<PathBuf>,
-    /// Persisted agent selection awaiting its entries. The Agents panel fills
-    /// in async, so the id waits here and [`Self::recompute_agents`] keeps the
-    /// selection on it until loading finishes.
+    /// Persisted agent selection whose entries the server did not load yet.
+    /// [`Self::recompute_agents`] keeps the selection on it until the
+    /// server finishes the load.
     pending_agent_restore: Option<String>,
 }
 
 impl App {
-    pub fn new(store: HistoryStore, sources: Sources) -> Self {
+    pub fn new(api: Arc<dyn Api>) -> Self {
         let mut app = Self {
-            store,
+            api,
+            view: View::default(),
             active_panel: Panel::History,
             selected_project_idx: None,
             project_scroll: 0,
             files: Vec::new(),
-            file_latest: HashMap::new(),
-            file_counts: HashMap::new(),
-            file_chains: HashMap::new(),
             selected_file_path: None,
             file_scroll: 0,
             mode: Mode::File,
@@ -1013,7 +615,6 @@ impl App {
             selected_agent: None,
             agent_scroll: 0,
             mode_return: ModeReturn::default(),
-            prompt_ordinals: HashMap::new(),
             groups: Vec::new(),
             display_rows: Vec::new(),
             sel_group: 0,
@@ -1034,34 +635,31 @@ impl App {
             last_diff_height: 0,
             display_gen: 0,
             diff_summaries: HashMap::new(),
-            content_cache: HashMap::new(),
             search: SearchState::default(),
-            embed: EmbedState::new(),
             project_search: PanelSearchState::default(),
             file_search: PanelSearchState::default(),
             diff_search: DiffSearchState::default(),
             search_history: SearchHistories::default(),
             auto_expand: false,
-            sources,
-            running: crate::session::RunningSessions::scan(),
-            running_scanned_at: Some(Instant::now()),
+            running: HashMap::new(),
             loading: false,
-            rx: None,
-            loading_sources: 0,
-            load_since: None,
+            embed: EmbedStatus::Off,
+            error: None,
             pending_project_restore: None,
             pending_file_restore: None,
             pending_agent_restore: None,
         };
+        app.load_server_state();
+        app.refresh_projects();
         app.refilter();
         app
     }
 
-    /// Seed selection/toggles from persisted state. The project and file are
-    /// stored by path and parked in the `pending_*_restore` fields; they are
-    /// resolved as load batches arrive (see [`Self::merge_batch`] and
-    /// [`Self::recompute_files`]). `absolute_time` is left to the caller so a
-    /// CLI override can take precedence.
+    /// Seed selection/toggles from persisted state, then load the views for
+    /// that selection. While the server loads, a project, file or agent
+    /// that it did not load yet waits in the `pending_*_restore` fields.
+    /// `absolute_time` is left to the caller so a CLI override can take
+    /// precedence.
     pub fn apply_persisted(&mut self, state: &crate::persist::PersistedState) {
         self.pending_project_restore = state.selected_project.clone();
         self.selected_file_path = state.selected_file.clone();
@@ -1076,13 +674,19 @@ impl App {
         if self.mode == Mode::Agent {
             self.active_panel = Panel::Agents;
         }
+        self.refresh_projects();
+        if !self.loading {
+            // The server holds all its data, so a selection that it does not
+            // know is gone. The refilter below drops it.
+            self.clear_pending_restores();
+        }
+        self.refilter();
     }
 
     /// Snapshot the bits of UI state worth surviving a restart.
     pub fn persisted_state(&self) -> crate::persist::PersistedState {
         let selected_project = self
-            .selected_project_idx
-            .and_then(|i| self.store.projects.get(i).cloned())
+            .selected_project_root()
             .or_else(|| self.pending_project_restore.clone());
         let selected_file = self
             .selected_file_path
@@ -1105,466 +709,289 @@ impl App {
         }
     }
 
-    /// Spawn one background thread per detected source. Each thread streams
-    /// per-folder/session/file batches in newest-first order through the
-    /// returned channel. Returns immediately; the UI loop should call
-    /// `drain_load_events` each frame to merge new batches.
-    pub fn start_background_load(&mut self) {
-        if self.loading {
-            return;
+    // ── Server state ──────────────────────────────────────────────────────────
+
+    /// Record the error of an API call. The help bar shows it.
+    fn fail(&mut self, error: ApiError) {
+        self.error = Some(error.0);
+    }
+
+    /// Read the server state that the event stream sends only when it
+    /// changes: the load state, the semantic search state and the running
+    /// sessions.
+    fn load_server_state(&mut self) {
+        match self.api.status() {
+            Ok(status) => {
+                self.loading = status.loading;
+                self.embed = status.embed;
+                self.error = None;
+            }
+            Err(e) => self.fail(e),
         }
-        let (tx, rx) = mpsc::channel::<LoadEvent>();
-        let since = self.load_since;
-        self.loading_sources = 0;
-        crate::history::clear_dir_states();
-
-        if let Some(dir) = self.sources.cursor_dir.clone() {
-            let mut mtimes = std::mem::take(&mut self.sources.cursor_mtimes);
-            let mut seen = std::mem::take(&mut self.sources.cursor_seen);
-            let loader_tx = tx.clone();
-            self.loading_sources += 1;
-            std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>| -> bool {
-                    loader_tx.send(LoadEvent::Batch(batch)).is_ok()
-                };
-                if let Err(e) =
-                    HistoryStore::load_cursor(&dir, &mut mtimes, &mut seen, since, &mut on_batch)
-                {
-                    crate::log_warn!("recap: cursor history failed: {e}");
-                }
-                let _ = loader_tx.send(LoadEvent::SourceFinished {
-                    kind: SourceKind::Cursor,
-                    mtimes,
-                    seen,
-                });
-            });
-
-            // Build the composer-attribution map on its own thread so the
-            // multi-GB DB scan never blocks Cursor edits from streaming. It's
-            // cached by DB mtime, so an unchanged store returns instantly.
-            let prev = self.sources.cursor_sessions.clone();
-            let prev_mtime = self.sources.cursor_sessions_mtime;
-            let attrib_tx = tx.clone();
-            // Counted so the load channel stays open until attribution lands.
-            self.loading_sources += 1;
-            std::thread::spawn(move || {
-                let (sessions, mtime) =
-                    crate::cursor_sessions::CursorSessions::load_cached(prev, prev_mtime);
-                let _ = attrib_tx.send(LoadEvent::CursorSessions { sessions, mtime });
-            });
-        }
-
-        if let Some(dir) = self.sources.claude_dir.clone() {
-            let mut mtimes = std::mem::take(&mut self.sources.claude_mtimes);
-            let mut seen = std::mem::take(&mut self.sources.claude_seen);
-            let tx = tx.clone();
-            self.loading_sources += 1;
-            std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>,
-                                    titles: HashMap<String, String>|
-                 -> bool {
-                    if !titles.is_empty()
-                        && tx.send(LoadEvent::SessionTitles(titles)).is_err()
-                    {
-                        return false;
-                    }
-                    if batch.is_empty() {
-                        return true;
-                    }
-                    tx.send(LoadEvent::Batch(batch)).is_ok()
-                };
-                if let Err(e) = claude::load(&dir, &mut mtimes, &mut seen, since, &mut on_batch)
-                {
-                    crate::log_warn!("recap: claude history failed: {e}");
-                }
-                let _ = tx.send(LoadEvent::SourceFinished {
-                    kind: SourceKind::Claude,
-                    mtimes,
-                    seen,
-                });
-            });
-        }
-
-        if let Some(dir) = self.sources.nvim_dir.clone() {
-            let mut mtimes = std::mem::take(&mut self.sources.nvim_mtimes);
-            let mut seen = std::mem::take(&mut self.sources.nvim_seen);
-            let tx = tx.clone();
-            self.loading_sources += 1;
-            std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>| -> bool {
-                    tx.send(LoadEvent::Batch(batch)).is_ok()
-                };
-                if let Err(e) = nvim::load(&dir, &mut mtimes, &mut seen, since, &mut on_batch) {
-                    crate::log_warn!("recap: neovim history failed: {e}");
-                }
-                let _ = tx.send(LoadEvent::SourceFinished {
-                    kind: SourceKind::Nvim,
-                    mtimes,
-                    seen,
-                });
-            });
-        }
-
-        // Drop the original sender so the receiver disconnects once every
-        // thread's clone is dropped (covers the no-sources case too).
-        drop(tx);
-
-        if self.loading_sources > 0 {
-            self.loading = true;
-            self.rx = Some(rx);
+        match self.api.running() {
+            Ok(sessions) => self.set_running(sessions),
+            Err(e) => self.fail(e),
         }
     }
 
-    /// Pull every available message from the loader channel and apply them.
-    /// All batches accumulated in a single drain are merged once so we
-    /// re-sort and recompute project metadata at most once per frame.
-    pub fn drain_load_events(&mut self, visible: usize) {
-        let Some(rx) = self.rx.as_ref() else {
-            return;
-        };
-
-        let mut accumulated: Vec<HistoryEntry> = Vec::new();
-        let mut disconnected = false;
-        let mut cursor_attribution_pending = false;
-        loop {
-            match rx.try_recv() {
-                Ok(LoadEvent::Batch(mut entries)) => accumulated.append(&mut entries),
-                Ok(LoadEvent::SessionTitles(titles)) => {
-                    self.store.session_titles.extend(titles);
-                }
-                Ok(LoadEvent::CursorSessions { sessions, mtime }) => {
-                    self.sources.cursor_sessions_mtime = mtime;
-                    // The composer map always covers the whole database. Drop
-                    // what is older than the load period, so a short period
-                    // stays cheap here too.
-                    let cutoff = self.load_since.map(DateTime::<Local>::from);
-                    // Extend, never replace: the Claude loader writes its
-                    // titles into the same map.
-                    self.store
-                        .session_titles
-                        .extend(sessions.names_map().clone());
-                    // Merge the composer's user prompts like Claude's, deduped
-                    // by their unique synthetic key (`cursor:<composer>:<bubble>`)
-                    // so a rebuild on mtime change doesn't re-add old prompts.
-                    // A prompt with a response passes anyway: `merge_batch`
-                    // replaces the entry, so a response that arrived after
-                    // the last rebuild reaches the store.
-                    let have: HashSet<&PathBuf> = self
-                        .store
-                        .entries
-                        .iter()
-                        .filter(|e| e.is_prompt())
-                        .map(|e| &e.file_path)
-                        .chain(accumulated.iter().filter(|e| e.is_prompt()).map(|e| &e.file_path))
-                        .collect();
-                    let fresh: Vec<HistoryEntry> = sessions
-                        .prompts()
-                        .iter()
-                        .filter(|p| cutoff.is_none_or(|c| p.timestamp >= c))
-                        .filter(|p| !have.contains(&p.file_path) || p.response_text().is_some())
-                        .cloned()
-                        .collect();
-                    drop(have);
-                    accumulated.extend(fresh);
-
-                    // Merge the composer's file edits the same way. Their key
-                    // is (path, time, snapshot), because the snapshot alone is
-                    // content-addressed and two edits can produce one content.
-                    let have_edits: HashSet<(&PathBuf, DateTime<Local>, &PathBuf)> = self
-                        .store
-                        .entries
-                        .iter()
-                        .chain(accumulated.iter())
-                        .filter(|e| e.base_path.is_some())
-                        .map(|e| (&e.file_path, e.timestamp, &e.snapshot_path))
-                        .collect();
-                    let fresh_edits: Vec<HistoryEntry> = sessions
-                        .edits()
-                        .iter()
-                        .filter(|e| cutoff.is_none_or(|c| e.timestamp >= c))
-                        .filter(|e| {
-                            !have_edits.contains(&(&e.file_path, e.timestamp, &e.snapshot_path))
-                        })
-                        .cloned()
-                        .collect();
-                    drop(have_edits);
-                    accumulated.extend(fresh_edits);
-                    self.sources.cursor_sessions = Some(sessions);
-                    cursor_attribution_pending = true;
-                    self.loading_sources = self.loading_sources.saturating_sub(1);
-                }
-                Ok(LoadEvent::SourceFinished { kind, mtimes, seen }) => {
-                    match kind {
-                        SourceKind::Cursor => {
-                            self.sources.cursor_mtimes = mtimes;
-                            self.sources.cursor_seen = seen;
-                        }
-                        SourceKind::Claude => {
-                            self.sources.claude_mtimes = mtimes;
-                            self.sources.claude_seen = seen;
-                        }
-                        SourceKind::Nvim => {
-                            self.sources.nvim_mtimes = mtimes;
-                            self.sources.nvim_seen = seen;
-                        }
-                    }
-                    self.loading_sources = self.loading_sources.saturating_sub(1);
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-
-        let merged = !accumulated.is_empty();
-        if merged {
-            self.merge_batch(accumulated, visible);
-        }
-
-        // (Re)attribute Cursor edits when the map just arrived, or when new
-        // Cursor entries merged while a map is already cached.
-        if (cursor_attribution_pending || merged) && self.sources.cursor_sessions.is_some() {
-            self.apply_cursor_attribution();
-        }
-
-        if disconnected || self.loading_sources == 0 {
-            self.loading = false;
-            self.rx = None;
-
-            // Loading is done — pending restores have had their chance. Clear
-            // them and reconcile once so a file selection that never
-            // materialized is dropped rather than left filtering to nothing.
-            if self.pending_project_restore.take().is_some()
-                | self.pending_file_restore.take().is_some()
-                | self.pending_agent_restore.take().is_some()
-            {
-                let selection_id = self
-                    .current_entry()
-                    .map(|e| (e.file_path.clone(), e.timestamp));
-                self.refilter_preserving(selection_id, visible);
-            }
-        }
+    fn set_running(&mut self, sessions: Vec<RunningSession>) {
+        self.running = sessions
+            .into_iter()
+            .map(|s| (s.session_id.clone(), s))
+            .collect();
     }
 
-    /// Tag every Cursor file-edit entry with the composer (agent session) that
-    /// produced it, using the cached attribution map. Idempotent; run after a
-    /// merge or when the map arrives. No-op without a map.
-    fn apply_cursor_attribution(&mut self) {
-        let Some(sessions) = self.sources.cursor_sessions.clone() else {
-            return;
-        };
-        for entry in &mut self.store.entries {
-            if entry.source != crate::history::EditSource::Cursor {
-                continue;
-            }
-            // An entry with a base already carries the composer that the tool
-            // call named. A prompt carries its own composer too, and its
-            // synthetic `cursor:<composer>:<bubble>` path matches no file, so
-            // the fuzzy join would only erase that composer. Only the Local
-            // History edits need the join.
-            if entry.base_path.is_some() || entry.is_prompt() {
-                continue;
-            }
-            entry.session_id = sessions.attribute(&entry.file_path, entry.timestamp.timestamp_millis());
-        }
-    }
-
-    fn merge_batch(&mut self, mut entries: Vec<HistoryEntry>, visible: usize) {
-        self.sources.attach_plan_project(&mut entries);
-
-        let selection_id = self
-            .current_entry()
-            .map(|e| (e.file_path.clone(), e.timestamp));
-
-        // Remember the selected project by path: the projects list re-sorts on
-        // every merge, so the index would otherwise drift. Fall back to a
-        // pending restore from persisted state when nothing is selected yet.
-        let desired_project = self
-            .selected_project_idx
-            .and_then(|i| self.store.projects.get(i).cloned())
+    /// Read the projects list again, and keep the selection on the same
+    /// project. The selection stays on the "All projects" row until the
+    /// selected project exists.
+    fn refresh_projects(&mut self) {
+        let desired = self
+            .selected_project_root()
             .or_else(|| self.pending_project_restore.clone());
-
-        // A prompt the store already holds arrives again when its source
-        // attached the agent's response after the earlier scan. Replace the
-        // old entry in place and drop its cached search text.
-        if entries.iter().any(|e| e.is_prompt()) {
-            let by_key: HashMap<PathBuf, usize> = self
-                .store
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.is_prompt())
-                .map(|(i, e)| (e.file_path.clone(), i))
-                .collect();
-            entries.retain_mut(|e| {
-                let Some(&i) = by_key.get(&e.file_path).filter(|_| e.is_prompt()) else {
-                    return true;
-                };
-                self.content_cache.remove(&content_cache_key(e));
-                std::mem::swap(&mut self.store.entries[i], e);
-                false
-            });
+        match self.api.projects() {
+            Ok(response) => self.view.set_projects(response.projects),
+            Err(e) => self.fail(e),
         }
-        self.store.entries.extend(entries);
-        self.store
-            .entries
-            .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        self.store.recompute_projects();
+        self.selected_project_idx = desired.and_then(|p| self.view.project_position(&p));
+    }
 
-        // Re-resolve the selection against the rebuilt projects list. Stays
-        // `None` (the "All projects" row) until the target project loads.
-        self.selected_project_idx = desired_project
-            .as_ref()
-            .and_then(|p| self.store.projects.iter().position(|q| q == p));
+    fn clear_pending_restores(&mut self) -> bool {
+        self.pending_project_restore.take().is_some()
+            | self.pending_file_restore.take().is_some()
+            | self.pending_agent_restore.take().is_some()
+    }
 
-        // Entry indices shifted; cached summaries are keyed by index.
-        self.diff_summaries.clear();
+    /// Apply one event from the server.
+    pub fn on_event(&mut self, event: Event, visible: usize) {
+        match event {
+            Event::Changed { version } => {
+                if version > self.view.version {
+                    self.pull_changes(visible);
+                }
+            }
+            Event::Loading { loading } => {
+                self.loading = loading;
+                // The load is complete, so the pending restores had their
+                // chance. Drop a selection that never arrived, so it does not
+                // filter the panels down to nothing.
+                if !loading && self.clear_pending_restores() {
+                    self.refresh_projects();
+                    let selection = self.current_entry_id();
+                    self.refilter_preserving(selection, visible);
+                }
+            }
+            Event::Embed(status) => self.embed = status,
+            Event::Running { sessions } => self.set_running(sessions),
+        }
+    }
 
-        // Drop search results: history matches reference entry indices (which
-        // shift on sort), and the side-panel matches reference positions in
-        // the projects/files lists (which a new batch can grow or reorder).
-        self.search_clear();
+    /// Read all the views again after the connection to the server came
+    /// back. The server can have restarted, so the store version can be
+    /// lower than before.
+    pub fn on_reconnect(&mut self, visible: usize) {
+        self.load_server_state();
+        self.refresh_projects();
+        let selection = self.current_entry_id();
+        self.refilter_preserving(selection, visible);
+    }
+
+    /// Record that the connection to the server stopped.
+    pub fn on_disconnect(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
+    /// Ask the server to load all sources now (the `r` key).
+    pub fn reload(&mut self, _visible: usize) {
+        if let Err(e) = self.api.reload() {
+            self.fail(e);
+        }
+    }
+
+    /// Ask the server to write the files of the archived session of `entry`
+    /// back to the Claude Code projects directory. Returns false and shows
+    /// the error when the server cannot do it.
+    pub fn restore_session(&mut self, entry: &Entry) -> bool {
+        let Some(session_id) = entry.session_id.as_deref() else {
+            return false;
+        };
+        match self.api.restore_session(session_id) {
+            Ok(()) => true,
+            Err(e) => {
+                self.fail(e);
+                false
+            }
+        }
+    }
+
+    /// Merge the entries that changed after `view.version`. The selection,
+    /// the expanded group and the search matches stay on the same entries.
+    fn pull_changes(&mut self, visible: usize) {
+        let selection = self.current_entry_id();
+        let before = self.filter();
+        self.refresh_projects();
+        self.recompute_files();
+        self.recompute_agents();
+        if self.filter() != before {
+            // The selected project, file or agent is gone, so the History
+            // panel shows another set of entries.
+            self.search_clear();
+            self.refilter_preserving(selection, visible);
+            return;
+        }
+
+        let page = Page {
+            since: Some(self.view.version),
+            limit: None,
+        };
+        let changed = match self.api.history(&before, &page) {
+            Ok(response) => self.view.apply(response),
+            Err(e) => return self.fail(e),
+        };
+        for id in &changed {
+            self.diff_summaries.remove(id);
+        }
+        self.remap_search_matches();
+        // The side lists can grow or change their order, so the positions
+        // in their matches can be wrong.
         self.project_search.clear();
         self.file_search.clear();
 
-        self.refilter_preserving(selection_id, visible);
-    }
-
-    /// Rescan all sources in the background. No-op while a scan is already
-    /// in flight. Batches are merged incrementally via `drain_load_events`.
-    pub fn reload(&mut self, _visible: usize) {
-        self.running = crate::session::RunningSessions::scan();
-        self.running_scanned_at = Some(Instant::now());
-        self.start_background_load();
-    }
-
-    /// Like `refilter` but tries to keep selection on the entry identified by
-    /// `(file_path, timestamp)`. Falls back to row 0 if not found.
-    fn refilter_preserving(
-        &mut self,
-        selection_id: Option<(PathBuf, chrono::DateTime<chrono::Local>)>,
-        visible: usize,
-    ) {
-        self.recompute_files();
-        self.recompute_prompt_ordinals();
-        self.recompute_agents();
-        let filtered = self.filtered_indices();
-        self.groups = Self::build_groups(&self.store.entries, &filtered);
-
-        let target = selection_id.and_then(|(fp, ts)| {
-            self.groups.iter().enumerate().find_map(|(gi, g)| {
-                g.entry_indices.iter().position(|&ei| {
-                    let e = &self.store.entries[ei];
-                    e.file_path == fp && e.timestamp == ts
-                }).map(|ci| (gi, ci))
-            })
-        });
-        let (sg, sc) = target.unwrap_or((0, 0));
-        self.sel_group = sg;
-        self.sel_child = sc;
-        self.diff_scroll = 0;
-
-        if !self.groups.is_empty() && self.effective_auto_expand() {
-            for g in &mut self.groups {
-                g.expanded = false;
-            }
-            self.groups[self.sel_group].expanded = true;
+        let expanded = self.current_group_ids();
+        self.regroup(selection.clone());
+        let moved = self.current_entry_id() != selection;
+        if moved {
+            self.diff_scroll = 0;
         }
-        self.rebuild_display();
+        self.adjust_scroll(visible);
+        // Build the diff again only when the text can be different, so a
+        // change in another entry does not drop the Diff scroll or the
+        // mouse selection.
+        if moved || self.current_group_ids() != expanded || expanded.iter().any(|id| changed.contains(id)) {
+            self.refresh_diff();
+            self.diff_scroll = self.diff_scroll.min(self.diff_lines.len().saturating_sub(1));
+        }
+    }
+
+    /// The ids of the entries in the selected group.
+    fn current_group_ids(&self) -> Vec<EntryId> {
+        self.groups
+            .get(self.sel_group)
+            .map(|g| {
+                g.entry_indices
+                    .iter()
+                    .map(|&i| self.view.entries[i].id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Put each search match on the new position of its entry, and drop the
+    /// matches whose entry is gone.
+    fn remap_search_matches(&mut self) {
+        let current = self.search.matches.get(self.search.current).map(|m| m.id.clone());
+        let view = &self.view;
+        self.search.matches.retain_mut(|m| match view.index_of(&m.id) {
+            Some(i) => {
+                m.entry_idx = i;
+                true
+            }
+            None => false,
+        });
+        self.search.current = current
+            .and_then(|id| self.search.matches.iter().position(|m| m.id == id))
+            .unwrap_or(0);
+    }
+
+    /// Like `refilter` but tries to keep selection on the entry `selection`.
+    /// Falls back to row 0 if not found.
+    fn refilter_preserving(&mut self, selection: Option<EntryId>, visible: usize) {
+        self.recompute_files();
+        self.recompute_agents();
+        self.load_history();
+        self.regroup(selection);
+        self.diff_scroll = 0;
         self.adjust_scroll(visible);
         self.refresh_diff();
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    fn filtered_indices(&self) -> Vec<usize> {
-        let project = self
-            .selected_project_idx
-            .and_then(|i| self.store.projects.get(i));
-        let file = self.selected_file_path.as_ref();
-        // Agent mode narrows History to one agent; File mode ignores this.
-        // With no agent selected, Agent mode reaches no entry at all — the
-        // entries without a session have no agent to select.
-        let agent = match self.mode {
-            Mode::Agent => Some(self.selected_agent.as_deref().unwrap_or("")),
-            Mode::File => None,
-        };
-        self.store
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| match project {
-                None => true,
-                Some(p) => e.project_roots.iter().any(|r| r == p),
-            })
-            .filter(|(_, e)| match file {
-                None => true,
-                Some(f) => &e.file_path == f,
-            })
-            .filter(|(_, e)| match agent {
-                None => true,
-                Some(a) => e.session_id.as_deref() == Some(a),
-            })
-            .filter(|(_, e)| self.kind_filter.keeps(e))
-            .map(|(i, _)| i)
-            .collect()
+    /// The root of the selected project.
+    fn selected_project_root(&self) -> Option<PathBuf> {
+        self.selected_project_idx
+            .and_then(|i| self.view.projects.get(i))
+            .map(|p| p.root.clone())
     }
 
-    /// Rebuild the Agents panel list from `store.entries`. Honors the project
-    /// filter so the panel mirrors what History can reach. Entries without a
-    /// session id have no agent and drop out. `store.entries` is newest first,
-    /// so the first prompt each session yields is that agent's newest one.
-    fn recompute_agents(&mut self) {
-        let project = self
-            .selected_project_idx
-            .and_then(|i| self.store.projects.get(i))
-            .cloned();
-        let mut order: Vec<String> = Vec::new();
-        let mut by_id: HashMap<String, Agent> = HashMap::new();
-        for e in &self.store.entries {
-            let Some(sid) = e.session_id.as_deref() else {
-                continue;
-            };
-            if let Some(p) = &project
-                && !e.project_roots.iter().any(|r| r == p)
-            {
-                continue;
-            }
-            let agent = by_id.entry(sid.to_string()).or_insert_with(|| {
-                order.push(sid.to_string());
-                Agent {
-                    session_id: sid.to_string(),
-                    source: e.source,
-                    last_ts: e.timestamp,
-                    prompt_count: 0,
-                    project_roots: e.project_roots.clone(),
-                    last_prompt: String::new(),
-                }
-            });
-            if let Some(text) = e.prompt_text() {
-                if agent.prompt_count == 0 {
-                    // The newest prompt also gives the agent its display time,
-                    // which the user reads as "when the agent last ran".
-                    agent.last_ts = e.timestamp;
-                    agent.last_prompt = crate::history::single_line(text);
-                    if agent.project_roots.is_empty() {
-                        agent.project_roots = e.project_roots.clone();
-                    }
-                }
-                agent.prompt_count += 1;
+    /// The filter of the History panel, as the server applies it.
+    fn filter(&self) -> Filter {
+        Filter {
+            project: self.selected_project_root(),
+            file: self.selected_file_path.clone(),
+            // Agent mode narrows History to one agent; File mode ignores
+            // this. With no agent selected, Agent mode reaches no entry at
+            // all: the server matches the empty id to no entry.
+            agent: match self.mode {
+                Mode::Agent => Some(self.selected_agent.clone().unwrap_or_default()),
+                Mode::File => None,
+            },
+            kind: self.kind_filter,
+            after: None,
+        }
+    }
+
+    /// Read all entries that pass the filter from the server.
+    fn load_history(&mut self) {
+        match self.api.history(&self.filter(), &Page::default()) {
+            Ok(response) => self.view.replace(response),
+            Err(e) => {
+                self.fail(e);
+                self.view.replace(HistoryResponse::default());
             }
         }
-        let mut agents: Vec<Agent> = order
+    }
+
+    /// Build the groups from `view.entries` again, and put the selection on
+    /// the entry `selection`. The selection falls back to row 0.
+    fn regroup(&mut self, selection: Option<EntryId>) {
+        self.groups = recap_api::group_runs(&self.view.entries)
             .into_iter()
-            .filter_map(|id| by_id.remove(&id))
+            .map(|run| HistoryGroup {
+                entry_indices: run.collect(),
+                expanded: false,
+            })
             .collect();
-        agents.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        let target = selection
+            .and_then(|id| self.view.index_of(&id))
+            .and_then(|idx| {
+                self.groups.iter().enumerate().find_map(|(gi, g)| {
+                    g.entry_indices.iter().position(|&ei| ei == idx).map(|ci| (gi, ci))
+                })
+            });
+        let (sg, sc) = target.unwrap_or((0, 0));
+        self.sel_group = sg;
+        self.sel_child = sc;
+        if !self.groups.is_empty() && self.effective_auto_expand() {
+            self.groups[self.sel_group].expanded = true;
+        }
+        self.rebuild_display();
+    }
+
+    /// Read the Agents panel list from the server. The list honors the
+    /// project filter, so the panel mirrors what History can reach.
+    fn recompute_agents(&mut self) {
+        let project = self.selected_project_root();
+        let agents = match self.api.agents(project.as_deref()) {
+            Ok(response) => response.agents,
+            Err(e) => {
+                self.fail(e);
+                Vec::new()
+            }
+        };
 
         // Keep the selection on an agent that still exists, and give Agent
         // mode a selection as soon as the first agent loads. A pending
-        // restore is exempt: its entries may not have streamed in yet.
+        // restore is exempt: its entries may not have loaded yet.
         let still_there = self
             .selected_agent
             .as_deref()
@@ -1578,113 +1005,36 @@ impl App {
         self.agents = agents;
     }
 
-    /// Recompute [`Self::prompt_ordinals`]. `store.entries` is newest first,
-    /// so the walk runs backwards to count each session's prompts from the
-    /// oldest one. A session whose older prompts have not loaded yet counts
-    /// from the oldest prompt loaded so far; the numbers settle once the
-    /// session's file finishes loading.
-    fn recompute_prompt_ordinals(&mut self) {
-        let mut counts: HashMap<&str, usize> = HashMap::new();
-        let mut out: HashMap<PathBuf, usize> = HashMap::new();
-        for e in self.store.entries.iter().rev() {
-            if !e.is_prompt() {
-                continue;
-            }
-            let Some(sid) = e.session_id.as_deref() else {
-                continue;
-            };
-            let n = counts.entry(sid).or_insert(0);
-            *n += 1;
-            out.insert(e.file_path.clone(), *n);
-        }
-        self.prompt_ordinals = out;
-    }
-
     /// Position of a prompt inside its own agent session, counted from 1.
-    /// `None` for a file change, or for a prompt with no session.
-    pub fn prompt_ordinal(&self, entry: &HistoryEntry) -> Option<usize> {
-        if !entry.is_prompt() {
-            return None;
-        }
-        self.prompt_ordinals.get(&entry.file_path).copied()
+    /// `None` for a file change, or for a prompt with no session. The server
+    /// calculates it.
+    pub fn prompt_ordinal(&self, entry: &Entry) -> Option<usize> {
+        entry.ordinal
     }
 
-    /// Rebuild the Files panel list from `store.entries`. Honors the current
-    /// project filter so the Files list mirrors what's actually reachable in
-    /// History. Prompts are skipped because their `file_path` is synthetic.
-    /// Sorting matches Projects: latest-touched first.
+    /// Read the Files panel list from the server. The list honors the
+    /// project filter, so the Files list mirrors what History can reach.
     fn recompute_files(&mut self) {
-        let project = self
-            .selected_project_idx
-            .and_then(|i| self.store.projects.get(i))
-            .cloned();
-        let mut latest: HashMap<PathBuf, DateTime<Local>> = HashMap::new();
-        let mut counts: HashMap<PathBuf, usize> = HashMap::new();
-        let mut chains: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
-        for e in &self.store.entries {
-            if matches!(e.kind, HistoryEntryKind::Prompt { .. }) {
-                continue;
+        let project = self.selected_project_root();
+        let files = match self.api.files(project.as_deref()) {
+            Ok(response) => response.files,
+            Err(e) => {
+                self.fail(e);
+                Vec::new()
             }
-            if let Some(p) = &project {
-                if !e.project_roots.iter().any(|r| r == p) {
-                    continue;
-                }
-            }
-            let slot = latest.entry(e.file_path.clone()).or_insert(e.timestamp);
-            if e.timestamp > *slot {
-                *slot = e.timestamp;
-            }
-            *counts.entry(e.file_path.clone()).or_insert(0) += 1;
-            chains
-                .entry(e.file_path.clone())
-                .or_insert_with(|| e.project_roots.clone());
-        }
-        let mut files: Vec<PathBuf> = latest.keys().cloned().collect();
-        files.sort_by(|a, b| {
-            let ta = latest
-                .get(a)
-                .copied()
-                .unwrap_or(DateTime::UNIX_EPOCH.into());
-            let tb = latest
-                .get(b)
-                .copied()
-                .unwrap_or(DateTime::UNIX_EPOCH.into());
-            tb.cmp(&ta)
-        });
+        };
 
         // Drop the file selection if it's no longer in the list (e.g.
         // project filter changed away from it). A pending restore is exempt:
-        // its entries may simply not have streamed in yet.
+        // its entries may simply not have loaded yet.
         if let Some(sel) = &self.selected_file_path {
             let restoring = self.pending_file_restore.as_deref() == Some(sel.as_path());
-            if !latest.contains_key(sel) && !restoring {
+            if !files.iter().any(|f| &f.path == sel) && !restoring {
                 self.selected_file_path = None;
                 self.file_scroll = 0;
             }
         }
-
         self.files = files;
-        self.file_latest = latest;
-        self.file_counts = counts;
-        self.file_chains = chains;
-    }
-
-    fn build_groups(entries: &[HistoryEntry], filtered: &[usize]) -> Vec<HistoryGroup> {
-        let mut groups: Vec<HistoryGroup> = Vec::new();
-        for &idx in filtered {
-            let fp = &entries[idx].file_path;
-            if let Some(last) = groups.last_mut() {
-                if &entries[last.entry_indices[0]].file_path == fp {
-                    last.entry_indices.push(idx);
-                    continue;
-                }
-            }
-            groups.push(HistoryGroup {
-                entry_indices: vec![idx],
-                expanded: false,
-            });
-        }
-        groups
     }
 
     fn rebuild_display(&mut self) {
@@ -1720,7 +1070,7 @@ impl App {
         const MAX_PROJECT_COL_CHARS: usize = 40;
         let mut widest = 0;
         for idx in 0..self.display_rows.len() {
-            let entry = &self.store.entries[self.row_entry_idx(idx)];
+            let entry = &self.view.entries[self.row_entry_idx(idx)];
             if entry.project_roots.is_empty() {
                 continue;
             }
@@ -1728,7 +1078,7 @@ impl App {
                 .project_roots
                 .iter()
                 .map(|root| {
-                    let name = match self.store.project_names.get(root) {
+                    let name = match self.view.project_names.get(root) {
                         Some(n) => n.chars().count(),
                         None => root
                             .file_name()
@@ -1762,18 +1112,11 @@ impl App {
 
     pub fn refilter(&mut self) {
         self.recompute_files();
-        self.recompute_prompt_ordinals();
         self.recompute_agents();
-        let filtered = self.filtered_indices();
-        self.groups = Self::build_groups(&self.store.entries, &filtered);
-        self.sel_group = 0;
-        self.sel_child = 0;
+        self.load_history();
+        self.regroup(None);
         self.history_scroll = 0;
         self.diff_scroll = 0;
-        if !self.groups.is_empty() && self.effective_auto_expand() {
-            self.groups[0].expanded = true;
-        }
-        self.rebuild_display();
         self.refresh_diff();
         // Project filter changed — search results no longer reflect the visible set.
         self.search_clear();
@@ -1798,43 +1141,24 @@ impl App {
             return vec![DiffLine::Header("(no selection)".to_string())];
         };
 
-        // Collapsed multi-entry group → concatenate every child's diff,
-        // separated by per-child header rows.
-        if !self.effective_auto_expand() && group.entry_indices.len() > 1 {
-            let mut lines: Vec<DiffLine> = Vec::new();
-            for (i, &entry_idx) in group.entry_indices.iter().enumerate() {
-                let entry = &self.store.entries[entry_idx];
-                let prev = self.store.prev_snapshot(entry_idx);
-                if i > 0 {
-                    lines.push(DiffLine::Header(String::new()));
-                }
-                lines.push(DiffLine::ChildSeparator { entry_idx });
-                lines.extend(build_diff(prev, &entry.snapshot_path));
-            }
-            return lines;
-        }
-
-        let Some(&entry_idx) = group.entry_indices.get(self.sel_child) else {
-            return vec![DiffLine::Header("(no selection)".to_string())];
+        // Collapsed multi-entry group → the server concatenates every
+        // child's diff, separated by per-child header rows.
+        let ids: Vec<EntryId> = if !self.effective_auto_expand() && group.entry_indices.len() > 1 {
+            group
+                .entry_indices
+                .iter()
+                .map(|&i| self.view.entries[i].id.clone())
+                .collect()
+        } else {
+            let Some(&entry_idx) = group.entry_indices.get(self.sel_child) else {
+                return vec![DiffLine::Header("(no selection)".to_string())];
+            };
+            vec![self.view.entries[entry_idx].id.clone()]
         };
-        let entry = &self.store.entries[entry_idx];
-        if let Some(text) = entry.prompt_text() {
-            let mut lines: Vec<DiffLine> = text
-                .lines()
-                .map(|l| DiffLine::Prompt(l.to_string()))
-                .collect();
-            if lines.is_empty() {
-                lines.push(DiffLine::Prompt(String::new()));
-            }
-            // The response follows the prompt after one blank line.
-            if let Some(response) = entry.response_text() {
-                lines.push(DiffLine::Context(String::new()));
-                lines.extend(response.lines().map(|l| DiffLine::Response(l.to_string())));
-            }
-            return lines;
+        match self.api.diff(&ids) {
+            Ok(lines) => lines,
+            Err(e) => vec![DiffLine::Header(format!("(cannot read the diff: {e})"))],
         }
-        let prev = self.store.prev_snapshot(entry_idx);
-        build_diff(prev, &entry.snapshot_path)
     }
 
     /// Hook every `refresh_diff` runs on its way out: rebuild any Diff-panel
@@ -2067,7 +1391,7 @@ impl App {
         if top >= self.display_rows.len() || self.row_starts_day(top) || !self.settings.date_separator {
             return None;
         }
-        Some(self.store.entries[self.row_entry_idx(top)].timestamp.date_naive())
+        Some(self.view.entries[self.row_entry_idx(top)].timestamp.date_naive())
     }
 
     /// Visual height (terminal lines) of display row `idx`. Defaults to 1
@@ -2095,13 +1419,13 @@ impl App {
         if !self.settings.date_separator || idx >= self.display_rows.len() {
             return false;
         }
-        let day = self.store.entries[self.row_entry_idx(idx)]
+        let day = self.view.entries[self.row_entry_idx(idx)]
             .timestamp
             .date_naive();
         match idx.checked_sub(1) {
             None => true,
             Some(prev) => {
-                self.store.entries[self.row_entry_idx(prev)]
+                self.view.entries[self.row_entry_idx(prev)]
                     .timestamp
                     .date_naive()
                     != day
@@ -2159,7 +1483,7 @@ impl App {
             let h = match row {
                 DisplayRow::Group(gi) => {
                     let g = &self.groups[*gi];
-                    let entry = &self.store.entries[g.entry_indices[0]];
+                    let entry = &self.view.entries[g.entry_indices[0]];
                     if g.entry_indices.len() == 1 && entry.is_prompt() {
                         self.prompt_row_height(entry, list_width, ts_width)
                     } else {
@@ -2178,8 +1502,8 @@ impl App {
     /// Number of wrapped lines a prompt row occupies at the given panel
     /// geometry — mirrors the wrapping the renderer performs so scroll math
     /// and rendering agree.
-    fn prompt_row_height(&self, entry: &HistoryEntry, list_width: usize, ts_width: usize) -> usize {
-        let (chain, _) = entry.display_path_segments(&self.store.project_names);
+    fn prompt_row_height(&self, entry: &Entry, list_width: usize, ts_width: usize) -> usize {
+        let (chain, _) = entry.display_path_segments(&self.view.project_names);
         let own_chars = if chain.is_empty() {
             0
         } else {
@@ -2226,9 +1550,9 @@ impl App {
             .enumerate()
             .skip(self.history_scroll)
             .take(list_height.max(1))
-            .map(|(idx, _)| self.store.entries[self.row_entry_idx(idx)].timestamp)
+            .map(|(idx, _)| self.view.entries[self.row_entry_idx(idx)].timestamp)
             .collect();
-        crate::history::align_relative_times(&tss)
+        crate::reltime::align_relative_times(&tss)
             .first()
             .map(|s| s.chars().count())
             .unwrap_or(0)
@@ -2259,9 +1583,9 @@ impl App {
         for i in 1..self.groups.len() {
             let prev_oldest_idx = *self.groups[i - 1].entry_indices.last().unwrap();
             let cur_newest_idx = self.groups[i].entry_indices[0];
-            let gap = self.store.entries[prev_oldest_idx]
+            let gap = self.view.entries[prev_oldest_idx]
                 .timestamp
-                .signed_duration_since(self.store.entries[cur_newest_idx].timestamp);
+                .signed_duration_since(self.view.entries[cur_newest_idx].timestamp);
             if gap.num_minutes() > 60 {
                 epoch = 1 - epoch;
             }
@@ -2274,6 +1598,7 @@ impl App {
     /// History panel. Cached entries are not recomputed.
     pub fn ensure_summaries_visible(&mut self, visible: usize) {
         let end = (self.history_scroll + visible).min(self.display_rows.len());
+        let mut missing: Vec<EntryId> = Vec::new();
         for row_idx in self.history_scroll..end {
             let entry_idx = match self.display_rows[row_idx] {
                 DisplayRow::Group(gi) => self.groups[gi].entry_indices[0],
@@ -2282,64 +1607,60 @@ impl App {
                     child_local,
                 } => self.groups[group_idx].entry_indices[child_local],
             };
-            if self.diff_summaries.contains_key(&entry_idx) {
-                continue;
+            let id = &self.view.entries[entry_idx].id;
+            if !self.diff_summaries.contains_key(id) {
+                missing.push(id.clone());
             }
-            let entry = &self.store.entries[entry_idx];
-            let prev = self.store.prev_snapshot(entry_idx);
-            let summary = compute_summary(prev, &entry.snapshot_path);
-            self.diff_summaries.insert(entry_idx, summary);
+        }
+        if missing.is_empty() {
+            return;
+        }
+        match self.api.summaries(&missing) {
+            Ok(summaries) => {
+                // An id that the server does not know gets an empty count, so
+                // the next frame does not ask for it again.
+                for id in missing {
+                    let summary = summaries.get(&id).copied().unwrap_or_default();
+                    self.diff_summaries.insert(id, summary);
+                }
+            }
+            Err(e) => self.fail(e),
         }
     }
 
-    pub fn current_entry(&self) -> Option<&HistoryEntry> {
+    pub fn current_entry(&self) -> Option<&Entry> {
         let group = self.groups.get(self.sel_group)?;
         let &idx = group.entry_indices.get(self.sel_child)?;
-        self.store.entries.get(idx)
+        self.view.entries.get(idx)
     }
 
-    /// Index into `store.entries` of the current selection (parallels
+    /// Index into `view.entries` of the current selection (parallels
     /// [`Self::current_entry`]).
     pub fn current_entry_idx(&self) -> Option<usize> {
         let group = self.groups.get(self.sel_group)?;
         group.entry_indices.get(self.sel_child).copied()
     }
 
-    /// Re-scan the running-session registry if it hasn't been refreshed
-    /// recently. Called once per frame from the event loop; the throttle keeps
-    /// the cost (a few small JSON reads) off the hot path while keeping the
-    /// running indicator live as sessions come and go.
-    pub fn maybe_rescan_running(&mut self) {
-        const REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
-        let due = self
-            .running_scanned_at
-            .map(|t| t.elapsed() >= REFRESH)
-            .unwrap_or(true);
-        if due {
-            self.running = crate::session::RunningSessions::scan();
-            self.running_scanned_at = Some(Instant::now());
-        }
-    }
-
     /// Whether the agent session behind `entry_idx` still runs. Only Claude
     /// Code publishes a session registry, so every other source reports
     /// [`RunState::Unknown`] and the renderer leaves its colors bright.
     pub fn entry_run_state(&self, entry_idx: usize) -> RunState {
-        let Some(entry) = self.store.entries.get(entry_idx) else {
+        let Some(entry) = self.view.entries.get(entry_idx) else {
             return RunState::Unknown;
         };
-        self.run_state_of(entry.source, entry.session_id.as_deref())
+        self.run_state_of(entry.source, entry.session_id.as_deref(), entry.session_archived)
     }
 
     /// [`Self::entry_run_state`] for a source and session id that the caller
     /// already holds (the Agents panel has no entry index).
-    pub fn run_state_of(&self, source: EditSource, session_id: Option<&str>) -> RunState {
+    pub fn run_state_of(&self, source: EditSource, session_id: Option<&str>, archived: bool) -> RunState {
         if source != EditSource::ClaudeCode {
             return RunState::Unknown;
         }
         match session_id {
             None => RunState::Unknown,
-            Some(sid) if self.running.is_running(sid) => RunState::Running,
+            Some(sid) if self.running.contains_key(sid) => RunState::Running,
+            Some(_) if archived => RunState::Archived,
             Some(_) => RunState::Stopped,
         }
     }
@@ -2347,11 +1668,11 @@ impl App {
     /// Whether the entry at `entry_idx` originated from a Claude Code session
     /// that is currently running.
     pub fn is_entry_running(&self, entry_idx: usize) -> bool {
-        self.store
+        self.view
             .entries
             .get(entry_idx)
             .and_then(|e| e.session_id.as_deref())
-            .map(|sid| self.running.is_running(sid))
+            .map(|sid| self.running.contains_key(sid))
             .unwrap_or(false)
     }
 
@@ -2361,7 +1682,7 @@ impl App {
         match self.active_panel {
             Panel::Projects => self
                 .selected_project_idx
-                .and_then(|i| self.store.projects.get(i).cloned()),
+                .and_then(|i| self.view.projects.get(i).map(|p| p.root.clone())),
             Panel::Files => self.selected_file_path.clone(),
             Panel::Agents => self
                 .sel_agent_idx()
@@ -2555,7 +1876,7 @@ impl App {
     }
 
     pub fn project_down(&mut self, visible: usize) {
-        let max = self.store.projects.len();
+        let max = self.view.projects.len();
         let current = self.selected_project_idx.map(|i| i + 1).unwrap_or(0);
         if current < max {
             self.selected_project_idx = Some(current);
@@ -2662,7 +1983,7 @@ impl App {
     }
 
     pub fn project_bottom(&mut self, visible: usize) {
-        let n = self.store.projects.len();
+        let n = self.view.projects.len();
         if n == 0 {
             return;
         }
@@ -2683,14 +2004,14 @@ impl App {
     /// re-sorts on each batch — recompute it on demand.
     fn sel_file_idx(&self) -> Option<usize> {
         let f = self.selected_file_path.as_ref()?;
-        self.files.iter().position(|p| p == f)
+        self.files.iter().position(|p| &p.path == f)
     }
 
     pub fn file_down(&mut self, visible: usize) {
         let max = self.files.len();
         let current = self.sel_file_idx().map(|i| i + 1).unwrap_or(0);
         if current < max {
-            self.selected_file_path = Some(self.files[current].clone());
+            self.selected_file_path = Some(self.files[current].path.clone());
             let display_idx = current + 1; // +1 for "All files" row
             if display_idx >= self.file_scroll + visible {
                 self.file_scroll += 1;
@@ -2708,7 +2029,7 @@ impl App {
                 self.refilter();
             }
             Some(i) => {
-                self.selected_file_path = Some(self.files[i - 1].clone());
+                self.selected_file_path = Some(self.files[i - 1].path.clone());
                 let display_idx = i; // i-1 file = display row i (0 = "All files")
                 if display_idx < self.file_scroll {
                     self.file_scroll = display_idx;
@@ -2751,7 +2072,7 @@ impl App {
         if n == 0 {
             return;
         }
-        self.selected_file_path = Some(self.files[n - 1].clone());
+        self.selected_file_path = Some(self.files[n - 1].path.clone());
         let total_rows = n + 1;
         self.file_scroll = total_rows.saturating_sub(visible);
         self.refilter();
@@ -2902,7 +2223,7 @@ impl App {
                 let found = group
                     .entry_indices
                     .iter()
-                    .find_map(|&ei| self.store.entries[ei].session_id.clone());
+                    .find_map(|&ei| self.view.entries[ei].session_id.clone());
                 if found.is_some() {
                     return found;
                 }
@@ -2913,8 +2234,7 @@ impl App {
 
     /// Identity of the selected History row. See [`EntryId`].
     pub fn current_entry_id(&self) -> Option<EntryId> {
-        self.current_entry()
-            .map(|e| (e.file_path.clone(), e.timestamp))
+        self.current_entry().map(|e| e.id.clone())
     }
 
     /// Scroll the Agents panel so the selected agent is on screen.
@@ -3006,9 +2326,7 @@ impl App {
     /// changes down to the one prompt inside it.
     pub fn cycle_kind_filter(&mut self, visible: usize) {
         self.kind_filter = self.kind_filter.next();
-        let selection = self
-            .current_entry()
-            .map(|e| (e.file_path.clone(), e.timestamp));
+        let selection = self.current_entry_id();
         self.refilter_preserving(selection, visible);
         // The matches describe the set from before the change. A semantic
         // search embeds its query again here, which costs one HTTP round trip.
@@ -3367,12 +2685,36 @@ impl App {
             return;
         }
 
-        let results = match self.search.kind {
-            SearchKind::Path => self.compute_path_matches(),
-            SearchKind::Content => self.compute_content_matches(),
-            SearchKind::Semantic => self.compute_semantic_matches(),
+        if self.search.kind == SearchKind::Content {
+            // An invalid pattern gives no matches, so the UI reads as "no
+            // matches" instead of an error. The Diff panel reuses the regex
+            // to highlight the hits in the line.
+            match recap_api::content_regex(&self.search.query) {
+                Ok(regex) => self.search.content_regex = Some(regex),
+                Err(_) => return,
+            }
+        }
+
+        let response = self.api.search(self.search.kind, &self.search.query, &self.filter());
+        let matches = match response {
+            Ok(response) => response.matches,
+            Err(e) => return self.fail(e),
         };
-        self.search.matches = results;
+        // The server searched the same filter, so each match is in the view.
+        // A match that a newer store version added is not, until the next
+        // merge.
+        self.search.matches = matches
+            .into_iter()
+            .filter_map(|m| {
+                let entry_idx = self.view.index_of(&m.id)?;
+                Some(SearchMatch {
+                    id: m.id,
+                    entry_idx,
+                    indices: m.indices,
+                    score: m.score,
+                })
+            })
+            .collect();
 
         // Park on the previously-selected entry if it still matches; else jump to the top hit.
         if let Some(idx) = current_entry_idx {
@@ -3391,325 +2733,11 @@ impl App {
         }
     }
 
-    fn compute_path_matches(&mut self) -> Vec<SearchMatch> {
-        // Lowercased for the same reason as `PanelSearch::recompute`: nucleo's
-        // raw `Matcher` asserts on uppercase needles when `ignore_case` is on.
-        let query = self.search.query.to_lowercase();
-        let mut needle_buf: Vec<char> = Vec::new();
-        let needle = Utf32Str::new(&query, &mut needle_buf);
-
-        let mut hay_buf: Vec<char> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-        let mut results: Vec<SearchMatch> = Vec::new();
-
-        for group in &self.groups {
-            for &entry_idx in &group.entry_indices {
-                let entry = &self.store.entries[entry_idx];
-                // Path search targets the *path*. For prompts, `display_path`
-                // appends the whole (single-lined) prompt body — fuzzy-matching
-                // a short query against that long text scatter-matches almost
-                // every prompt, so match only the project chain here. Prompt
-                // bodies are searchable via content search (`?`).
-                let s = if entry.is_prompt() {
-                    let (chain, _) = entry.display_path_segments(&self.store.project_names);
-                    chain.join(" → ")
-                } else {
-                    entry.display_path(&self.store.project_names)
-                };
-                hay_buf.clear();
-                let haystack = Utf32Str::new(&s, &mut hay_buf);
-                indices.clear();
-                if let Some(score) =
-                    self.search.matcher.fuzzy_indices(haystack, needle, &mut indices)
-                {
-                    results.push(SearchMatch {
-                        entry_idx,
-                        indices: indices.clone(),
-                        score,
-                    });
-                }
-            }
-        }
-
-        // Highest score first; ties keep recency order (groups already iterate newest → oldest).
-        results.sort_by(|a, b| b.score.cmp(&a.score));
-        results
-    }
-
-    fn compute_content_matches(&mut self) -> Vec<SearchMatch> {
-        // Build a case-insensitive regex. Invalid patterns fall through to an
-        // empty result set so the UI reads as "no matches" instead of crashing.
-        let regex = match RegexBuilder::new(&self.search.query)
-            .case_insensitive(true)
-            .build()
-        {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-
-        // First pass: materialize searchable text for every entry that the
-        // current filter exposes, and cache it across keystrokes.
-        let entry_indices: Vec<usize> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.entry_indices.iter().copied())
-            .collect();
-        self.fill_content_cache(&entry_indices);
-
-        let mut results: Vec<SearchMatch> = Vec::new();
-        for &entry_idx in &entry_indices {
-            let key = content_cache_key(&self.store.entries[entry_idx]);
-            let Some(text) = self.content_cache.get(&key) else {
-                continue;
-            };
-            if regex.is_match(text) {
-                results.push(SearchMatch {
-                    entry_idx,
-                    indices: Vec::new(),
-                    score: 0,
-                });
-            }
-        }
-        // Groups iterate newest-first, so `entry_indices` is newest-first
-        // already; no sort needed. Stash the regex so the Diff panel can
-        // reuse it for in-line highlighting of hits.
-        self.search.content_regex = Some(regex);
-        results
-    }
-
-    /// Materialize the searchable text of every entry in `entry_indices` that
-    /// the cache does not hold yet. A Prompt entry stores its text and its
-    /// response; a FileChange entry stores its `+`/`-` diff lines.
-    ///
-    /// Two things keep this off the multi-second path. First a **prefilter**:
-    /// an added line is part of the new snapshot and a removed line is part of
-    /// the old one, so an entry whose two snapshots contain no match cannot
-    /// produce a matching diff line. Such an entry needs no diff, and a query
-    /// normally rejects almost every entry this way. `multi_line` makes `^`
-    /// and `$` match at line breaks, so a line-anchored query behaves on the
-    /// snapshot text as it does on a diff line. Second, the scan runs on all
-    /// available cores, because it reads gigabytes of snapshots.
-    fn fill_content_cache(&mut self, entry_indices: &[usize]) {
-        let prefilter = match RegexBuilder::new(&self.search.query)
-            .case_insensitive(true)
-            .multi_line(true)
-            .build()
-        {
-            Ok(r) => r,
-            Err(_) => return,
-        };
-
-        let todo: Vec<usize> = entry_indices
-            .iter()
-            .copied()
-            .filter(|&i| {
-                !self
-                    .content_cache
-                    .contains_key(&content_cache_key(&self.store.entries[i]))
-            })
-            .collect();
-        if todo.is_empty() {
-            return;
-        }
-
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(todo.len());
-        let chunk = todo.len().div_ceil(threads);
-        let store = &self.store;
-        let prefilter = &prefilter;
-
-        let found: Vec<(PathBuf, String)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = todo
-                .chunks(chunk)
-                .map(|part| {
-                    scope.spawn(move || {
-                        let mut out: Vec<(PathBuf, String)> = Vec::new();
-                        for &idx in part {
-                            let entry = &store.entries[idx];
-                            let key = content_cache_key(entry);
-                            match &entry.kind {
-                                HistoryEntryKind::Prompt { .. } => {
-                                    out.push((key, turn_text(entry)));
-                                }
-                                HistoryEntryKind::FileChange => {
-                                    let (old_content, new_content) =
-                                        entry_snapshots(store, idx);
-                                    if !prefilter.is_match(&new_content)
-                                        && !prefilter.is_match(&old_content)
-                                    {
-                                        continue;
-                                    }
-                                    out.push((key, diff_text(&old_content, &new_content)));
-                                }
-                            }
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .filter_map(|h| h.join().ok())
-                .flatten()
-                .collect()
-        });
-
-        // An entry the prefilter rejected stays out of the cache. It holds no
-        // match for this query, and the next query prefilters it again.
-        self.content_cache.extend(found);
-    }
-
-
     // ── Semantic search ──────────────────────────────────────────────────────
 
-    /// The sqlite key of an entry. It reuses [`content_cache_key`], which is
-    /// already the identity of an entry's searchable text, so the vector store
-    /// and the content cache never disagree about what one entry is.
-    fn embed_key(entry: &HistoryEntry) -> String {
-        content_cache_key(entry).to_string_lossy().into_owned()
-    }
-
-    /// Build one job per entry that the in-memory index does not hold.
-    /// Phase 1 embeds prompts. `include_diffs` turns on phase 2.
-    fn embed_jobs(&self, include_diffs: bool) -> Vec<EmbedJob> {
-        let mut jobs = Vec::new();
-        for (idx, entry) in self.store.entries.iter().enumerate() {
-            let key = Self::embed_key(entry);
-            if self.embed.index.contains(&key) {
-                continue;
-            }
-            match &entry.kind {
-                HistoryEntryKind::Prompt { .. } => jobs.push(EmbedJob {
-                    key,
-                    kind: EmbedKind::Prompt,
-                    text: Some(turn_text(entry)),
-                    new_path: entry.file_path.clone(),
-                    old_path: None,
-                }),
-                HistoryEntryKind::FileChange if include_diffs => jobs.push(EmbedJob {
-                    key,
-                    kind: EmbedKind::Diff,
-                    text: None,
-                    new_path: entry.snapshot_path.clone(),
-                    old_path: self.store.prev_snapshot(idx).map(|p| p.to_path_buf()),
-                }),
-                HistoryEntryKind::FileChange => {}
-            }
-        }
-        // Prompts first. They are short, so they cost little time, and they
-        // carry the user's own words, which is what a semantic query most
-        // often looks for. A long diff round then follows.
-        jobs.sort_by_key(|j| match j.kind {
-            EmbedKind::Prompt => 0,
-            EmbedKind::Diff => 1,
-        });
-        jobs
-    }
-
-    /// Start the model server and the indexer, or start one more indexer round
-    /// for entries that loaded after the last round. Returns at once; the work
-    /// runs on a background thread.
-    pub fn start_embedding(&mut self, include_diffs: bool) {
-        match self.embed.status {
-            // A round is already in flight.
-            EmbedStatus::Starting | EmbedStatus::Indexing => return,
-            EmbedStatus::Failed(_) | EmbedStatus::Off | EmbedStatus::Ready => {}
-        }
-        if let Some(msg) = self.embed.cfg.missing_parts() {
-            self.embed.status = EmbedStatus::Failed(msg);
-            return;
-        }
-
-        let first_round = self.embed.server.is_none();
-        if first_round {
-            match EmbedServer::spawn(&self.embed.cfg) {
-                Ok(server) => {
-                    self.embed.server = Some(server);
-                    self.embed.client = Some(EmbedClient::new(&self.embed.cfg));
-                }
-                Err(e) => {
-                    self.embed.status = EmbedStatus::Failed(e.to_string());
-                    return;
-                }
-            }
-        }
-
-        let jobs = self.embed_jobs(include_diffs);
-        if !first_round && jobs.is_empty() {
-            self.embed.status = EmbedStatus::Ready;
-            return;
-        }
-
-        let (tx, rx) = mpsc::channel();
-        let cfg = self.embed.cfg.clone();
-        let Some(client) = self.embed.client.clone() else {
-            return;
-        };
-        self.embed.rx = Some(rx);
-        self.embed.done = 0;
-        self.embed.total = jobs.len();
-        self.embed.status = if first_round {
-            EmbedStatus::Starting
-        } else {
-            EmbedStatus::Indexing
-        };
-        std::thread::spawn(move || run_indexer(cfg, client, jobs, first_round, tx));
-    }
-
-    /// Merge whatever the indexer thread produced. The main loop calls this
-    /// each frame, so a search can already use a batch that just landed.
-    pub fn drain_embed_events(&mut self) {
-        let Some(rx) = &self.embed.rx else {
-            return;
-        };
-        let mut finished = false;
-        loop {
-            match rx.try_recv() {
-                Ok(EmbedEvent::Index(index)) => {
-                    // Jobs whose key the store already held need no work.
-                    self.embed.total = self
-                        .embed
-                        .total
-                        .saturating_sub(count_known(&index, &self.store.entries));
-                    self.embed.index = index;
-                    self.embed.status = EmbedStatus::Indexing;
-                }
-                Ok(EmbedEvent::Batch(rows)) => {
-                    self.embed.done += rows.len();
-                    for (key, kind, vec) in rows {
-                        self.embed.index.insert(key, kind, &vec);
-                    }
-                    self.embed.status = EmbedStatus::Indexing;
-                }
-                Ok(EmbedEvent::Done) => {
-                    self.embed.status = EmbedStatus::Ready;
-                    finished = true;
-                }
-                Ok(EmbedEvent::Failed(e)) => {
-                    self.embed.status = EmbedStatus::Failed(e);
-                    // Drop the server so the next `F` starts a clean round
-                    // instead of trusting a process that did not answer.
-                    self.embed.server = None;
-                    self.embed.client = None;
-                    finished = true;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
-        }
-        if finished {
-            self.embed.rx = None;
-        }
-    }
-
-    /// Open the search prompt in semantic mode. This also starts the server
-    /// and the indexer on the first use, so the user pays for the model only
-    /// when the user asks for this search.
+    /// Open the search prompt in semantic mode. This also asks the server to
+    /// start the model and the indexer on the first use, so the user pays
+    /// for the model only when the user asks for this search.
     pub fn search_open_semantic(&mut self) {
         self.search.phase = SearchPhase::Typing;
         self.search.kind = SearchKind::Semantic;
@@ -3721,55 +2749,9 @@ impl App {
         self.search.highlights = true;
         self.search.content_regex = None;
         self.search.pending_since = None;
-        self.start_embedding(true);
-    }
-
-    /// Rank the entries that the current filter exposes against the query.
-    /// Runs on Enter only: one HTTP round trip per keystroke would be waste.
-    fn compute_semantic_matches(&mut self) -> Vec<SearchMatch> {
-        let Some(client) = self.embed.client.clone() else {
-            return Vec::new();
-        };
-        // The server needs a few seconds to load the model. A query that
-        // arrives before the load completes gets a refused connection, so wait
-        // here. The call costs one /health round trip when the server is ready.
-        if let Err(e) = client.wait_ready(Duration::from_secs(120)) {
-            self.embed.status = EmbedStatus::Failed(e.to_string());
-            return Vec::new();
+        if let Err(e) = self.api.start_embedding() {
+            self.fail(e);
         }
-        let query = match client.embed_query(&self.search.query) {
-            Ok(q) => q,
-            Err(e) => {
-                self.embed.status = EmbedStatus::Failed(e.to_string());
-                return Vec::new();
-            }
-        };
-
-        let mut scored: Vec<(f32, usize)> = Vec::new();
-        for group in &self.groups {
-            for &entry_idx in &group.entry_indices {
-                let key = Self::embed_key(&self.store.entries[entry_idx]);
-                let Some(vec) = self.embed.index.get(&key) else {
-                    continue;
-                };
-                scored.push((cosine(&query, vec), entry_idx));
-            }
-        }
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-        let Some(&(best, _)) = scored.first() else {
-            return Vec::new();
-        };
-        scored
-            .into_iter()
-            .take(SEMANTIC_TOP_K)
-            .filter(|(score, _)| *score >= best - SEMANTIC_REL_FLOOR)
-            .map(|(score, entry_idx)| SearchMatch {
-                entry_idx,
-                indices: Vec::new(),
-                score: (score.clamp(0.0, 1.0) * SEMANTIC_SCORE_SCALE) as u16,
-            })
-            .collect()
     }
 
     /// Run one semantic search without the prompt, for the `--index` command
@@ -3796,7 +2778,7 @@ impl App {
             .search
             .matches
             .iter()
-            .filter(|m| self.store.entries[m.entry_idx].is_prompt())
+            .filter(|m| self.view.entries[m.entry_idx].is_prompt())
             .count();
         (prompts, self.search.matches.len() - prompts)
     }
@@ -3807,29 +2789,21 @@ impl App {
     /// the rendered chain so a search for "foo → bar" can match the chain
     /// glyphs the user sees on screen.
     fn project_search_label(&self, i: usize) -> String {
-        let proj = &self.store.projects[i];
-        self.store
-            .project_chains
-            .get(proj)
+        let proj = &self.view.projects[i];
+        Some(&proj.chain)
+            .filter(|chain| !chain.is_empty())
             .map(|chain| {
                 chain
                     .iter()
-                    .map(|p| match self.store.project_names.get(p) {
-                        Some(s) => s.clone(),
-                        None => p
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("?")
-                            .to_string(),
-                    })
+                    .map(|p| recap_api::project_name(p, &self.view.project_names))
                     .collect::<Vec<_>>()
                     .join(" → ")
             })
-            .unwrap_or_else(|| Self::project_label(proj))
+            .unwrap_or_else(|| Self::project_label(&proj.root))
     }
 
     fn project_search_items(&self) -> Vec<String> {
-        (0..self.store.projects.len())
+        (0..self.view.projects.len())
             .map(|i| self.project_search_label(i))
             .collect()
     }
@@ -3837,7 +2811,7 @@ impl App {
     pub fn project_search_open(&mut self) {
         let current = self
             .selected_project_idx
-            .and_then(|i| self.store.projects.get(i).cloned());
+            .and_then(|i| self.view.projects.get(i).map(|p| p.root.clone()));
         self.project_search.phase = SearchPhase::Typing;
         self.project_search.restore = current;
         self.search_history.get_mut(SearchMode::Project).reset_walk();
@@ -3951,7 +2925,7 @@ impl App {
         let Some(m) = self.project_search.matches.get(self.project_search.current) else {
             return;
         };
-        let target_path = self.store.projects.get(m.item_idx).cloned();
+        let target_path = self.view.projects.get(m.item_idx).map(|p| p.root.clone());
         self.select_project_by_path(target_path, visible);
     }
 
@@ -3961,7 +2935,7 @@ impl App {
     fn select_project_by_path(&mut self, target: Option<PathBuf>, visible: usize) {
         let new_idx = target
             .as_ref()
-            .and_then(|p| self.store.projects.iter().position(|x| x == p));
+            .and_then(|p| self.view.project_position(p));
         if self.selected_project_idx == new_idx {
             return;
         }
@@ -3981,16 +2955,16 @@ impl App {
     // ── Files-panel search ───────────────────────────────────────────────────
 
     fn file_search_label(&self, i: usize) -> String {
-        let file = &self.files[i];
-        let chain = self.file_chains.get(file).cloned().unwrap_or_default();
+        let file = &self.files[i].path;
+        let chain = &self.files[i].chain;
         let project_selected = self.selected_project_idx.is_some();
         // Reuse the same label the panel renders so the user can search the
         // text they see (chain + rel path, or just rel path when a project
         // filter hides the chain).
         crate::ui::file_display_for_panel(
             file,
-            &chain,
-            &self.store.project_names,
+            chain,
+            &self.view.project_names,
             project_selected,
         )
     }
@@ -4110,7 +3084,7 @@ impl App {
         let Some(m) = self.file_search.matches.get(self.file_search.current) else {
             return;
         };
-        let target = self.files.get(m.item_idx).cloned();
+        let target = self.files.get(m.item_idx).map(|f| f.path.clone());
         self.select_file_by_path(target, visible);
     }
 
@@ -4121,7 +3095,7 @@ impl App {
         self.selected_file_path = target.clone();
         let new_idx = target
             .as_ref()
-            .and_then(|p| self.files.iter().position(|x| x == p));
+            .and_then(|p| self.files.iter().position(|x| &x.path == p));
         let display_row = new_idx.map(|i| i + 1).unwrap_or(0);
         if display_row < self.file_scroll {
             self.file_scroll = display_row;
@@ -4247,10 +3221,7 @@ impl App {
         if self.diff_search.query.is_empty() {
             return;
         }
-        let regex = match RegexBuilder::new(&self.diff_search.query)
-            .case_insensitive(true)
-            .build()
-        {
+        let regex = match recap_api::content_regex(&self.diff_search.query) {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -4336,8 +3307,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use recap_api::EntryKind;
+    use recap_server::history::HistoryEntry;
 
-    use crate::history::EditSource;
+    /// An App whose server holds `entries` and runs no loader.
+    fn test_app(entries: Vec<HistoryEntry>) -> App {
+        App::new(Arc::new(recap_server::Server::from_entries(entries)))
+    }
+
+    /// An App whose server loads the real sources of this machine. The
+    /// function returns when the first load is complete.
+    pub(super) fn real_app() -> App {
+        let server = recap_server::Server::start(Duration::from_secs(3600));
+        let started = Instant::now();
+        loop {
+            let status = server.status().unwrap();
+            if status.version > 0 && !status.loading {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("the server loaded the sources in {:?}", started.elapsed());
+        App::new(Arc::new(server))
+    }
 
     fn prompt_entry(text: &str, session: &str, minutes_ago: i64) -> HistoryEntry {
         HistoryEntry {
@@ -4347,7 +3339,7 @@ mod tests {
             base_path: None,
             project_roots: vec![PathBuf::from("/dev/proj")],
             source: EditSource::ClaudeCode,
-            kind: HistoryEntryKind::Prompt {
+            kind: EntryKind::Prompt {
                 text: text.to_string(),
                 response: None,
             },
@@ -4356,58 +3348,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_prompt_that_arrives_again_with_a_response_replaces_the_old_entry() {
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut app = App::new(store, Sources::default());
-        app.content_cache
-            .insert(content_cache_key(&app.store.entries[0]), "fix it".to_string());
-
-        let mut again = prompt_entry("fix it", "s1", 5);
-        again.kind = HistoryEntryKind::Prompt {
-            text: "fix it".to_string(),
-            response: Some("Fixed.".to_string()),
-        };
-        app.merge_batch(vec![again, nvim_entry("/dev/proj/a.rs", 1)], 10);
-
-        let prompts: Vec<&HistoryEntry> =
-            app.store.entries.iter().filter(|e| e.is_prompt()).collect();
-        assert_eq!(prompts.len(), 1, "the prompt is replaced, not duplicated");
-        assert_eq!(prompts[0].response_text(), Some("Fixed."));
-        assert_eq!(app.store.entries.len(), 2);
-        assert!(app.content_cache.is_empty(), "the stale search text is dropped");
-    }
-
-    /// A Cursor prompt carries the composer that wrote it. The fuzzy join
-    /// runs on Local-History edits only, so it must not clear that composer.
-    #[test]
-    fn cursor_attribution_keeps_the_composer_of_a_prompt() {
-        let mut prompt = prompt_entry("fix it", "composer-1", 5);
-        prompt.source = EditSource::Cursor;
-        prompt.file_path = PathBuf::from("cursor:composer-1:bubble-1");
-        let edit = {
-            let mut e = nvim_entry("/dev/proj/a.rs", 1);
-            e.source = EditSource::Cursor;
-            e.session_id = Some("stale".to_string());
-            e
-        };
-
-        let mut app = App::new(HistoryStore::from_entries(vec![prompt, edit]), Sources::default());
-        app.sources.cursor_sessions =
-            Some(std::sync::Arc::new(crate::cursor_sessions::CursorSessions::default()));
-        app.apply_cursor_attribution();
-
-        let prompt = app.store.entries.iter().find(|e| e.is_prompt()).unwrap();
-        assert_eq!(prompt.session_id.as_deref(), Some("composer-1"));
-        let edit = app.store.entries.iter().find(|e| !e.is_prompt()).unwrap();
-        assert_eq!(edit.session_id, None, "an unattributed edit loses its composer");
-    }
-
     /// A committed query comes back on Up, and each corpus keeps its own list.
     #[test]
     fn each_history_search_mode_walks_its_own_query_list() {
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt_entry("fix it", "s1", 5)]);
+        let mut app = test_app(store);
 
         app.search_open();
         for c in "fix".chars() {
@@ -4438,8 +3383,8 @@ mod tests {
     /// Esc still ends a search that the user ran, so the query is remembered.
     #[test]
     fn a_canceled_search_stays_in_the_query_list() {
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt_entry("fix it", "s1", 5)]);
+        let mut app = test_app(store);
 
         app.search_open();
         for c in "abc".chars() {
@@ -4456,12 +3401,12 @@ mod tests {
     /// the user is on, even after Esc dropped the matches.
     #[test]
     fn n_repeats_the_last_search_after_esc() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("alpha one", "s1", 5),
             prompt_entry("beta", "s2", 4),
             prompt_entry("alpha two", "s3", 3),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
 
         // Content search reads the prompt text; path search reads the chain.
         app.search_open_content();
@@ -4499,12 +3444,12 @@ mod tests {
     /// `n` walks the list in row order, not in score order.
     #[test]
     fn n_walks_the_rows_in_order() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("alpha", "s1", 5),
             prompt_entry("alpha alpha alpha", "s2", 4),
             prompt_entry("alpha", "s3", 3),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         app.search_open_content();
         for c in "alpha".chars() {
             app.search_push_char(c, 10);
@@ -4526,8 +3471,8 @@ mod tests {
     /// The typed text filters the walk, as vim's command line filters it.
     #[test]
     fn the_typed_prefix_filters_the_walk() {
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt_entry("fix it", "s1", 5)]);
+        let mut app = test_app(store);
         for query in ["secret worker", "cursor prompt", "secret rotation"] {
             app.search_open();
             for c in query.chars() {
@@ -4553,8 +3498,8 @@ mod tests {
     /// The query lists survive a restart through the persisted state.
     #[test]
     fn the_query_lists_survive_a_restart() {
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![prompt_entry("fix it", "s1", 5)]);
+        let mut app = test_app(store);
         app.diff_search_open();
         for c in "fn main".chars() {
             app.diff_search_push_char(c);
@@ -4562,8 +3507,8 @@ mod tests {
         app.diff_search_commit();
 
         let saved = app.persisted_state();
-        let store = HistoryStore::from_entries(vec![prompt_entry("fix it", "s1", 5)]);
-        let mut next = App::new(store, Sources::default());
+        let store = (vec![prompt_entry("fix it", "s1", 5)]);
+        let mut next = test_app(store);
         next.apply_persisted(&saved);
 
         next.diff_search_open();
@@ -4575,11 +3520,11 @@ mod tests {
         HistoryEntry {
             timestamp: Local::now() - chrono::Duration::minutes(minutes_ago),
             file_path: PathBuf::from(path),
-            snapshot_path: PathBuf::from("/dev/null"),
+            snapshot_path: PathBuf::from(format!("/snapshots{path}/{minutes_ago}")),
             base_path: None,
             project_roots: vec![PathBuf::from("/dev/proj")],
             source: EditSource::Neovim,
-            kind: HistoryEntryKind::FileChange,
+            kind: EntryKind::FileChange,
             session_id: None,
             session_cwd: None,
         }
@@ -4588,13 +3533,13 @@ mod tests {
     /// Two agents whose prompts interleave, so a File-mode row is never row 0
     /// of its own agent.
     fn interleaved_app() -> App {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("b2", "sessionB", 1),
             prompt_entry("a2", "sessionA", 2),
             prompt_entry("b1", "sessionB", 3),
             prompt_entry("a1", "sessionA", 4),
         ]);
-        App::new(store, Sources::default())
+        test_app(store)
     }
 
     /// Text of the selected prompt, or the selected file's name.
@@ -4612,7 +3557,7 @@ mod tests {
             .groups
             .iter()
             .position(|g| {
-                app.store.entries[g.entry_indices[0]].prompt_text() == Some(text)
+                app.view.entries[g.entry_indices[0]].prompt_text() == Some(text)
             })
             .unwrap_or_else(|| panic!("no row for {text:?}"));
         app.sel_group = gi;
@@ -4623,13 +3568,13 @@ mod tests {
     /// A store with one prompt and three file changes, all in one minute, so
     /// the kind filter is the only thing that changes the row count.
     fn mixed_app() -> App {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("fix the parser", "sessionA", 1),
             nvim_entry("/dev/proj/parser.rs", 2),
             nvim_entry("/dev/proj/lexer.rs", 3),
             nvim_entry("/dev/proj/main.rs", 4),
         ]);
-        App::new(store, Sources::default())
+        test_app(store)
     }
 
     fn entry_count(app: &App) -> usize {
@@ -4718,16 +3663,16 @@ mod tests {
 
     #[test]
     fn a_row_without_an_agent_survives_the_round_trip() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("b2", "sessionB", 1),
             nvim_entry("/dev/proj/src/main.rs", 2),
             prompt_entry("a1", "sessionA", 3),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         let gi = app
             .groups
             .iter()
-            .position(|g| !app.store.entries[g.entry_indices[0]].is_prompt())
+            .position(|g| !app.view.entries[g.entry_indices[0]].is_prompt())
             .unwrap();
         app.sel_group = gi;
         app.sel_child = 0;
@@ -4763,16 +3708,16 @@ mod tests {
 
     #[test]
     fn a_row_without_an_agent_takes_the_agent_of_the_nearest_row() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("b2", "sessionB", 1),
             nvim_entry("/dev/proj/src/main.rs", 2),
             prompt_entry("a1", "sessionA", 3),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         let gi = app
             .groups
             .iter()
-            .position(|g| !app.store.entries[g.entry_indices[0]].is_prompt())
+            .position(|g| !app.view.entries[g.entry_indices[0]].is_prompt())
             .unwrap();
         app.sel_group = gi;
         app.sel_child = 0;
@@ -4792,15 +3737,15 @@ mod tests {
         let mut response: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
         response[40] = "the needle is here".to_string();
         let mut with_response = prompt_entry("second prompt", "sessionB", 5);
-        with_response.kind = HistoryEntryKind::Prompt {
+        with_response.kind = EntryKind::Prompt {
             text: "second prompt".to_string(),
             response: Some(response.join("\n")),
         };
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("first prompt", "sessionA", 1),
             with_response,
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
         let visible = 10;
         app.set_diff_height(visible);
 
@@ -4828,12 +3773,12 @@ mod tests {
     #[test]
     fn shift_y_copies_the_response_only_in_the_diff_panel() {
         let mut entry = prompt_entry("fix the parser", "sessionA", 1);
-        entry.kind = HistoryEntryKind::Prompt {
+        entry.kind = EntryKind::Prompt {
             text: "fix the parser".to_string(),
             response: Some("I fixed it.".to_string()),
         };
-        let store = HistoryStore::from_entries(vec![entry]);
-        let mut app = App::new(store, Sources::default());
+        let store = (vec![entry]);
+        let mut app = test_app(store);
 
         // The History panel shows no response, so `Y` does nothing there.
         app.active_panel = Panel::History;
@@ -4846,19 +3791,19 @@ mod tests {
     #[test]
     fn shift_y_copies_nothing_when_the_prompt_has_no_response() {
         let store =
-            HistoryStore::from_entries(vec![prompt_entry("fix the parser", "sessionA", 1)]);
-        let mut app = App::new(store, Sources::default());
+            (vec![prompt_entry("fix the parser", "sessionA", 1)]);
+        let mut app = test_app(store);
         app.active_panel = Panel::Diff;
         assert_eq!(app.copy_response_target(), None);
     }
 
     #[test]
     fn the_status_bar_drops_open_file_on_a_prompt_row() {
-        let store = HistoryStore::from_entries(vec![
+        let store = (vec![
             prompt_entry("fix the parser", "sessionA", 1),
             nvim_entry("/dev/proj/src/main.rs", 2),
         ]);
-        let mut app = App::new(store, Sources::default());
+        let mut app = test_app(store);
 
         assert!(!app.can_open_file(), "a prompt row has no file to open");
         assert_eq!(
@@ -4884,7 +3829,7 @@ mod tests {
             let session = if i % 2 == 0 { "sessionA" } else { "sessionB" };
             entries.push(prompt_entry(&format!("{text} {i}"), session, i as i64 + 1));
         }
-        let mut app = App::new(HistoryStore::from_entries(entries), Sources::default());
+        let mut app = test_app((entries));
         let visible = 20;
         let width = 60;
         app.recompute_row_heights(width, visible);
@@ -4917,7 +3862,7 @@ mod tests {
             prompt_entry("first", "sessionA", 1),
             prompt_entry("second", "sessionB", 2),
         ];
-        let mut app = App::new(HistoryStore::from_entries(entries), Sources::default());
+        let mut app = test_app((entries));
 
         app.active_panel = Panel::History;
         app.toggle_mode(20, 20);
@@ -4942,7 +3887,7 @@ mod tests {
             let session = if i % 2 == 0 { "sessionA" } else { "sessionB" };
             entries.push(prompt_entry(&format!("prompt {i}"), session, i as i64 + 1));
         }
-        let mut app = App::new(HistoryStore::from_entries(entries), Sources::default());
+        let mut app = test_app((entries));
         let visible = 10;
         let width = 60;
         app.recompute_row_heights(width, visible);
@@ -4971,18 +3916,8 @@ mod tests {
     #[test]
     #[ignore]
     fn timing_cold_content_search() {
-        let mut app = App::new(HistoryStore::from_entries(Vec::new()), Sources::detect());
-        app.start_background_load();
-        let load_start = Instant::now();
-        while app.loading {
-            app.drain_load_events(40);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        eprintln!(
-            "loaded {} entries in {:?}",
-            app.store.entries.len(),
-            load_start.elapsed()
-        );
+        let mut app = tests::real_app();
+        eprintln!("loaded {} entries", app.view.entries.len());
 
         app.search_open_content();
         app.search.query = "fn ".to_string();
@@ -5005,7 +3940,6 @@ mod tests {
 #[cfg(test)]
 mod smoke {
     use super::*;
-    use crate::history::EditSource;
 
     /// Non-hermetic: loads every real source on this machine, then runs the
     /// content (`f`) search. Ignored by default:
@@ -5015,24 +3949,17 @@ mod smoke {
     fn smoke_full_load_and_content_search() {
         let needle = std::env::var("RECAP_NEEDLE").unwrap_or_else(|_| "space_for".to_string());
         let visible = 40;
-        let mut app = App::new(HistoryStore::from_entries(Vec::new()), Sources::detect());
-        let t0 = Instant::now();
-        app.start_background_load();
-        while app.loading {
-            app.drain_load_events(visible);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        eprintln!("load took {:?}", t0.elapsed());
+        let mut app = tests::real_app();
 
-        let total = app.store.entries.len();
+        let total = app.view.entries.len();
         let cursor_blob = app
-            .store
+            .view
             .entries
             .iter()
             .filter(|e| e.source == EditSource::Cursor && e.base_path.is_some())
             .count();
         let cursor_local = app
-            .store
+            .view
             .entries
             .iter()
             .filter(|e| {
@@ -5054,11 +3981,11 @@ mod smoke {
             "content search {:?} for {needle:?}: {} matches, corpus {} entries, first scan {:?}",
             needle,
             app.search.matches.len(),
-            app.content_cache.len(),
+            app.view.entries.len(),
             elapsed
         );
         for m in app.search.matches.iter().take(8) {
-            let e = &app.store.entries[m.entry_idx];
+            let e = &app.view.entries[m.entry_idx];
             eprintln!(
                 "  {} {:?} {} sess={:?}",
                 e.timestamp.format("%Y-%m-%d %H:%M"),
