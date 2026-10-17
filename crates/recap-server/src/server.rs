@@ -246,6 +246,7 @@ impl Server {
         let mut titles: HashMap<String, String> = HashMap::new();
         let mut summaries: HashMap<String, String> = HashMap::new();
         let mut parents: HashMap<String, String> = HashMap::new();
+        let mut subagent_parents: HashMap<String, String> = HashMap::new();
         let mut archived: Option<HashSet<String>> = None;
         let mut attribution = false;
         let mut disconnected = false;
@@ -272,6 +273,7 @@ impl Server {
                         continue;
                     }
                     titles.extend(sessions.names_map().clone());
+                    subagent_parents.extend(sessions.subagent_parents().clone());
                     let fresh = read(&self.inner.store).new_cursor_entries(&sessions, &batch);
                     batch.extend(fresh);
                     sources.cursor_sessions = Some(sessions);
@@ -296,6 +298,7 @@ impl Server {
             || !titles.is_empty()
             || !summaries.is_empty()
             || !parents.is_empty()
+            || !subagent_parents.is_empty()
             || archived.is_some()
             || attribution
         {
@@ -305,6 +308,7 @@ impl Server {
             store.extend_titles(titles);
             store.extend_summaries(summaries);
             store.extend_parents(parents);
+            store.extend_subagent_parents(subagent_parents);
             if let Some(ids) = archived {
                 store.set_archived_sessions(ids);
             }

@@ -108,6 +108,12 @@ pub struct Store {
     /// [`crate::claude::SessionFacts::parents`]). [`Self::chain_id`] follows
     /// these links.
     session_parents: HashMap<String, String>,
+    /// Subagent session id → the session that started it (see
+    /// [`CursorSessions::subagent_parents`]). [`Self::chain_id`] also follows
+    /// these links. The prompts of a subagent session come from the parent
+    /// agent, so they get no ordinal and do not count as prompts of the
+    /// agent.
+    subagent_parents: HashMap<String, String>,
 }
 
 impl Default for Store {
@@ -121,6 +127,7 @@ impl Default for Store {
             archived_sessions: HashSet::new(),
             session_summaries: HashMap::new(),
             session_parents: HashMap::new(),
+            subagent_parents: HashMap::new(),
         }
     }
 }
@@ -232,7 +239,7 @@ impl Store {
     ) -> Vec<HistoryEntry> {
         let all = || self.history.entries.iter().chain(pending.iter());
         let have: HashSet<&PathBuf> = all()
-            .filter(|e| e.is_prompt())
+            .filter(|e| !e.is_file_change())
             .map(|e| &e.file_path)
             .collect();
         let mut fresh: Vec<HistoryEntry> = sessions
@@ -296,19 +303,36 @@ impl Store {
         self.session_parents.extend(parents);
     }
 
+    /// Add the links from subagent sessions to the sessions that started
+    /// them.
+    pub fn extend_subagent_parents(
+        &mut self,
+        parents: impl IntoIterator<Item = (String, String)>,
+    ) {
+        self.subagent_parents.extend(parents);
+    }
+
     /// The first session of the session chain that holds `session_id` (see
-    /// [`Entry::chain_id`]). The function follows the parent links. It stops
-    /// after as many steps as there are links, so a loop in the links does
-    /// not stop the server.
+    /// [`Entry::chain_id`]). The function follows the parent links and the
+    /// subagent links. It stops after as many steps as there are links, so a
+    /// loop in the links does not stop the server.
     pub fn chain_id<'a>(&'a self, session_id: &'a str) -> &'a str {
         let mut current = session_id;
-        for _ in 0..self.session_parents.len() {
-            match self.session_parents.get(current) {
+        for _ in 0..self.session_parents.len() + self.subagent_parents.len() {
+            let parent = self
+                .session_parents
+                .get(current)
+                .or_else(|| self.subagent_parents.get(current));
+            match parent {
                 Some(parent) => current = parent,
                 None => break,
             }
         }
         current
+    }
+
+    fn is_subagent(&self, session_id: Option<&str>) -> bool {
+        session_id.is_some_and(|sid| self.subagent_parents.contains_key(sid))
     }
 
     fn entry_chain_id<'a>(&'a self, entry: &'a HistoryEntry) -> Option<&'a str> {
@@ -359,18 +383,19 @@ impl Store {
         self.session_title(entry).hash(&mut h);
         self.session_summary(entry).hash(&mut h);
         self.is_archived(entry.session_id.as_deref()).hash(&mut h);
+        self.is_subagent(entry.session_id.as_deref()).hash(&mut h);
         self.ordinal(entry).hash(&mut h);
         h.finish()
     }
 
     /// Calculate [`Self::ordinals`]. `history.entries` is newest first, so the
     /// walk runs backwards to count the prompts of each session chain from
-    /// the oldest one.
+    /// the oldest one. A subagent prompt does not count.
     fn recompute_ordinals(&mut self) {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut out: HashMap<PathBuf, usize> = HashMap::new();
         for e in self.history.entries.iter().rev() {
-            if !e.is_prompt() {
+            if !e.is_prompt() || self.is_subagent(e.session_id.as_deref()) {
                 continue;
             }
             let Some(chain) = self.entry_chain_id(e) else {
@@ -416,6 +441,7 @@ impl Store {
             session_summary: self.session_summary(e).cloned(),
             session_cwd: e.session_cwd.clone(),
             session_archived: self.is_archived(e.session_id.as_deref()),
+            subagent: self.is_subagent(e.session_id.as_deref()),
             ordinal: self.ordinal(e),
             snapshot_path: is_file_change.then(|| e.snapshot_path.clone()),
             base_path: if is_file_change {
@@ -513,7 +539,10 @@ impl Store {
     /// The session chains inside `project` (or all chains), newest first, as
     /// agents. An entry without a session id has no agent. `history.entries`
     /// is newest first, so the first entry of each chain is its newest entry,
-    /// and the first prompt is its newest prompt.
+    /// and the first prompt is its newest prompt. The session, the title and
+    /// the prompts of the agent come from the sessions that are not
+    /// subagents. A subagent session gives them only when the chain has no
+    /// other session.
     pub fn agents(&self, project: Option<&Path>) -> Vec<Agent> {
         let mut order: Vec<&str> = Vec::new();
         let mut by_id: HashMap<&str, Agent> = HashMap::new();
@@ -527,6 +556,7 @@ impl Store {
                 continue;
             }
             let chain = self.chain_id(sid);
+            let subagent = self.is_subagent(Some(sid));
             let agent = by_id.entry(chain).or_insert_with(|| {
                 order.push(chain);
                 Agent {
@@ -541,10 +571,20 @@ impl Store {
                     last_prompt: String::new(),
                 }
             });
-            if agent.title.is_none() {
+            // The first entry of a subagent session made the agent. Take the
+            // session and the title again from the first entry of a session
+            // that is not a subagent.
+            if !subagent && self.is_subagent(Some(&agent.session_id)) {
+                agent.session_id = sid.to_string();
+                agent.archived = self.is_archived(Some(sid));
+                agent.title = None;
+            }
+            if agent.title.is_none() && (!subagent || self.is_subagent(Some(&agent.session_id))) {
                 agent.title = self.history.session_titles.get(sid).cloned();
             }
-            if let Some(text) = e.prompt_text() {
+            if let Some(text) = e.prompt_text()
+                && !subagent
+            {
                 if agent.prompt_count == 0 {
                     // The newest prompt also gives the agent its display
                     // time, which the user reads as "when the agent last ran".
@@ -677,6 +717,58 @@ mod tests {
                 ("branch".to_string(), Some(3), root.clone()),
                 ("continue".to_string(), Some(2), root.clone()),
                 ("start".to_string(), Some(1), root),
+            ]
+        );
+    }
+
+    /// A subagent session joins the session chain of its parent. Its prompts
+    /// get no ordinal, and the agent takes its session, title and prompts
+    /// from the parent only.
+    #[test]
+    fn a_subagent_joins_the_chain_of_its_parent() {
+        let mut store = Store::from_entries(vec![
+            prompt_entry("plan it", "parent", 30),
+            prompt_entry("explore the code", "sub", 20),
+            prompt_entry("now build it", "parent", 10),
+            prompt_entry("review the build", "sub2", 5),
+        ]);
+        store.extend_subagent_parents([
+            ("sub".to_string(), "parent".to_string()),
+            ("sub2".to_string(), "parent".to_string()),
+        ]);
+        store.extend_titles([
+            ("parent".to_string(), "Main".to_string()),
+            ("sub2".to_string(), "Review".to_string()),
+        ]);
+        store.commit();
+
+        let agents = store.agents(None);
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
+        assert_eq!(agent.chain_id, "parent");
+        assert_eq!(agent.session_id, "parent");
+        assert_eq!(agent.title.as_deref(), Some("Main"));
+        assert_eq!(agent.prompt_count, 2);
+        assert_eq!(agent.last_prompt, "now build it");
+
+        let rows: Vec<(String, Option<usize>, bool)> = store
+            .filtered(&Filter {
+                agent: Some("parent".to_string()),
+                ..Filter::default()
+            })
+            .into_iter()
+            .map(|i| {
+                let e = store.wire(i);
+                (e.prompt_text().unwrap().to_string(), e.ordinal, e.subagent)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("review the build".to_string(), None, true),
+                ("now build it".to_string(), Some(2), false),
+                ("explore the code".to_string(), None, true),
+                ("plan it".to_string(), Some(1), false),
             ]
         );
     }

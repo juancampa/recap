@@ -487,6 +487,7 @@ fn run_list_cli(
             ListRow {
                 timestamp: e.timestamp.to_rfc3339(),
                 kind: match e.kind {
+                    EntryKind::Prompt { .. } if e.subagent => "subagent_prompt",
                     EntryKind::Prompt { .. } => "prompt",
                     EntryKind::Compaction { .. } => "compaction",
                     EntryKind::FileChange => "diff",

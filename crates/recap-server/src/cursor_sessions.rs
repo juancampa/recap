@@ -6,6 +6,15 @@
 //!   like Claude Code prompts — so a Cursor session shows its prompts and
 //!   edits together under one colored session bar. Each prompt carries the
 //!   agent's final response of its turn; see [`attach_responses`].
+//! - **Compactions.** Until 2026-01, Cursor wrote the summary of a
+//!   compaction into an agent bubble, as `conversationSummary`. Each such
+//!   bubble becomes an [`EntryKind::Compaction`] entry of its composer. A
+//!   newer client stores the summary in a binary blob that names no
+//!   composer, so the loader finds no newer compaction.
+//! - **Subagents.** A subagent is a composer that another composer started.
+//!   Its header names the parent in `subagentInfo.parentComposerId`. The
+//!   store joins the subagent to the session chain of the parent; see
+//!   [`CursorSessions::subagent_parents`].
 //! - **Agent edits.** Every `edit_file*` / `search_replace` tool call records
 //!   the whole file content before and after the call, as two blobs in the
 //!   same store. Each call becomes a [`EntryKind::FileChange`] entry
@@ -101,6 +110,8 @@ struct ComposerMeta {
     /// prompt, type 2 an agent bubble. Empty for an old composer that has no
     /// header list; such a composer gets no responses.
     bubble_order: Vec<(String, i64)>,
+    /// The composer that started this composer as a subagent.
+    parent: Option<String>,
 }
 
 /// Built map from Cursor's global store. Cheap to query; built once per load.
@@ -120,6 +131,8 @@ pub struct CursorSessions {
     /// content blobs. Each carries its composer in `session_id` and its exact
     /// before-content in `base_path`, so no fuzzy attribution runs on them.
     edits: Vec<HistoryEntry>,
+    /// Subagent composerId → the composerId of its parent.
+    subagent_parents: HashMap<String, String>,
 }
 
 impl CursorSessions {
@@ -202,6 +215,7 @@ impl CursorSessions {
         let mut names = HashMap::new();
         let mut prompts = Vec::new();
         let mut edits = Vec::new();
+        let mut subagent_parents = HashMap::new();
         for (id, cached) in cache.composers {
             // The header holds the current name and window: the user can
             // rename a chat after the scan.
@@ -211,6 +225,9 @@ impl CursorSessions {
             let updated = header.and_then(|m| m.updated).or(cached.updated);
             if let Some(name) = name {
                 names.insert(id.clone(), name);
+            }
+            if let Some(parent) = header.and_then(|m| m.parent.clone()).or(cached.parent) {
+                subagent_parents.insert(id.clone(), parent);
             }
             // The window fallback is only for an old composer, which has no
             // exact edits. A composer with exact edits has a record of each
@@ -234,11 +251,12 @@ impl CursorSessions {
             names,
             prompts,
             edits,
+            subagent_parents,
         })
     }
 
-    /// The Cursor agent prompt entries (user messages), ready to merge into the
-    /// history. Each carries `session_id = composerId`.
+    /// The Cursor agent prompt entries (user messages) and compaction entries,
+    /// ready to merge into the history. Each carries `session_id = composerId`.
     pub fn prompts(&self) -> &[HistoryEntry] {
         &self.prompts
     }
@@ -281,13 +299,21 @@ impl CursorSessions {
     pub fn names_map(&self) -> &HashMap<String, String> {
         &self.names
     }
+
+    /// Subagent composerId → the composerId of the composer that started it.
+    /// The prompts of a subagent come from the parent agent, not from the
+    /// user.
+    pub fn subagent_parents(&self) -> &HashMap<String, String> {
+        &self.subagent_parents
+    }
 }
 
 /// The format version of the cache file. A change to the cached types bumps
 /// it; a file with another version gets a full rebuild. Version 2 stores the
 /// snapshot paths relative to the cache root. The migration in
-/// [`crate::cache`] changes a version 1 file.
-const CACHE_VERSION: u32 = 2;
+/// [`crate::cache`] changes a version 1 file. Version 3 adds the compaction
+/// entries and the subagent parent.
+const CACHE_VERSION: u32 = 3;
 
 /// The scan results, one per composer, in `~/.cache/recap/cursor/sessions.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -305,7 +331,10 @@ struct CachedComposer {
     created: Option<i64>,
     updated: Option<i64>,
     name: Option<String>,
+    /// The composer that started this composer as a subagent.
+    parent: Option<String>,
     files: Vec<PathBuf>,
+    /// The prompts and the compactions.
     prompts: Vec<CachedEntry>,
     edits: Vec<CachedEntry>,
 }
@@ -321,26 +350,20 @@ struct CachedEntry {
     snapshot_path: PathBuf,
     base_path: Option<PathBuf>,
     project_roots: Vec<PathBuf>,
-    /// `Some((text, response))` for a prompt, `None` for a file change.
-    prompt: Option<(String, Option<String>)>,
+    kind: EntryKind,
     session_id: Option<String>,
     session_cwd: Option<PathBuf>,
 }
 
 impl From<&HistoryEntry> for CachedEntry {
     fn from(e: &HistoryEntry) -> Self {
-        let prompt = match &e.kind {
-            EntryKind::Prompt { text, response } => Some((text.clone(), response.clone())),
-            // The Cursor loader makes no compaction entry.
-            EntryKind::FileChange | EntryKind::Compaction { .. } => None,
-        };
         Self {
             ts_ms: e.timestamp.timestamp_millis(),
             file_path: e.file_path.clone(),
             snapshot_path: relative_to_cache(&e.snapshot_path),
             base_path: e.base_path.as_deref().map(relative_to_cache),
             project_roots: e.project_roots.clone(),
-            prompt,
+            kind: e.kind.clone(),
             session_id: e.session_id.clone(),
             session_cwd: e.session_cwd.clone(),
         }
@@ -349,10 +372,6 @@ impl From<&HistoryEntry> for CachedEntry {
 
 impl From<CachedEntry> for HistoryEntry {
     fn from(c: CachedEntry) -> Self {
-        let kind = match c.prompt {
-            Some((text, response)) => EntryKind::Prompt { text, response },
-            None => EntryKind::FileChange,
-        };
         Self {
             timestamp: DateTime::from_timestamp_millis(c.ts_ms)
                 .unwrap_or_default()
@@ -362,7 +381,7 @@ impl From<CachedEntry> for HistoryEntry {
             base_path: c.base_path.map(absolute_in_cache),
             project_roots: c.project_roots,
             source: EditSource::Cursor,
-            kind,
+            kind: c.kind,
             session_id: c.session_id,
             session_cwd: c.session_cwd,
         }
@@ -460,6 +479,7 @@ fn scan_composer(
         created: meta.created,
         updated: meta.updated,
         name: meta.name.clone(),
+        parent: meta.parent.clone(),
         files: files.into_iter().collect(),
         prompts: prompts.iter().map(CachedEntry::from).collect(),
         edits: edits.iter().map(CachedEntry::from).collect(),
@@ -516,6 +536,7 @@ fn read_composer_headers(conn: &Connection, metas: &mut HashMap<String, Composer
                     meta.name = Some(sub);
                 }
             }
+            meta.parent = subagent_parent(&v);
             if let Some(repos) = v.get("trackedGitRepos").and_then(|r| r.as_array()) {
                 for repo in repos {
                     if let Some(p) = repo.get("repoPath").and_then(|p| p.as_str()) {
@@ -550,6 +571,9 @@ fn read_composer_data(conn: &Connection, composer: &str, meta: &mut ComposerMeta
     if meta.name.is_none() {
         meta.name = nonempty_str(&v, "name");
     }
+    if meta.parent.is_none() {
+        meta.parent = subagent_parent(&v);
+    }
     if let Some(headers) = v.get("fullConversationHeadersOnly").and_then(|h| h.as_array()) {
         meta.bubble_order = headers
             .iter()
@@ -560,6 +584,13 @@ fn read_composer_data(conn: &Connection, composer: &str, meta: &mut ComposerMeta
             })
             .collect();
     }
+}
+
+/// The parent composer of a subagent, from the `subagentInfo` of a composer
+/// header or of a `composerData` blob.
+fn subagent_parent(v: &Value) -> Option<String> {
+    v.get("subagentInfo")
+        .and_then(|info| nonempty_str(info, "parentComposerId"))
 }
 
 /// Attach the agent's final response to each prompt of one composer. The
@@ -634,6 +665,8 @@ fn attach_responses(
 /// - the **set of files edited** (for the fuzzy window attribution),
 /// - the **user prompts** (type-1 bubbles), as [`EntryKind::Prompt`]
 ///   entries keyed to the composer — the Cursor analogue of Claude prompts,
+///   and the **compactions** (bubbles with a `conversationSummary`), as
+///   [`EntryKind::Compaction`] entries,
 /// - the **edit records** of the agent's edit tool calls.
 ///
 /// The key range `bubbleId:<composerId>:` uses the key index. A `LIKE` on
@@ -649,7 +682,8 @@ fn attach_responses(
 /// - agentic bubbles: `diffsSinceLastApply[].relativeWorkspacePath` (relative
 ///   to a repo root);
 /// - legacy/ask bubbles: absolute `codeBlocks[].uri.path`;
-/// - user prompts: `"type":1` bubbles with `text` and a top-level `createdAt`.
+/// - user prompts: `"type":1` bubbles with `text` and a top-level `createdAt`;
+/// - compactions: bubbles with a `conversationSummary` string.
 fn read_bubbles(
     conn: &Connection,
     composer: &str,
@@ -663,7 +697,7 @@ fn read_bubbles(
         "SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 \
          AND (value LIKE '%\"codeBlocks\":[{%' OR value LIKE '%\"diffsSinceLastApply\":[{%' \
               OR value LIKE '%search_replace%' OR value LIKE '%edit_file%' \
-              OR value LIKE '%\"type\":1,%')",
+              OR value LIKE '%\"type\":1,%' OR value LIKE '%\"conversationSummary\":\"{%')",
     ) else {
         return (set, prompts, records);
     };
@@ -685,9 +719,19 @@ fn read_bubbles(
 
         // User prompt (type-1) bubble → a Prompt history entry.
         if v.get("type").and_then(|t| t.as_i64()) == Some(1) {
-            if let Some(entry) = prompt_entry(&v, composer, bubble, Some(meta), chain_cache) {
-                prompts.push(entry);
+            if let Some(text) = nonempty_str(&v, "text") {
+                let kind = EntryKind::Prompt {
+                    text,
+                    response: None,
+                };
+                prompts.extend(conversation_entry(&v, composer, bubble, meta, chain_cache, kind));
             }
+        }
+
+        // Summary bubble → a Compaction history entry.
+        if let Some(summary) = compaction_summary(&v) {
+            let kind = EntryKind::Compaction { summary };
+            prompts.extend(conversation_entry(&v, composer, bubble, meta, chain_cache, kind));
         }
 
         let set = &mut set;
@@ -868,27 +912,35 @@ fn blob_cache_dir() -> Option<PathBuf> {
     Some(crate::paths::cache_root().join("cursor"))
 }
 
-/// Build a [`EntryKind::Prompt`] entry from a type-1 (user) bubble, or
-/// `None` when the text is empty or there is no usable timestamp. The bubble
+/// The summary text of a compaction bubble. Cursor stores
+/// `conversationSummary` as a JSON string of an object with a `summary`
+/// field. `None` for any other bubble.
+fn compaction_summary(v: &Value) -> Option<String> {
+    let summary = decode_json(v.get("conversationSummary")?)?;
+    nonempty_str(&summary, "summary")
+}
+
+/// Build a [`EntryKind::Prompt`] or [`EntryKind::Compaction`] entry of `kind`
+/// from one bubble, or `None` when there is no usable timestamp. The bubble
 /// carries no `session_cwd`, but its `createdAt` (RFC3339) and the composer's
 /// repo roots give the timestamp and project chain. The synthetic `file_path`
 /// (`cursor:<composerId>:<bubbleId>`) mirrors Claude's, keeping distinct
-/// prompts from coalescing in `build_groups`.
-fn prompt_entry(
+/// entries from coalescing in `build_groups`.
+fn conversation_entry(
     v: &Value,
     composer: &str,
     bubble: &str,
-    meta: Option<&ComposerMeta>,
+    meta: &ComposerMeta,
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    kind: EntryKind,
 ) -> Option<HistoryEntry> {
-    let text = nonempty_str(v, "text")?;
     let ts_str = v.get("createdAt").and_then(|t| t.as_str())?;
     let timestamp = DateTime::parse_from_rfc3339(ts_str).ok()?.with_timezone(&Local);
 
     // Project chain from the composer's first git repo root. `find_project_chain`
     // walks a *file*'s ancestors, so probe a pseudo-child of the root (as the
     // Claude prompt path does) so the root itself can appear in the chain.
-    let repo = meta.and_then(|m| m.repo_paths.first());
+    let repo = meta.repo_paths.first();
     let project_roots = match repo {
         Some(root) => {
             let probe = root.join(".");
@@ -907,10 +959,7 @@ fn prompt_entry(
         base_path: None,
         project_roots,
         source: EditSource::Cursor,
-        kind: EntryKind::Prompt {
-            text,
-            response: None,
-        },
+        kind,
         session_id: Some(composer.to_string()),
         session_cwd: repo.cloned(),
     })
@@ -1025,6 +1074,32 @@ fn global_state_db() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use recap_api::EntryFields;
+
+    /// Cursor stores the summary of a compaction as a JSON string in
+    /// `conversationSummary`. A bubble with a null summary is no compaction.
+    #[test]
+    fn a_summary_bubble_gives_its_summary() {
+        let bubble = serde_json::json!({
+            "type": 2,
+            "conversationSummary": "{\"summary\":\"Summary:\\n1. The user asked for X.\"}",
+        });
+        assert_eq!(
+            compaction_summary(&bubble).as_deref(),
+            Some("Summary:\n1. The user asked for X.")
+        );
+        let other = serde_json::json!({ "type": 2, "conversationSummary": null, "text": "hi" });
+        assert_eq!(compaction_summary(&other), None);
+    }
+
+    #[test]
+    fn a_subagent_header_names_its_parent() {
+        let header = serde_json::json!({
+            "composerId": "child",
+            "subagentInfo": { "subagentType": 3, "parentComposerId": "parent" },
+        });
+        assert_eq!(subagent_parent(&header).as_deref(), Some("parent"));
+        assert_eq!(subagent_parent(&serde_json::json!({ "composerId": "x" })), None);
+    }
 
     /// Non-hermetic smoke test against the local Cursor install. Ignored by
     /// default (`cargo test -- --ignored --nocapture` to run); verifies the

@@ -147,6 +147,12 @@ const RUNNING_COLOR: Color = Color::Rgb(90, 220, 120);
 /// session colors and from the prompt and response colors, so the row is
 /// easy to find in a long session.
 const COMPACTION_COLOR: Color = Color::Rgb(255, 165, 80);
+/// The label in front of a subagent prompt, in place of the prompt count.
+/// The parent agent wrote the prompt, not the user.
+const SUBAGENT_LABEL: &str = "[sub] ";
+/// Color of [`SUBAGENT_LABEL`]. The blue differs from the timestamp gray of
+/// the prompt count.
+const SUBAGENT_COLOR: Color = Color::Rgb(110, 170, 230);
 /// The glyph of a session that Claude Code deleted and recap archived.
 const ARCHIVED_GLYPH: &str = "◌";
 
@@ -248,7 +254,7 @@ fn continuation_bar_span(session_id: Option<&str>, last: bool) -> Span<'static> 
 /// width used for row-height math ([`crate::app::App::recompute_row_heights`])
 /// matches what the renderer lays out. Column order doesn't affect the total.
 /// A prompt's `[N] ` count sits after this prefix; see
-/// [`ordinal_prefix_width`].
+/// [`prompt_prefix_width`].
 pub fn history_prefix_cols(ts_width: usize, list_width: usize, settings: &Settings) -> usize {
     // leading(2) + ts + ' ' + change + ' ' + source + ' ' + title + ' ' + bar
     let mut cols = 2 + BAR_COL_WIDTH;
@@ -462,13 +468,20 @@ fn dim_color(color: Color) -> Color {
     }
 }
 
-/// Columns the `[N] ` prompt-count prefix takes in front of the prompt text.
-/// Zero when the prompt has no count (no agent session).
-pub fn ordinal_prefix_width(ordinal: Option<usize>) -> usize {
+/// The label in front of the prompt text: `[N] ` for a user prompt with a
+/// count, [`SUBAGENT_LABEL`] for a subagent prompt. `None` for a prompt
+/// without a session.
+fn prompt_prefix(ordinal: Option<usize>, subagent: bool) -> Option<String> {
     match ordinal {
-        Some(n) => format!("[{}] ", n).chars().count(),
-        None => 0,
+        Some(n) => Some(format!("[{}] ", n)),
+        None if subagent => Some(SUBAGENT_LABEL.to_string()),
+        None => None,
     }
+}
+
+/// Columns that [`prompt_prefix`] takes in front of the prompt text.
+pub fn prompt_prefix_width(ordinal: Option<usize>, subagent: bool) -> usize {
+    prompt_prefix(ordinal, subagent).map_or(0, |p| p.chars().count())
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -1284,10 +1297,11 @@ fn group_row_line(
     // ── Prompt entries: wrap the text over up to N rows. ──
     if entry.is_prompt() {
         // The prompt count sits in front of the text, in the timestamp gray.
-        let ord_width = ordinal_prefix_width(ordinal);
-        let ord_span = ordinal.map(|n| {
-            Span::styled(format!("[{}] ", n), Style::default().fg(time_color))
-        });
+        // A subagent prompt has a label in its own color instead.
+        let ord_width = prompt_prefix_width(ordinal, entry.subagent);
+        let ord_color = if entry.subagent { SUBAGENT_COLOR } else { time_color };
+        let ord_span = prompt_prefix(ordinal, entry.subagent)
+            .map(|label| Span::styled(label, Style::default().fg(ord_color)));
         // Column at which the prompt text begins on the first line.
         let text_start =
             history_prefix_cols(ts_width, inner_width, settings) + chain_chars + ord_width;
@@ -3268,6 +3282,28 @@ mod render_tests {
             "the two sessions of the chain have one bar color\n{out}"
         );
         assert_eq!(fg_at(&app, 190, 20, bar_x as u16, label_y as u16), session_color("root"), "{out}");
+    }
+
+    /// A subagent prompt shows the subagent label in place of a prompt count,
+    /// and the prompt of the parent keeps its count.
+    #[test]
+    fn a_subagent_prompt_shows_the_subagent_label() {
+        let mut sub = prompt("explore the code", "sub");
+        sub.timestamp = Local::now() - chrono::Duration::minutes(5);
+        let mut store = Store::from_entries(vec![prompt("plan it", "parent"), sub]);
+        store.extend_subagent_parents([("sub".to_string(), "parent".to_string())]);
+        store.commit();
+        let mut app = App::new(Arc::new(recap_server::Server::from_store(store)));
+        app.recompute_row_heights(90, 18);
+        let out = history_half(&render(&app, 190, 20), 190);
+
+        let (label_x, label_y) = find(&out, SUBAGENT_LABEL.trim_end());
+        assert_eq!(fg_at(&app, 190, 20, label_x as u16, label_y as u16), SUBAGENT_COLOR);
+        let (text_x, text_y) = find(&out, "explore the code");
+        assert_eq!((text_x, text_y), (label_x + SUBAGENT_LABEL.len(), label_y), "{out}");
+        let (count_x, count_y) = find(&out, "[1] plan it");
+        assert_eq!(count_x, label_x, "{out}");
+        assert_ne!(count_y, label_y);
     }
 
     /// The title column prints the session title of the entry. The map holds

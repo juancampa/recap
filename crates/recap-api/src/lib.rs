@@ -85,8 +85,10 @@ pub struct Entry {
     /// The first session of the session chain that holds `session_id`. A
     /// compaction can continue a Claude Code session in a new session, and
     /// the new session names the old one. The server follows these links
-    /// back to the first session. The Agents panel shows one agent for each
-    /// session chain. Equal to `session_id` for a session without links.
+    /// back to the first session. A subagent session also joins the chain
+    /// of the session that started it (see [`Entry::subagent`]). The Agents
+    /// panel shows one agent for each session chain. Equal to `session_id`
+    /// for a session without links.
     #[serde(default)]
     pub chain_id: Option<String>,
     /// The title of that session, when the source records one.
@@ -102,9 +104,14 @@ pub struct Entry {
     /// be archived. `POST /v1/sessions/{id}/restore` writes the files back.
     #[serde(default)]
     pub session_archived: bool,
-    /// The position of a prompt in its own session, counted from the oldest
-    /// prompt as 1. `None` for a file change and for a prompt without a
-    /// session.
+    /// True when another agent started the session as a subagent. The
+    /// parent agent wrote the prompts of a subagent session, not the user.
+    /// The session joins the session chain of the parent.
+    #[serde(default)]
+    pub subagent: bool,
+    /// The position of a prompt in its own session chain, counted from the
+    /// oldest prompt as 1. `None` for a file change, for a subagent prompt
+    /// and for a prompt without a session.
     pub ordinal: Option<usize>,
     /// The file on the server that holds the content after a file change.
     /// `None` for a prompt.
@@ -784,6 +791,7 @@ mod tests {
             session_summary: Some("I fixed the bug.".to_string()),
             session_cwd: Some(PathBuf::from("/dev/proj")),
             session_archived: false,
+            subagent: false,
             ordinal: Some(1),
             snapshot_path: None,
             base_path: None,

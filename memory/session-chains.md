@@ -1,6 +1,6 @@
 ---
 name: session-chains
-description: How a Claude Code compaction appears in the session files, and how recap joins a continued session to its parent (measured 2026-10-16)
+description: How Claude Code and Cursor compactions appear in the source data, and how recap joins a continued session or a subagent to its parent (measured 2026-10-16)
 metadata:
   type: project
 ---
@@ -22,3 +22,12 @@ The store keeps the links (child → parent), and `Store::chain_id` follows them
 The Agents panel shows one agent for each session chain, and the History panel lists the prompts of the chain by time.
 
 See [[session-titles]] for the other session facts that the loader reads.
+
+**Cursor.** A Cursor compaction stays in the same composer, so it makes no new session.
+Until 2026-01, Cursor wrote the summary into an agent bubble as `conversationSummary` (a JSON string with a `summary` field), and the loader makes a compaction entry from it.
+A newer client writes the summary into a binary `agentKv:blob:<sha256>` row, which names no composer. The loader does not read it.
+
+**Subagents.** A Cursor subagent is a separate composer. Its header has `subagentInfo.parentComposerId`.
+The store keeps these links apart from the continuation links (`Store::subagent_parents`), and `Store::chain_id` follows both.
+The parent agent wrote the prompts of a subagent, so they get no ordinal, do not count in the agent's prompts, and show the `[sub]` label.
+recap does not read the Claude Code subagent transcripts (`<session>/subagents/*.jsonl`).

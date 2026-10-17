@@ -1520,7 +1520,7 @@ impl App {
         let ordinal = self.prompt_ordinal(entry);
         let text_start = crate::ui::history_prefix_cols(ts_width, list_width, &self.settings)
             + chain_chars
-            + crate::ui::ordinal_prefix_width(ordinal);
+            + crate::ui::prompt_prefix_width(ordinal, entry.subagent);
         let avail = list_width
             .saturating_sub(text_start + crate::ui::RUNNING_RESERVE)
             .max(1);
