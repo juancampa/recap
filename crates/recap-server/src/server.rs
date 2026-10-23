@@ -22,12 +22,12 @@ use crate::session::RunningSessions;
 use crate::sources::{Load, LoadEvent, Sources};
 use crate::store::Store;
 use recap_api::{
-    AgentsResponse, Api, ApiError, ApiResult, BlameRequest, DiffLine, DiffSummary, Entry, EntryId,
-    Event, FilesResponse, Filter, HistoryResponse, HunkBlame, Page, ProjectsResponse,
-    RunningSession, SearchKind, SearchResponse, Status,
+    Agent, AgentsResponse, Api, ApiError, ApiResult, BlameRequest, DiffLine, DiffSummary, Entry,
+    EntryId, Event, FileInfo, FilesResponse, Filter, HistoryResponse, HunkBlame, ListItem, Page,
+    ProjectsResponse, RunningSession, SearchKind, SearchResponse, Status,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -45,6 +45,75 @@ const RUNNING_SCAN: Duration = Duration::from_secs(2);
 /// load the model.
 const MODEL_WAIT: Duration = Duration::from_secs(120);
 
+/// The number of project filters that a [`ListCache`] keeps. The cache
+/// forgets all lists when it reaches this number.
+const LIST_CACHE_PROJECTS: usize = 16;
+
+/// The last list that the server sent for each project filter, at the store
+/// version of that list. A client that holds this version gets only the
+/// change to the list (see [`ListItem`]).
+struct ListCache<T> {
+    lists: Mutex<HashMap<Option<PathBuf>, (u64, Arc<Vec<T>>)>>,
+}
+
+impl<T> Default for ListCache<T> {
+    fn default() -> Self {
+        ListCache {
+            lists: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// The answer of [`ListCache::get`]: the items, the removed keys, and the
+/// version that the change applies to (`None` for the full list).
+struct ListAnswer<T: ListItem> {
+    items: Vec<T>,
+    removed: Vec<T::Key>,
+    since: Option<u64>,
+}
+
+impl<T: ListItem> ListCache<T> {
+    /// The list for `project` at the store version `version`, or only its
+    /// change after `since` when the cache holds the list at `since`. The
+    /// function calls `compute` when the cache does not hold the list at
+    /// `version`.
+    fn get(
+        &self,
+        project: Option<&Path>,
+        version: u64,
+        since: Option<u64>,
+        compute: impl FnOnce() -> Vec<T>,
+    ) -> ListAnswer<T> {
+        let key = project.map(Path::to_path_buf);
+        let old = lock(&self.lists).get(&key).cloned();
+        let current = match &old {
+            Some((v, list)) if *v == version => list.clone(),
+            _ => Arc::new(compute()),
+        };
+        let answer = match old {
+            Some((v, list)) if since == Some(v) => {
+                let (items, removed) = recap_api::list_change(&list, &current);
+                ListAnswer {
+                    items,
+                    removed,
+                    since,
+                }
+            }
+            _ => ListAnswer {
+                items: current.as_ref().clone(),
+                removed: Vec::new(),
+                since: None,
+            },
+        };
+        let mut lists = lock(&self.lists);
+        if lists.len() >= LIST_CACHE_PROJECTS && !lists.contains_key(&key) {
+            lists.clear();
+        }
+        lists.insert(key, (version, current));
+        answer
+    }
+}
+
 /// A request from an API call to the manager thread.
 enum Command {
     Reload,
@@ -58,6 +127,8 @@ struct Inner {
     running: RwLock<RunningSessions>,
     loading: AtomicBool,
     events: broadcast::Sender<Event>,
+    files: ListCache<FileInfo>,
+    agents: ListCache<Agent>,
     /// `None` for a server without a manager thread (the tests).
     commands: Option<Mutex<mpsc::Sender<Command>>>,
 }
@@ -107,6 +178,8 @@ impl Server {
                 // the first load starts, the store is empty but not complete.
                 loading: AtomicBool::new(commands.is_some()),
                 events,
+                files: ListCache::default(),
+                agents: ListCache::default(),
                 commands: commands.map(Mutex::new),
             }),
         }
@@ -510,19 +583,33 @@ impl Api for Server {
         })
     }
 
-    fn files(&self, project: Option<&Path>) -> ApiResult<FilesResponse> {
+    fn files(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<FilesResponse> {
         let store = read(&self.inner.store);
+        let version = store.version();
+        let answer = self
+            .inner
+            .files
+            .get(project, version, since, || store.files(project));
         Ok(FilesResponse {
-            version: store.version(),
-            files: store.files(project),
+            version,
+            since: answer.since,
+            files: answer.items,
+            removed: answer.removed,
         })
     }
 
-    fn agents(&self, project: Option<&Path>) -> ApiResult<AgentsResponse> {
+    fn agents(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<AgentsResponse> {
         let store = read(&self.inner.store);
+        let version = store.version();
+        let answer = self
+            .inner
+            .agents
+            .get(project, version, since, || store.agents(project));
         Ok(AgentsResponse {
-            version: store.version(),
-            agents: store.agents(project),
+            version,
+            since: answer.since,
+            agents: answer.items,
+            removed: answer.removed,
         })
     }
 
@@ -657,24 +744,78 @@ impl Api for Server {
     }
 
     fn blame(&self, request: &BlameRequest) -> ApiResult<Vec<HunkBlame>> {
-        let files = crate::blame::parse_unified(&request.diff);
+        let files = recap_unidiff::parse_unified(&request.diff);
         let bash = match crate::claude::projects_dir() {
             Some(dir) => crate::claude::bash_calls(&dir, &crate::claude::archive_dir()),
             None => Vec::new(),
         };
         let store = read(&self.inner.store);
-        Ok(crate::blame::attribute(&store.history, &files, &request.repo_root, &bash))
+        Ok(crate::blame::attribute(
+            &store.history,
+            &files,
+            &request.repo_root,
+            &bash,
+        ))
     }
 
     fn restore_session(&self, session_id: &str) -> ApiResult<()> {
-        let dir = crate::claude::projects_dir()
-            .ok_or_else(|| ApiError("the Claude Code projects directory does not exist".to_string()))?;
-        crate::claude::restore_session(&dir, &crate::claude::archive_dir(), session_id).map_err(|e| {
-            log::error!("restore session {session_id}: {e}");
-            ApiError(e.to_string())
+        let dir = crate::claude::projects_dir().ok_or_else(|| {
+            ApiError("the Claude Code projects directory does not exist".to_string())
         })?;
+        crate::claude::restore_session(&dir, &crate::claude::archive_dir(), session_id).map_err(
+            |e| {
+                log::error!("restore session {session_id}: {e}");
+                ApiError(e.to_string())
+            },
+        )?;
         // The next load reads the restored file and sends the new set of
         // archived sessions.
         self.reload()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Local;
+
+    fn file(path: &str, count: usize) -> FileInfo {
+        FileInfo {
+            path: PathBuf::from(path),
+            latest: Local::now(),
+            count,
+            chain: vec![],
+        }
+    }
+
+    #[test]
+    fn the_list_cache_sends_only_the_change_to_a_known_version() {
+        let cache: ListCache<FileInfo> = ListCache::default();
+        let a = file("/a", 1);
+        let b = file("/b", 1);
+
+        // A client without a list gets the full list.
+        let full = cache.get(None, 1, None, || vec![a.clone(), b.clone()]);
+        assert_eq!(full.since, None);
+        assert_eq!(full.items.len(), 2);
+
+        // The same version needs no new calculation, and has no change.
+        let same = cache.get(None, 1, Some(1), || panic!("the cache holds version 1"));
+        assert_eq!(same.since, Some(1));
+        assert!(same.items.is_empty() && same.removed.is_empty());
+
+        // The next version sends the changed file and the removed file.
+        let a2 = FileInfo { count: 2, ..a.clone() };
+        let next = cache.get(None, 2, Some(1), || vec![a2.clone()]);
+        assert_eq!(next.since, Some(1));
+        assert_eq!(next.items, vec![a2]);
+        assert_eq!(next.removed, vec![PathBuf::from("/b")]);
+
+        // An unknown version or another project gets the full list.
+        let old = cache.get(None, 2, Some(1), || unreachable!());
+        assert_eq!(old.since, None);
+        let other = cache.get(Some(Path::new("/p")), 2, Some(2), || vec![b.clone()]);
+        assert_eq!(other.since, None);
+        assert_eq!(other.items, vec![b]);
     }
 }

@@ -10,7 +10,7 @@ use crate::cursor_sessions::CursorSessions;
 use crate::history::{HistoryEntry, HistoryStore};
 use recap_api::{
     Agent, EditSource, Entry, EntryFields, EntryId, EntryKind, FileInfo, Filter, HistoryGroup,
-    HistoryResponse, Page, Project,
+    HistoryResponse, ListItem, Page, Project,
 };
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
@@ -130,6 +130,21 @@ impl Default for Store {
             subagent_parents: HashMap::new(),
         }
     }
+}
+
+
+/// The maximum number of chars in each text of an [`Agent`]. The Agents
+/// panel shows each text on one line, so it never shows more chars than
+/// this. The limit keeps the `/v1/agents` response small.
+const AGENT_TEXT_CHARS: usize = 300;
+
+/// The start of `text` on one line, at most [`AGENT_TEXT_CHARS`] chars.
+fn agent_line(text: &str) -> String {
+    let mut line = recap_api::single_line(text);
+    if let Some((end, _)) = line.char_indices().nth(AGENT_TEXT_CHARS) {
+        line.truncate(end);
+    }
+    line
 }
 
 impl Store {
@@ -542,7 +557,7 @@ impl Store {
             info.count += 1;
         }
         let mut files: Vec<FileInfo> = by_path.into_values().collect();
-        files.sort_by(|a, b| b.latest.cmp(&a.latest).then_with(|| a.path.cmp(&b.path)));
+        files.sort_by(FileInfo::order);
         files
     }
 
@@ -654,6 +669,13 @@ impl Store {
 mod tests {
     use super::*;
     use chrono::Local;
+
+    #[test]
+    fn agent_line_keeps_only_the_start_of_a_long_text() {
+        let long = "é".repeat(AGENT_TEXT_CHARS + 50);
+        assert_eq!(agent_line(&long).chars().count(), AGENT_TEXT_CHARS);
+        assert_eq!(agent_line("a\n  b"), "a b");
+    }
 
     fn prompt_entry(text: &str, session: &str, minutes_ago: i64) -> HistoryEntry {
         HistoryEntry {

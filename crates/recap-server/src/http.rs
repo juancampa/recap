@@ -65,8 +65,10 @@ where
 }
 
 #[derive(Deserialize)]
-struct ProjectQuery {
+struct ListQuery {
     project: Option<std::path::PathBuf>,
+    /// The version of the list that the client holds.
+    since: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -150,12 +152,22 @@ async fn projects(State(s): State<Server>) -> HttpResult<impl IntoResponse> {
     Ok(Json(blocking(s, |s| s.projects()).await?))
 }
 
-async fn files(State(s): State<Server>, Query(q): Query<ProjectQuery>) -> HttpResult<impl IntoResponse> {
-    Ok(Json(blocking(s, move |s| s.files(q.project.as_deref())).await?))
+async fn files(
+    State(s): State<Server>,
+    Query(q): Query<ListQuery>,
+) -> HttpResult<impl IntoResponse> {
+    Ok(Json(
+        blocking(s, move |s| s.files(q.project.as_deref(), q.since)).await?,
+    ))
 }
 
-async fn agents(State(s): State<Server>, Query(q): Query<ProjectQuery>) -> HttpResult<impl IntoResponse> {
-    Ok(Json(blocking(s, move |s| s.agents(q.project.as_deref())).await?))
+async fn agents(
+    State(s): State<Server>,
+    Query(q): Query<ListQuery>,
+) -> HttpResult<impl IntoResponse> {
+    Ok(Json(
+        blocking(s, move |s| s.agents(q.project.as_deref(), q.since)).await?,
+    ))
 }
 
 async fn history(

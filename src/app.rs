@@ -9,7 +9,8 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 pub use recap_api::{Agent, KindFilter, SearchKind};
 use recap_api::{
     Api, ApiError, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields, EntryId,
-    Event, FileInfo, Filter, HistoryResponse, Page, Project, RunningSession, SEMANTIC_SCORE_SCALE,
+    Event, FileInfo, Filter, HistoryResponse, ListItem, Page, Project, RunningSession,
+    SEMANTIC_SCORE_SCALE,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -512,6 +513,8 @@ pub struct App {
     /// The server sends them. The list has no prompts, because the
     /// `file_path` of a prompt is not a real file.
     pub files: Vec<FileInfo>,
+    /// The project filter and the store version of `files`.
+    files_basis: Option<ListBasis>,
     /// `None` → "All files" row. Path-based (not index) so the selection
     /// survives a change of the list.
     pub selected_file_path: Option<PathBuf>,
@@ -528,10 +531,16 @@ pub struct App {
     /// edits, unattributed Cursor saves) have no agent, so Agent mode does
     /// not reach them.
     pub agents: Vec<Agent>,
+    /// The project filter and the store version of `agents`.
+    agents_basis: Option<ListBasis>,
     /// Chain id of the selected agent (see `Entry::chain_id`). Stored by id
     /// (not index) so the selection survives a change of the list.
     pub selected_agent: Option<String>,
     pub agent_scroll: usize,
+    /// The File-mode history while Agent mode is active. A return to File
+    /// mode with the same filter asks the server only for the entries that
+    /// changed, because the full history can hold many MB.
+    file_mode_history: Option<KeptHistory>,
     /// Selection memory for the `m` toggle. See [`ModeReturn`].
     mode_return: ModeReturn,
 
@@ -647,6 +656,54 @@ pub struct App {
     pending_agent_restore: Option<String>,
 }
 
+/// The entries of a history view that the History panel does not show now.
+#[derive(Debug)]
+struct KeptHistory {
+    filter: Filter,
+    version: u64,
+    entries: Vec<Entry>,
+}
+
+/// The project filter of a side list, and the store version of the list.
+#[derive(Debug, Clone, PartialEq)]
+struct ListBasis {
+    project: Option<PathBuf>,
+    version: u64,
+}
+
+/// Read a side list from the server into `list`. `basis` describes `list`.
+/// When `basis` has the project `project`, the function sends its version,
+/// and the server can send only the change to the list. `fetch` takes that
+/// version and returns the version of the answer, the version that the
+/// change applies to, the items, and the removed keys. On an error, `list`
+/// is empty.
+fn read_list<T: ListItem>(
+    list: &mut Vec<T>,
+    basis: &mut Option<ListBasis>,
+    project: Option<PathBuf>,
+    fetch: impl FnOnce(Option<u64>) -> Result<(u64, Option<u64>, Vec<T>, Vec<T::Key>), ApiError>,
+) -> Result<(), ApiError> {
+    let since = basis
+        .as_ref()
+        .filter(|b| b.project == project)
+        .map(|b| b.version);
+    match fetch(since) {
+        Ok((version, change_since, items, removed)) => {
+            match change_since {
+                Some(_) => recap_api::apply_list_change(list, items, &removed),
+                None => *list = items,
+            }
+            *basis = Some(ListBasis { project, version });
+            Ok(())
+        }
+        Err(e) => {
+            list.clear();
+            *basis = None;
+            Err(e)
+        }
+    }
+}
+
 impl App {
     pub fn new(api: Arc<dyn Api>) -> Self {
         let mut app = Self {
@@ -656,13 +713,16 @@ impl App {
             selected_project_idx: None,
             project_scroll: 0,
             files: Vec::new(),
+            files_basis: None,
             selected_file_path: None,
             file_scroll: 0,
             mode: Mode::File,
             kind_filter: KindFilter::All,
             agents: Vec::new(),
+            agents_basis: None,
             selected_agent: None,
             agent_scroll: 0,
+            file_mode_history: None,
             mode_return: ModeReturn::default(),
             groups: Vec::new(),
             display_rows: Vec::new(),
@@ -839,6 +899,11 @@ impl App {
     /// back. The server can have restarted, so the store version can be
     /// lower than before.
     pub fn on_reconnect(&mut self, visible: usize) {
+        // The versions of a new server process do not identify the same
+        // lists, so the next reads get the full lists.
+        self.files_basis = None;
+        self.agents_basis = None;
+        self.file_mode_history = None;
         self.load_server_state();
         self.refresh_projects();
         let selection = self.current_entry_id();
@@ -990,9 +1055,33 @@ impl App {
         }
     }
 
-    /// Read all entries that pass the filter from the server.
+    /// Read all entries that pass the filter from the server. In File mode,
+    /// when `file_mode_history` has the same filter, read only the entries
+    /// that changed after it.
     fn load_history(&mut self) {
-        match self.api.history(&self.filter(), &Page::default()) {
+        let filter = self.filter();
+        if self.mode == Mode::File
+            && let Some(kept) = self.file_mode_history.take()
+            && kept.filter == filter
+        {
+            self.view.entries = kept.entries;
+            self.view.reindex();
+            self.view.version = kept.version;
+            let page = Page {
+                since: Some(kept.version),
+                limit: None,
+            };
+            match self.api.history(&filter, &page) {
+                Ok(response) => {
+                    for id in self.view.apply(response) {
+                        self.diff_summaries.remove(&id);
+                    }
+                    return;
+                }
+                Err(e) => self.fail(e),
+            }
+        }
+        match self.api.history(&filter, &Page::default()) {
             Ok(response) => self.view.replace(response),
             Err(e) => {
                 self.fail(e);
@@ -1031,13 +1120,15 @@ impl App {
     /// project filter, so the panel mirrors what History can reach.
     fn recompute_agents(&mut self) {
         let project = self.selected_project_root();
-        let agents = match self.api.agents(project.as_deref()) {
-            Ok(response) => response.agents,
-            Err(e) => {
-                self.fail(e);
-                Vec::new()
-            }
-        };
+        let api = &self.api;
+        let mut agents = std::mem::take(&mut self.agents);
+        let read = read_list(&mut agents, &mut self.agents_basis, project.clone(), |since| {
+            api.agents(project.as_deref(), since)
+                .map(|r| (r.version, r.since, r.agents, r.removed))
+        });
+        if let Err(e) = read {
+            self.fail(e);
+        }
 
         // Keep the selection on an agent that still exists, and give Agent
         // mode a selection as soon as the first agent loads. A pending
@@ -1070,13 +1161,15 @@ impl App {
     /// project filter, so the Files list mirrors what History can reach.
     fn recompute_files(&mut self) {
         let project = self.selected_project_root();
-        let files = match self.api.files(project.as_deref()) {
-            Ok(response) => response.files,
-            Err(e) => {
-                self.fail(e);
-                Vec::new()
-            }
-        };
+        let api = &self.api;
+        let mut files = std::mem::take(&mut self.files);
+        let read = read_list(&mut files, &mut self.files_basis, project.clone(), |since| {
+            api.files(project.as_deref(), since)
+                .map(|r| (r.version, r.since, r.files, r.removed))
+        });
+        if let Err(e) = read {
+            self.fail(e);
+        }
 
         // Drop the file selection if it's no longer in the list (e.g.
         // project filter changed away from it). A pending restore is exempt:
@@ -1167,6 +1260,13 @@ impl App {
     pub fn refilter(&mut self) {
         self.recompute_files();
         self.recompute_agents();
+        self.refilter_history();
+    }
+
+    /// Read the History panel again for the current filter. The Files and
+    /// Agents lists depend only on the project, so a change of the selected
+    /// file or agent calls this function and does not read those lists again.
+    fn refilter_history(&mut self) {
         self.load_history();
         self.regroup(None);
         self.history_scroll = 0;
@@ -2250,6 +2350,13 @@ impl App {
 
         let leaving_file = self.mode == Mode::File;
         let stay_on_history = self.active_panel == Panel::History;
+        if leaving_file {
+            self.file_mode_history = Some(KeptHistory {
+                filter: self.filter(),
+                version: self.view.version,
+                entries: std::mem::take(&mut self.view.entries),
+            });
+        }
         self.mode = self.mode.other();
         self.active_panel = match self.mode {
             Mode::Agent if stay_on_history => Panel::History,

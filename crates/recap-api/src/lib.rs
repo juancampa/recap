@@ -11,7 +11,7 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -505,8 +505,28 @@ pub struct FileInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FilesResponse {
     pub version: u64,
-    /// Newest first.
+    /// The version of the list that the change in this response applies to
+    /// (see [`ListItem`]). `None` when `files` is the full list.
+    #[serde(default)]
+    pub since: Option<u64>,
+    /// Newest first. With `since`, only the new files and the files that
+    /// changed after that version.
     pub files: Vec<FileInfo>,
+    /// With `since`, the files that left the list after that version.
+    #[serde(default)]
+    pub removed: Vec<PathBuf>,
+}
+
+impl ListItem for FileInfo {
+    type Key = PathBuf;
+
+    fn key(&self) -> &PathBuf {
+        &self.path
+    }
+
+    fn order(a: &Self, b: &Self) -> Ordering {
+        b.latest.cmp(&a.latest).then_with(|| a.path.cmp(&b.path))
+    }
 }
 
 /// One session chain, as the Agents panel lists it (see
@@ -529,17 +549,117 @@ pub struct Agent {
     /// when the chain has no prompt.
     pub last_ts: DateTime<Local>,
     pub prompt_count: usize,
+    /// The number of entries of the chain: prompts, file changes and
+    /// compactions, subagent entries included.
+    #[serde(default)]
+    pub entry_count: usize,
     /// The project chain of the newest entry of the agent.
     pub project_roots: Vec<PathBuf>,
+    /// The oldest prompt on one line. Empty when the agent has no prompt.
+    #[serde(default)]
+    pub first_prompt: String,
+    /// The [`Entry::ordinal`] of the oldest prompt. It is 1, unless the
+    /// project filter hides the older prompts of the chain.
+    #[serde(default)]
+    pub first_ordinal: Option<usize>,
     /// The newest prompt on one line. Empty when the agent has no prompt.
     pub last_prompt: String,
+    /// The [`Entry::ordinal`] of the newest prompt.
+    #[serde(default)]
+    pub last_ordinal: Option<usize>,
+    /// The newest summary of `session_id` (see [`Entry::session_summary`]),
+    /// on one line.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The newest final response of the agent to a prompt, on one line.
+    #[serde(default)]
+    pub last_response: Option<String>,
+    // The server sends only the start of `first_prompt`, `last_prompt`,
+    // `summary` and `last_response`, because the Agents panel shows one line
+    // of each text.
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentsResponse {
     pub version: u64,
-    /// Newest first.
+    /// The version of the list that the change in this response applies to
+    /// (see [`ListItem`]). `None` when `agents` is the full list.
+    #[serde(default)]
+    pub since: Option<u64>,
+    /// Newest first. With `since`, only the new agents and the agents that
+    /// changed after that version.
     pub agents: Vec<Agent>,
+    /// With `since`, the chain ids of the agents that left the list after
+    /// that version.
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+impl ListItem for Agent {
+    type Key = String;
+
+    fn key(&self) -> &String {
+        &self.chain_id
+    }
+
+    fn order(a: &Self, b: &Self) -> Ordering {
+        b.last_ts.cmp(&a.last_ts).then_with(|| a.chain_id.cmp(&b.chain_id))
+    }
+}
+
+/// An item of a side list (the Files list and the Agents list). The client
+/// sends the version of the list that it holds. When the server still knows
+/// the list at that version, it sends only the new and the changed items and
+/// the keys of the removed items. The client merges them with
+/// [`apply_list_change`].
+pub trait ListItem: Clone + PartialEq {
+    type Key: Clone + Eq + std::hash::Hash;
+
+    /// The identity of the item in its list.
+    fn key(&self) -> &Self::Key;
+
+    /// The order of the list: newest first. Two different items never
+    /// compare equal, so the server and the client get the same order.
+    fn order(a: &Self, b: &Self) -> Ordering;
+}
+
+/// The items of `new` that are not in `old` or that are different in `old`,
+/// and the keys of the items of `old` that are not in `new`.
+pub fn list_change<T: ListItem>(old: &[T], new: &[T]) -> (Vec<T>, Vec<T::Key>) {
+    let old_by_key: HashMap<&T::Key, &T> = old.iter().map(|item| (item.key(), item)).collect();
+    let new_keys: HashSet<&T::Key> = new.iter().map(ListItem::key).collect();
+    let changed = new
+        .iter()
+        .filter(|item| old_by_key.get(item.key()) != Some(item))
+        .cloned()
+        .collect();
+    let removed = old
+        .iter()
+        .map(ListItem::key)
+        .filter(|key| !new_keys.contains(key))
+        .cloned()
+        .collect();
+    (changed, removed)
+}
+
+/// Merge the result of [`list_change`] into `list`, and sort `list` again.
+pub fn apply_list_change<T: ListItem>(list: &mut Vec<T>, changed: Vec<T>, removed: &[T::Key]) {
+    let mut changed: HashMap<T::Key, T> = changed
+        .into_iter()
+        .map(|item| (item.key().clone(), item))
+        .collect();
+    let removed: HashSet<&T::Key> = removed.iter().collect();
+    list.retain_mut(|item| {
+        if removed.contains(item.key()) {
+            return false;
+        }
+        if let Some(new) = changed.remove(item.key()) {
+            *item = new;
+        }
+        true
+    });
+    list.extend(changed.into_values());
+    list.sort_by(T::order);
 }
 
 /// A run of consecutive entries of one file, newest first.
@@ -745,10 +865,12 @@ pub type ApiResult<T> = Result<T, ApiError>;
 pub trait Api: Send + Sync {
     fn status(&self) -> ApiResult<Status>;
     fn projects(&self) -> ApiResult<ProjectsResponse>;
-    /// The files inside `project`, or all files.
-    fn files(&self, project: Option<&Path>) -> ApiResult<FilesResponse>;
-    /// The agents inside `project`, or all agents.
-    fn agents(&self, project: Option<&Path>) -> ApiResult<AgentsResponse>;
+    /// The files inside `project`, or all files. `since` is the version of
+    /// the list that the caller holds (see [`ListItem`]).
+    fn files(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<FilesResponse>;
+    /// The agents inside `project`, or all agents. `since` is the version of
+    /// the list that the caller holds (see [`ListItem`]).
+    fn agents(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<AgentsResponse>;
     fn history(&self, filter: &Filter, page: &Page) -> ApiResult<HistoryResponse>;
     fn entry(&self, id: &EntryId) -> ApiResult<Entry>;
     /// The diff of one entry, or the diffs of several entries joined with a
@@ -772,6 +894,33 @@ pub trait Api: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(path: &str, minutes_ago: i64, count: usize) -> FileInfo {
+        FileInfo {
+            path: PathBuf::from(path),
+            latest: Local::now() - chrono::Duration::minutes(minutes_ago),
+            count,
+            chain: vec![],
+        }
+    }
+
+    #[test]
+    fn a_list_change_gives_the_new_list_from_the_old_list() {
+        let old = vec![file("/a", 3, 1), file("/b", 2, 1), file("/c", 1, 1)];
+        let mut new = vec![file("/d", 0, 1), file("/a", 3, 2), file("/c", 1, 1)];
+        new[2].latest = old[2].latest;
+        new.sort_by(FileInfo::order);
+
+        let (changed, removed) = list_change(&old, &new);
+        let mut paths: Vec<_> = changed.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/d")]);
+        assert_eq!(removed, vec![PathBuf::from("/b")]);
+
+        let mut list = old.clone();
+        apply_list_change(&mut list, changed, &removed);
+        assert_eq!(list, new);
+    }
 
     fn sample_entry() -> Entry {
         Entry {
@@ -825,15 +974,19 @@ mod tests {
         });
         round_trip(&FilesResponse {
             version: 3,
+            since: Some(2),
             files: vec![FileInfo {
                 path: PathBuf::from("/dev/proj/a.rs"),
                 latest: entry.timestamp,
                 count: 2,
                 chain: vec![PathBuf::from("/dev/proj")],
             }],
+            removed: vec![PathBuf::from("/dev/proj/b.rs")],
         });
         round_trip(&AgentsResponse {
             version: 3,
+            since: None,
+            removed: vec![],
             agents: vec![Agent {
                 chain_id: "s0".to_string(),
                 session_id: "s1".to_string(),

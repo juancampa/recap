@@ -127,6 +127,13 @@ impl Client {
         }
     }
 
+    fn with_since(request: ureq::Request, since: Option<u64>) -> ureq::Request {
+        match since {
+            Some(v) => request.query("since", &v.to_string()),
+            None => request,
+        }
+    }
+
     /// Open the event stream. The iterator ends when the server closes the
     /// connection, and gives an error when the connection fails.
     pub fn events(&self) -> ApiResult<Events> {
@@ -239,12 +246,14 @@ impl Api for Client {
         self.fetch(self.get(routes::PROJECTS))
     }
 
-    fn files(&self, project: Option<&Path>) -> ApiResult<FilesResponse> {
-        self.fetch(Self::with_project(self.get(routes::FILES), project))
+    fn files(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<FilesResponse> {
+        let request = Self::with_project(self.get(routes::FILES), project);
+        self.fetch(Self::with_since(request, since))
     }
 
-    fn agents(&self, project: Option<&Path>) -> ApiResult<AgentsResponse> {
-        self.fetch(Self::with_project(self.get(routes::AGENTS), project))
+    fn agents(&self, project: Option<&Path>, since: Option<u64>) -> ApiResult<AgentsResponse> {
+        let request = Self::with_project(self.get(routes::AGENTS), project);
+        self.fetch(Self::with_since(request, since))
     }
 
     fn history(&self, filter: &Filter, page: &Page) -> ApiResult<HistoryResponse> {
