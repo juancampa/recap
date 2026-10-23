@@ -16,7 +16,7 @@
 //!   mismatch) are skipped.
 //! - Files renamed or deleted since the last save are skipped.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -24,7 +24,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::history::{find_project_chain, EditSource, HistoryEntry, HistoryEntryKind};
+use crate::history::{HistoryEntry, find_project_chain};
+use recap_api::{EditSource, EntryKind};
 
 const UF_START_MAGIC: &[u8] = b"Vim\x9FUnDo\xE5";
 const UF_VERSION: u16 = 3;
@@ -61,7 +62,10 @@ pub fn undodir() -> Option<PathBuf> {
 /// the user's init.lua / init.vim, so a custom `set undodir=...` is picked
 /// up automatically. Returns the first listed entry that exists on disk.
 fn query_undodir_from_nvim() -> Option<PathBuf> {
+    // `output()` captures stdout and stderr, but stdin stays connected to the
+    // terminal. Headless nvim must not read the keys that the user types.
     let output = std::process::Command::new("nvim")
+        .stdin(std::process::Stdio::null())
         .args([
             "--headless",
             "-c",
@@ -116,17 +120,20 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 fn cache_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".cache/recap/nvim")
+    crate::paths::cache_root().join("nvim")
 }
 
 /// Scan the Neovim undodir, emitting one batch per undofile via `on_batch`.
 /// Undofiles are processed newest-first (sorted by mtime descending).
 /// `on_batch` returning `false` aborts the scan.
+/// Read the undofiles. `since` limits the scan: the loader skips a file whose
+/// mtime is older, because such a file holds no newer entry. `None` reads
+/// every file.
 pub fn load(
     undodir: &Path,
     mtimes: &mut HashMap<PathBuf, SystemTime>,
     seen_keys: &mut HashSet<PathBuf>,
+    since: Option<SystemTime>,
     on_batch: &mut dyn FnMut(Vec<HistoryEntry>) -> bool,
 ) -> Result<()> {
     let read = match fs::read_dir(undodir) {
@@ -148,6 +155,9 @@ pub fn load(
         {
             continue;
         }
+        if since.is_some_and(|cut| mtime < cut) {
+            continue;
+        }
         files.push((p, mtime));
     }
     files.sort_by(|a, b| b.1.cmp(&a.1));
@@ -156,7 +166,7 @@ pub fn load(
     for (path, mtime) in files {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         if let Err(e) = process_undofile(&path, &mut batch, &mut chain_cache, seen_keys) {
-            eprintln!("recap: skipped undofile {}: {e}", path.display());
+            log::warn!("skipped undofile {}: {e}", path.display());
         }
         mtimes.insert(path, mtime);
         if !batch.is_empty() && !on_batch(batch) {
@@ -180,6 +190,10 @@ fn process_undofile(
     let file_path = decode_undofile_name(undofile_name)
         .context("could not decode undofile name to a file path")?;
 
+    // macOS can ask the user before the server reads this file.
+    if crate::paths::in_protected_folder(&file_path) {
+        return Ok(());
+    }
     let on_disk = match fs::read(&file_path) {
         Ok(b) => b,
         Err(_) => return Ok(()),
@@ -219,7 +233,8 @@ fn process_undofile(
     loop {
         let header = &parsed.headers[cur];
         if let Some(save_nr) = header.save_nr
-            && let Some(snapshot_path) = write_snapshot(&cache_dir, save_nr, &state, trailing_newline)
+            && let Some(snapshot_path) =
+                write_snapshot(&cache_dir, save_nr, &state, trailing_newline)
             && !seen_keys.contains(&snapshot_path)
         {
             let timestamp = Local
@@ -231,9 +246,10 @@ fn process_undofile(
                 timestamp,
                 file_path: file_path.clone(),
                 snapshot_path,
+                base_path: None,
                 project_roots: project_roots.clone(),
                 source: EditSource::Neovim,
-                kind: HistoryEntryKind::FileChange,
+                kind: EntryKind::FileChange,
                 session_id: None,
                 session_cwd: None,
             });
@@ -293,8 +309,8 @@ fn write_snapshot(
     if trailing_newline && !state.is_empty() {
         buf.push(b'\n');
     }
-    if let Err(e) = fs::write(&path, &buf) {
-        eprintln!("recap: nvim snapshot write failed: {e}");
+    if let Err(e) = crate::cache::write_atomic(&path, &buf) {
+        log::warn!("nvim snapshot write failed: {e}");
         return None;
     }
     Some(path)
@@ -700,10 +716,7 @@ mod tests {
     #[test]
     fn split_lines_trailing_newline() {
         let s = b"a\nb\n";
-        assert_eq!(
-            split_lines(s, true),
-            vec![b"a".to_vec(), b"b".to_vec()]
-        );
+        assert_eq!(split_lines(s, true), vec![b"a".to_vec(), b"b".to_vec()]);
     }
 
     #[test]
@@ -742,12 +755,8 @@ mod tests {
         // Regression: bot=0 is vim's sentinel for "change extends to end".
         // Walking back from ["a","b","c","d"] after appending "d" should
         // yield ["a","b","c"], not insert at position 0.
-        let mut state: Vec<Vec<u8>> = vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"c".to_vec(),
-            b"d".to_vec(),
-        ];
+        let mut state: Vec<Vec<u8>> =
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
         // The two-entry pattern neovim writes for a pure append:
         let e1 = UndoEntry {
             top: 3,

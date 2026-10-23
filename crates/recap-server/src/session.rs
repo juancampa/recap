@@ -12,6 +12,7 @@
 //! comparing `procStart` to the live process's start time); a reused pid is
 //! rare and the worst case is focusing the wrong window.
 
+use recap_api::RunningSession;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -26,18 +27,9 @@ struct SessionFile {
     status: Option<String>,
 }
 
-/// A running Claude Code session resolved from the registry.
-#[derive(Debug, Clone)]
-pub struct RunningSession {
-    pub pid: i32,
-    pub cwd: Option<PathBuf>,
-    /// Coarse status reported by Claude Code (`idle`, `busy`, `waiting`, …).
-    pub status: Option<String>,
-}
-
 /// Snapshot of the live sessions, indexed by session id. Rebuild with
 /// [`RunningSessions::scan`] to refresh (cheap: a handful of small JSON files).
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub struct RunningSessions {
     by_session: HashMap<String, RunningSession>,
 }
@@ -86,8 +78,9 @@ impl RunningSessions {
                 continue;
             }
             by_session.insert(
-                sid,
+                sid.clone(),
                 RunningSession {
+                    session_id: sid,
                     pid: sf.pid,
                     cwd: sf.cwd.map(PathBuf::from),
                     status: sf.status,
@@ -104,5 +97,16 @@ impl RunningSessions {
 
     pub fn is_running(&self, session_id: &str) -> bool {
         self.by_session.contains_key(session_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_session.len()
+    }
+
+    /// All running sessions, sorted by session id.
+    pub fn list(&self) -> Vec<RunningSession> {
+        let mut out: Vec<RunningSession> = self.by_session.values().cloned().collect();
+        out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        out
     }
 }

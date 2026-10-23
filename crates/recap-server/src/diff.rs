@@ -2,32 +2,18 @@ use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-pub enum DiffLine {
-    Added(String),
-    Removed(String),
-    Context(String),
-    Header(String),
-    /// One line of a prompt entry's body. Rendered in light blue, with
-    /// a `> ` prefix on the first line.
-    Prompt(String),
-    /// Per-child separator emitted when a collapsed group's diff is the
-    /// concatenation of its children. The renderer formats this with the
-    /// same spans the history panel uses, keyed by `entry_idx`.
-    ChildSeparator { entry_idx: usize },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DiffSummary {
-    pub added: usize,
-    pub removed: usize,
-}
+pub use recap_api::{DiffLine, DiffSummary};
 
 /// Cheap diff that only counts added/removed lines, for the history sidebar.
 pub fn compute_summary(old_path: Option<&Path>, new_path: &Path) -> DiffSummary {
     let new_content = match fs::read_to_string(new_path) {
         Ok(c) => c,
-        Err(_) => return DiffSummary { added: 0, removed: 0 },
+        Err(_) => {
+            return DiffSummary {
+                added: 0,
+                removed: 0,
+            };
+        }
     };
     let old_content = match old_path {
         Some(p) => fs::read_to_string(p).unwrap_or_default(),
@@ -62,7 +48,13 @@ pub fn build_diff(old_path: Option<&Path>, new_path: &Path) -> Vec<DiffLine> {
         None => String::new(),
     };
 
-    let diff = TextDiff::from_lines(&old_content, &new_content);
+    build_diff_from(&old_content, &new_content)
+}
+
+/// The body of [`build_diff`], for a caller that already holds both contents.
+/// The content search reads each snapshot once and reuses it here.
+pub fn build_diff_from(old_content: &str, new_content: &str) -> Vec<DiffLine> {
+    let diff = TextDiff::from_lines(old_content, new_content);
     let mut lines: Vec<DiffLine> = Vec::new();
 
     for group in diff.grouped_ops(3) {

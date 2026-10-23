@@ -1,0 +1,13 @@
+[package]
+name = "recap-api"
+version = "0.1.0"
+edition = "2024"
+description = "The wire types of the recap HTTP API, shared by the server and the Rust clients."
+
+[dependencies]
+serde.workspace = true
+chrono.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,3 +1,22 @@
+[workspace]
+members = ["crates/recap-api", "crates/recap-client", "crates/recap-server", "crates/recap-unidiff", "crates/slicer"]
+
+[workspace.dependencies]
+recap-api = { path = "crates/recap-api" }
+recap-client = { path = "crates/recap-client" }
+recap-server = { path = "crates/recap-server" }
+recap-unidiff = { path = "crates/recap-unidiff" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+percent-encoding = "2"
+regex = "1"
+dirs = "6"
+libc = "0.2"
+log = { version = "0.4", features = ["std", "kv"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
+
 [package]
 name = "recap"
 version = "0.1.0"
@@ -8,17 +27,18 @@ name = "recap"
 path = "src/main.rs"
 
 [dependencies]
+recap-api.workspace = true
+recap-client.workspace = true
+recap-server.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = "0.4"
-similar = "2"
-anyhow = "1"
-percent-encoding = "2"
-sha2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+log.workspace = true
 nucleo-matcher = "0.3"
-libc = "0.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
-regex = "1"
-dirs = "6"
+libc.workspace = true
+regex.workspace = true
+dirs.workspace = true
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }

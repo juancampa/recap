@@ -2,6 +2,7 @@
 //! selected project / file (stored by path, not index, since the projects
 //! list re-sorts as async load batches arrive) and the display toggles.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,15 @@ pub struct PersistedState {
     /// Max number of visual lines a prompt entry may occupy in the History
     /// list (the `>`/`<` toggle). Defaults to 5.
     pub prompt_lines: usize,
+    /// True when the app last ran in Agent mode (the `m` toggle).
+    pub agent_mode: bool,
+    /// Session id of the selected agent, for Agent mode.
+    pub selected_agent: Option<String>,
+    /// The committed queries of each search prompt, keyed by the mode name
+    /// that [`crate::search_history::SearchMode::key`] returns. Oldest first.
+    pub search_history: HashMap<String, Vec<String>>,
+    /// The History panel columns, and the date-row option (the `S` menu).
+    pub settings: crate::settings::Settings,
 }
 
 impl Default for PersistedState {
@@ -28,6 +38,10 @@ impl Default for PersistedState {
             absolute_time: false,
             auto_expand: false,
             prompt_lines: 5,
+            agent_mode: false,
+            selected_agent: None,
+            search_history: HashMap::new(),
+            settings: crate::settings::Settings::default(),
         }
     }
 }

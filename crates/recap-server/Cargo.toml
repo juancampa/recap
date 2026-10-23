@@ -1,0 +1,30 @@
+[package]
+name = "recap-server"
+version = "0.1.0"
+edition = "2024"
+description = "The recap server: it loads the edit and prompt history and serves it over HTTP."
+
+[dependencies]
+recap-api.workspace = true
+recap-unidiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+percent-encoding.workspace = true
+regex.workspace = true
+dirs.workspace = true
+libc.workspace = true
+log.workspace = true
+ureq.workspace = true
+similar = "2"
+sha2 = "0.10"
+nucleo-matcher = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+zstd = "0.14.0"
+
+[dev-dependencies]
+recap-client.workspace = true
