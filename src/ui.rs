@@ -1,12 +1,12 @@
 use crate::app::{App, DisplayRow, KindFilter, Mode, Panel, RunState, SearchKind, SearchPhase};
 use crate::reltime::align_relative_times;
-use recap_api::{DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
+use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
 use crate::search_history::SearchMode;
 use crate::settings::{Settings, SETTINGS_ITEMS};
 use crate::prompt::{
     self, HANG_INDENT, PROMPT_COLOR, RESPONSE_COLOR, WRAP_INDENT, WRAP_MARKER, WRAP_MARKER_COLOR,
 };
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Datelike, Local, NaiveDate};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -1135,7 +1135,21 @@ fn day_label(day: NaiveDate, today: NaiveDate) -> String {
         d if d < 365 => format!("{} months ago", d / 30),
         d => format!("{} years ago", d / 365),
     };
-    format!("{relative} - {}", day.format("%Y-%m-%d"))
+    format!("{relative} - {}", short_date(day, today))
+}
+
+/// A short date: `Sept-26` for a day of the current year, and `Sept-26 '25`
+/// for a day of an earlier year.
+fn short_date(day: NaiveDate, today: NaiveDate) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS[day.month0() as usize];
+    if day.year() == today.year() {
+        format!("{month}-{}", day.day())
+    } else {
+        format!("{month}-{} '{:02}", day.day(), day.year().rem_euclid(100))
+    }
 }
 
 /// The date row that the panel draws above the first entry of a day. The
@@ -3385,11 +3399,11 @@ mod render_tests {
         assert!(out.contains("today - "), "the first day is today\n{out}");
         let older = (Local::now() - chrono::Duration::days(3)).date_naive();
         assert!(
-            out.contains(&format!("3 days ago - {}", older.format("%Y-%m-%d"))),
+            out.contains(&format!("3 days ago - {}", short_date(older, today))),
             "the older day names both forms\n{out}"
         );
         assert!(
-            out.contains(&today.format("%Y-%m-%d").to_string()),
+            out.contains(&short_date(today, today)),
             "the date row prints the date\n{out}"
         );
         // The date row costs the first row of each day one extra line.

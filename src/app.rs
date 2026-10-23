@@ -2417,15 +2417,88 @@ impl App {
     }
 
     /// Scroll the Agents panel so the selected agent is on screen.
-    fn ensure_agent_visible(&mut self, visible: usize) {
+    /// `visible` is the height of the panel in lines. The main loop calls
+    /// this function before each frame, because a new agent can move the
+    /// selected agent down the list.
+    pub fn ensure_agent_visible(&mut self, visible: usize) {
         let Some(i) = self.sel_agent_idx() else {
             return;
         };
+        if visible == 0 {
+            return;
+        }
         if i < self.agent_scroll {
             self.agent_scroll = i;
-        } else if visible > 0 && i >= self.agent_scroll + visible {
-            self.agent_scroll = i + 1 - visible;
         }
+        while self.agent_scroll < i && i >= self.agent_scroll + self.agents_fit(self.agent_scroll, visible) {
+            self.agent_scroll += 1;
+        }
+    }
+
+    /// True if agent `i` is the first agent of its day, and the user turned
+    /// the date row on. The Agents panel then draws a date row above the
+    /// agent, as the History panel does.
+    pub fn agent_starts_day(&self, i: usize) -> bool {
+        if !self.settings.date_separator || i >= self.agents.len() {
+            return false;
+        }
+        let day = self.agents[i].last_ts.date_naive();
+        match i.checked_sub(1) {
+            None => true,
+            Some(prev) => self.agents[prev].last_ts.date_naive() != day,
+        }
+    }
+
+    /// The height of agent `i` in lines, with its date row and the empty
+    /// line after it.
+    pub fn agent_height(&self, i: usize) -> usize {
+        crate::ui::AGENT_ROW_HEIGHT + self.agent_starts_day(i) as usize
+    }
+
+    /// The number of agents, from agent `top`, that fit in a panel of
+    /// `visible` lines. The last agent needs no empty line after it. When
+    /// the user turns the date row on, the panel keeps the top line for the
+    /// sticky date row (see [`Self::agent_sticky_date`]), as History does.
+    /// The value is at least 1 when an agent follows `top`.
+    pub fn agents_fit(&self, top: usize, visible: usize) -> usize {
+        let lines = visible.saturating_sub(self.settings.date_separator as usize);
+        let mut used = 0usize;
+        let mut count = 0usize;
+        for i in top..self.agents.len() {
+            let h = self.agent_height(i);
+            if used + h - 1 > lines {
+                break;
+            }
+            used += h;
+            count += 1;
+        }
+        count.max(1).min(self.agents.len().saturating_sub(top))
+    }
+
+    /// The day that the sticky date row shows at the top of the Agents
+    /// panel. It is the day of the top agent, when the top agent has no date
+    /// row of its own. The value is `None` when the user turned the date row off.
+    pub fn agent_sticky_date(&self) -> Option<NaiveDate> {
+        let top = self.agent_scroll;
+        if !self.settings.date_separator || top >= self.agents.len() || self.agent_starts_day(top) {
+            return None;
+        }
+        Some(self.agents[top].last_ts.date_naive())
+    }
+
+    /// The agent on line `line` of the Agents panel, counted from the top
+    /// of the panel. A click on the sticky date row selects no agent.
+    pub fn agent_at_line(&self, line: usize) -> Option<usize> {
+        let line = line.checked_sub(self.agent_sticky_date().is_some() as usize)?;
+        let mut acc = 0usize;
+        for i in self.agent_scroll..self.agents.len() {
+            let h = self.agent_height(i);
+            if line < acc + h {
+                return Some(i);
+            }
+            acc += h;
+        }
+        None
     }
 
     // ── Agents panel navigation ───────────────────────────────────────────
@@ -2446,12 +2519,8 @@ impl App {
             return;
         }
         self.selected_agent = Some(id);
-        if target < self.agent_scroll {
-            self.agent_scroll = target;
-        } else if visible > 0 && target >= self.agent_scroll + visible {
-            self.agent_scroll = target + 1 - visible;
-        }
-        self.refilter();
+        self.ensure_agent_visible(visible);
+        self.refilter_history();
         self.adjust_scroll(visible);
     }
 
@@ -2477,7 +2546,8 @@ impl App {
         let Some(i) = self.sel_agent_idx() else {
             return;
         };
-        let target = (i + visible.max(1)).min(self.agents.len().saturating_sub(1));
+        let page = self.agents_fit(self.agent_scroll, visible);
+        let target = (i + page).min(self.agents.len().saturating_sub(1));
         self.select_agent_row(target, visible);
     }
 
@@ -2485,7 +2555,8 @@ impl App {
         let Some(i) = self.sel_agent_idx() else {
             return;
         };
-        self.select_agent_row(i.saturating_sub(visible.max(1)), visible);
+        let page = self.agents_fit(self.agent_scroll, visible);
+        self.select_agent_row(i.saturating_sub(page), visible);
     }
 
     pub fn agent_top(&mut self, visible: usize) {

@@ -806,8 +806,10 @@ fn handle_mouse(
                 && rect_contains(agents, me.column, me.row)
             {
                 app.active_panel = app::Panel::Agents;
-                if let Some(row) = click_to_row(agents, me.column, me.row) {
-                    app.select_agent_row(app.agent_scroll + row, visible_agents);
+                if let Some(target) =
+                    click_to_row(agents, me.column, me.row).and_then(|row| app.agent_at_line(row))
+                {
+                    app.select_agent_row(target, visible_agents);
                 }
             } else if rect_contains(rects.history, me.column, me.row) {
                 app.active_panel = app::Panel::History;
@@ -1002,6 +1004,8 @@ fn run(
             .files
             .map(|r| (r.height as usize).saturating_sub(2))
             .unwrap_or(full);
+        // The Agents panel measures its height in lines, because a date
+        // row makes some agents one line taller.
         let visible_agents = rects
             .agents
             .map(|r| (r.height as usize).saturating_sub(2))
@@ -1016,6 +1020,7 @@ fn run(
         }
         app.maybe_run_pending_search(visible_history);
         app.ensure_summaries_visible(visible_history);
+        app.ensure_agent_visible(visible_agents);
         let list_width = (rects.history.width as usize).saturating_sub(2);
         app.recompute_row_heights(list_width, visible_history);
         app.set_diff_height(visible_diff);
