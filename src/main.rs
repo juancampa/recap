@@ -556,9 +556,75 @@ fn run_serve(args: &[String]) -> Result<()> {
 /// The interval between two loads of the sources.
 const DEFAULT_POLL: Duration = Duration::from_secs(5);
 
+/// The text of `recap --help`.
+const HELP: &str = "\
+recap: show the prompts of coding agents and the file changes that they made.
+
+Usage:
+  recap [options]                    Open the TUI.
+  recap list [options]               Print the newest entries as JSON.
+  recap blame [--stdin] [--] [<git diff args>...]
+                                     Find the prompts that made the hunks of a diff.
+  recap serve [options]              Run the server in the foreground.
+  recap service <command>            Manage the prod server as a launchd agent.
+  recap logs [-f] [-n <lines>]       Print the end of the prod server log.
+
+TUI options:
+  -a, --absolute       Show absolute times instead of relative times.
+      --index          Build the semantic search index, then stop.
+      --query <text>   With --index, run a search and print the results.
+                       You can give this option more than one time.
+
+Client options (TUI, list, blame):
+      --server <url>   Use this server. The default is $RECAP_URL, else the prod server.
+
+list options:
+  -n, --limit <count>  Print this number of entries. The default is 50.
+      --since <period> Start with the entries of this period, such as 12h, 7d or all.
+                       The default is 7d.
+      --filter kind=<prompt|diff>
+                       Print only one kind of entry.
+
+blame options:
+      --stdin          Read the diff from stdin. Else the command runs `git diff`.
+
+serve options:
+      --port <n>       Listen on this port. The default is 7717, or 7718 with --test.
+      --test           Use a copy of the prod cache.
+      --poll <seconds> The interval between two loads of the sources. The default is 5.
+
+service commands:
+  install              Copy this binary, write the agent file and start the server.
+  uninstall            Stop the server and remove the agent file.
+  restart              Stop the server and start it again.
+  status               Print the state of the agent and of the server.
+
+logs options:
+  -f, --follow         Print the new lines until you press Ctrl-C.
+  -n, --lines <count>  Print this number of lines first. The default is 50.
+
+Environment:
+  RECAP_URL            The server that the client uses.
+  RECAP_LOG            The log level of the server: error, warn, info, debug or trace.
+";
+
 fn main() -> Result<()> {
     let absolute_time = std::env::args().any(|a| a == "--absolute" || a == "-a");
     let args: Vec<String> = std::env::args().collect();
+    // `recap blame` gives the arguments after `--` to git, so a `--help`
+    // there is for git.
+    let help = args[1..]
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--help" || a == "-h")
+        || args.get(1).map(String::as_str) == Some("help");
+    if help {
+        print!("{HELP}");
+        return Ok(());
+    }
+    if args.get(1).map(String::as_str) == Some("logs") {
+        return service::logs(&args[2..]);
+    }
     if args.get(1).map(String::as_str) == Some("serve") {
         return run_serve(&args[2..]);
     }

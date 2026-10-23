@@ -37,6 +37,11 @@ fn log_dir() -> Result<PathBuf> {
     Ok(home()?.join("Library/Logs/recap"))
 }
 
+/// The file that launchd writes the stdout and stderr of the server to.
+fn log_file() -> Result<PathBuf> {
+    Ok(log_dir()?.join("server.log"))
+}
+
 /// The launchd domain of the user: `gui/<uid>`.
 fn domain() -> Result<String> {
     let out = Command::new("id").arg("-u").output().context("cannot run id")?;
@@ -123,7 +128,7 @@ fn install() -> Result<()> {
         &plist_file,
         plist(
             &binary.to_string_lossy(),
-            &logs.join("server.log").to_string_lossy(),
+            &log_file()?.to_string_lossy(),
             &path,
         ),
     )?;
@@ -140,7 +145,7 @@ fn install() -> Result<()> {
     }
     println!("installed {}", binary.display());
     println!("agent file {}", plist_file.display());
-    println!("log {}", logs.join("server.log").display());
+    println!("log {}", log_file()?.display());
     println!("server {}", recap_client::local_url(recap_client::PROD_PORT));
     Ok(())
 }
