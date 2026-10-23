@@ -123,21 +123,21 @@ async fn log_request(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
     let response = next.run(request).await;
-    let elapsed = crate::logger::ms(started.elapsed());
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let status = response.status();
-    let size = response
-        .body()
-        .size_hint()
-        .exact()
-        .map(|n| format!(" {}", crate::logger::bytes(n)))
-        .unwrap_or_default();
+    let level = if status.is_server_error() {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    };
+    let status = status.as_u16();
     let path = percent_encoding::percent_decode_str(&uri.to_string())
         .decode_utf8_lossy()
         .into_owned();
-    if status.is_server_error() {
-        log::warn!("{method} {path} {} {elapsed}{size}", status.as_u16());
-    } else {
-        log::info!("{method} {path} {} {elapsed}{size}", status.as_u16());
+    // The size of a stream is not known.
+    match response.body().size_hint().exact() {
+        Some(bytes) => log::log!(level, status, elapsed_ms, bytes; "{method} {path}"),
+        None => log::log!(level, status, elapsed_ms; "{method} {path}"),
     }
     response
 }

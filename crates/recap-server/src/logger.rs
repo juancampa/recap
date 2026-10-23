@@ -1,9 +1,14 @@
-//! The logger of the server: one line on stderr for each record, with the
-//! time, the level and the module.
+//! The logger of the server: one record on stderr for each `log` call.
+//!
+//! When stderr is a file, the logger writes each record as one line of JSON
+//! (see [`LogRecord`]):
 //!
 //! ```text
-//! 2026-09-28 21:14:12.753 INFO  http: GET /v1/history?project=/x 200 12.3ms 81.2 KB
+//! {"time":"2026-09-28T21:14:12.753+02:00","level":"INFO","target":"http","message":"GET /v1/history","fields":{"status":200,"elapsed_ms":12.3,"bytes":83149}}
 //! ```
+//!
+//! When stderr is a terminal, the logger writes the record as colored text
+//! (see [`crate::colorize`]). `recap logs` writes the same text.
 //!
 //! launchd writes stderr to `~/Library/Logs/recap/server.log` (see `recap
 //! service`). A test server in a terminal writes it on the terminal.
@@ -16,10 +21,11 @@
 //! stderr would stay on the screen (see the TUI renderer). Without a logger,
 //! the `log` macros write nothing.
 
-use chrono::Local;
+use chrono::{DateTime, Local};
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 
 /// The largest log file that the logger keeps. When stderr is a regular
@@ -31,6 +37,63 @@ const LEVEL_VAR: &str = "RECAP_LOG";
 
 struct Logger {
     level: LevelFilter,
+    /// Stderr is a terminal: the logger writes colored text, not JSON.
+    terminal: bool,
+}
+
+/// One record of the log. The logger writes it as one line of JSON.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogRecord {
+    pub time: DateTime<Local>,
+    pub level: String,
+    /// The module that wrote the record, without the `recap_server::` prefix.
+    pub target: String,
+    pub message: String,
+    /// The key-value fields of the record, for example the `status` of an
+    /// HTTP request.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LogRecord {
+    fn new(time: DateTime<Local>, record: &Record) -> Self {
+        let target = record.target();
+        let mut fields = Fields(serde_json::Map::new());
+        // The visitor does not fail.
+        let _ = record.key_values().visit(&mut fields);
+        LogRecord {
+            time,
+            level: record.level().to_string(),
+            target: target.strip_prefix("recap_server::").unwrap_or(target).to_string(),
+            message: record.args().to_string(),
+            fields: fields.0,
+        }
+    }
+}
+
+/// Collects the key-value fields of a record as JSON values.
+struct Fields(serde_json::Map<String, serde_json::Value>);
+
+impl<'kvs> log::kv::VisitSource<'kvs> for Fields {
+    fn visit_pair(
+        &mut self,
+        key: log::kv::Key<'kvs>,
+        value: log::kv::Value<'kvs>,
+    ) -> Result<(), log::kv::Error> {
+        let json = if let Some(v) = value.to_u64() {
+            v.into()
+        } else if let Some(v) = value.to_i64() {
+            v.into()
+        } else if let Some(v) = value.to_f64().and_then(serde_json::Number::from_f64) {
+            v.into()
+        } else if let Some(v) = value.to_bool() {
+            v.into()
+        } else {
+            value.to_string().into()
+        };
+        self.0.insert(key.to_string(), json);
+        Ok(())
+    }
 }
 
 impl Log for Logger {
@@ -46,14 +109,13 @@ impl Log for Logger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let target = record.target();
-        let target = target.strip_prefix("recap_server::").unwrap_or(target);
-        let line = format!(
-            "{} {:<5} {target}: {}\n",
-            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            record.level(),
-            record.args()
-        );
+        let record = LogRecord::new(Local::now(), record);
+        let mut line = if self.terminal {
+            crate::colorize::render(&record, true)
+        } else {
+            serde_json::to_string(&record).unwrap_or_default()
+        };
+        line.push('\n');
         let stderr = std::io::stderr();
         let mut stderr = stderr.lock();
         limit_size(&stderr);
@@ -93,7 +155,8 @@ fn level() -> LevelFilter {
 /// Install the logger. Call it once, at the start of `recap serve`.
 pub fn init() {
     let level = level();
-    if log::set_boxed_logger(Box::new(Logger { level })).is_ok() {
+    let terminal = std::io::stderr().is_terminal();
+    if log::set_boxed_logger(Box::new(Logger { level, terminal })).is_ok() {
         log::set_max_level(level.max(LevelFilter::Warn));
     }
 }
@@ -137,6 +200,32 @@ mod tests {
         assert_eq!(bytes(83_149), "81.2 KB");
         assert_eq!(bytes(3_565_158), "3.4 MB");
         assert_eq!(bytes(2_567_593_165), "2.39 GB");
+    }
+
+    /// The record keeps the key-value fields of a `log` call with their types.
+    #[test]
+    fn a_record_keeps_the_fields() {
+        let time = Local::now();
+        let fields: &[(&str, log::kv::Value)] = &[
+            ("status", 500u16.into()),
+            ("elapsed_ms", 12.3f64.into()),
+            ("name", "x y".into()),
+        ];
+        let record = LogRecord::new(
+            time,
+            &Record::builder()
+                .level(Level::Warn)
+                .target("recap_server::http")
+                .args(format_args!("GET /v1/x"))
+                .key_values(&fields)
+                .build(),
+        );
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.ends_with(r#""level":"WARN","target":"http","message":"GET /v1/x","fields":{"elapsed_ms":12.3,"name":"x y","status":500}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<LogRecord>(&json).unwrap(), record);
     }
 
     /// A log file past the limit becomes empty, and a small file stays.

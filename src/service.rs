@@ -11,8 +11,9 @@
 use anyhow::{Context, Result, bail};
 use recap_api::Api;
 use std::fs;
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The launchd label of the prod server.
@@ -228,4 +229,59 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("status") => status(),
         _ => bail!("usage: recap service install | uninstall | restart | status"),
     }
+}
+
+/// `recap logs [-f] [-n <lines>]`: print the end of the prod server log as
+/// text, with colors when stdout is a terminal. `-f` prints the new lines
+/// until SIGINT. The command reads the output of `tail -F`, because the logger
+/// empties the file at a size limit and `-F` reads the file again from the
+/// start after that.
+pub fn logs(args: &[String]) -> Result<()> {
+    let follow = args.iter().any(|a| a == "-f" || a == "--follow");
+    let lines = match args.iter().position(|a| a == "-n" || a == "--lines") {
+        Some(i) => {
+            let v = args.get(i + 1).map(String::as_str).unwrap_or("");
+            v.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("-n: `{v}` is not a number of lines"))?
+        }
+        None => 50,
+    };
+    let file = log_file()?;
+    if !file.exists() {
+        bail!("{} does not exist. Run `recap service install` first.", file.display());
+    }
+    let mut cmd = Command::new("tail");
+    cmd.arg("-n").arg(lines.to_string());
+    if follow {
+        cmd.arg("-F");
+    }
+    let mut child = cmd
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("cannot run tail")?;
+    let color = std::io::stdout().is_terminal();
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let mut stdout = std::io::stdout().lock();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = recap_server::colorize::render_line(text.trim_end_matches('\n'), color);
+        // The write fails when the reader of a pipe stops, for example `head`.
+        if writeln!(stdout, "{text}").and_then(|_| stdout.flush()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
+    let status = child.wait()?;
+    // tail stops with a signal after SIGINT. That is the normal end of `-f`.
+    if !status.success() && status.code().is_some() {
+        bail!("tail failed: {status}");
+    }
+    Ok(())
 }

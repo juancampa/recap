@@ -4,6 +4,7 @@
 pub mod blame;
 pub mod cache;
 pub mod claude;
+pub mod colorize;
 pub mod cursor_sessions;
 pub mod cursor_workspace;
 pub mod diff;
