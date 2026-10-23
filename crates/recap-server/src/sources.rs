@@ -7,12 +7,12 @@
 //! [`crate::server`]).
 
 use crate::cursor_sessions::CursorSessions;
-use crate::history::{find_project_chain, HistoryEntry, HistoryStore};
+use crate::history::{HistoryEntry, HistoryStore, find_project_chain};
 use crate::{claude, cursor_workspace, nvim};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::SystemTime;
 
 /// The external entry sources, with the caches of the last load. Each source
@@ -185,16 +185,24 @@ impl Sources {
             let tx = tx.clone();
             pending += 1;
             std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>, facts: claude::SessionFacts| -> bool {
-                    if !facts.is_empty() && tx.send(LoadEvent::SessionFacts(facts)).is_err() {
-                        return false;
-                    }
-                    if batch.is_empty() {
-                        return true;
-                    }
-                    tx.send(LoadEvent::Batch(batch)).is_ok()
-                };
-                match claude::load(&dir, &claude::archive_dir(), &mut mtimes, &mut seen, None, &mut on_batch) {
+                let mut on_batch =
+                    |batch: Vec<HistoryEntry>, facts: claude::SessionFacts| -> bool {
+                        if !facts.is_empty() && tx.send(LoadEvent::SessionFacts(facts)).is_err() {
+                            return false;
+                        }
+                        if batch.is_empty() {
+                            return true;
+                        }
+                        tx.send(LoadEvent::Batch(batch)).is_ok()
+                    };
+                match claude::load(
+                    &dir,
+                    &claude::archive_dir(),
+                    &mut mtimes,
+                    &mut seen,
+                    None,
+                    &mut on_batch,
+                ) {
                     Ok(archived) => {
                         let _ = tx.send(LoadEvent::ArchivedSessions(archived));
                     }
@@ -214,9 +222,8 @@ impl Sources {
             let tx = tx.clone();
             pending += 1;
             std::thread::spawn(move || {
-                let mut on_batch = |batch: Vec<HistoryEntry>| -> bool {
-                    tx.send(LoadEvent::Batch(batch)).is_ok()
-                };
+                let mut on_batch =
+                    |batch: Vec<HistoryEntry>| -> bool { tx.send(LoadEvent::Batch(batch)).is_ok() };
                 if let Err(e) = nvim::load(&dir, &mut mtimes, &mut seen, None, &mut on_batch) {
                     log::warn!("neovim history failed: {e}");
                 }
@@ -232,7 +239,12 @@ impl Sources {
     }
 
     /// Put the caches that a finished loader thread returns back in place.
-    pub fn finish(&mut self, kind: SourceKind, mtimes: HashMap<PathBuf, SystemTime>, seen: HashSet<PathBuf>) {
+    pub fn finish(
+        &mut self,
+        kind: SourceKind,
+        mtimes: HashMap<PathBuf, SystemTime>,
+        seen: HashSet<PathBuf>,
+    ) {
         match kind {
             SourceKind::Cursor => {
                 self.cursor_mtimes = mtimes;

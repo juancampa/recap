@@ -692,7 +692,8 @@ diff --git a/lib.rs b/lib.rs
         assert!(third.patch.starts_with("diff --git a/lib.rs b/lib.rs\n"));
 
         // A hunk that nothing explains has no winner.
-        let unknown = parse_unified("--- a/lib.rs\n+++ b/lib.rs\n@@ -9,0 +9,1 @@\n+fn from_nowhere() {}\n");
+        let unknown =
+            parse_unified("--- a/lib.rs\n+++ b/lib.rs\n@@ -9,0 +9,1 @@\n+fn from_nowhere() {}\n");
         let blames = attribute(&store, &unknown, &root, &bash);
         assert!(blames[0].winner.is_none());
 

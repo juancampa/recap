@@ -8,7 +8,12 @@ pub use recap_api::{DiffLine, DiffSummary};
 pub fn compute_summary(old_path: Option<&Path>, new_path: &Path) -> DiffSummary {
     let new_content = match fs::read_to_string(new_path) {
         Ok(c) => c,
-        Err(_) => return DiffSummary { added: 0, removed: 0 },
+        Err(_) => {
+            return DiffSummary {
+                added: 0,
+                removed: 0,
+            };
+        }
     };
     let old_content = match old_path {
         Some(p) => fs::read_to_string(p).unwrap_or_default(),

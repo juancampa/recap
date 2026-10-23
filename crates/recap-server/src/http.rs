@@ -13,13 +13,15 @@ use crate::server::Server;
 use axum::body::Body;
 use axum::body::HttpBody;
 use axum::extract::{Path as UrlPath, Query, Request, State};
-use axum::middleware::{self, Next};
 use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use recap_api::{Api, ApiError, BlameRequest, DiffLine, EntryId, Event, Filter, Page, SearchKind, routes};
+use recap_api::{
+    Api, ApiError, BlameRequest, DiffLine, EntryId, Event, Filter, Page, SearchKind, routes,
+};
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
@@ -104,7 +106,10 @@ pub fn router(server: Server) -> Router {
         .route(routes::RELOAD, post(reload))
         .route(routes::EMBED_START, post(start_embedding))
         .route(routes::BLAME, post(blame))
-        .route(&format!("{}/{{id}}/restore", routes::SESSIONS), post(restore_session))
+        .route(
+            &format!("{}/{{id}}/restore", routes::SESSIONS),
+            post(restore_session),
+        )
         .route(routes::EVENTS, get(events))
         .layer(middleware::from_fn(log_request))
         .with_state(server)
@@ -161,12 +166,18 @@ async fn history(
     Ok(Json(blocking(s, move |s| s.history(&filter, &page)).await?))
 }
 
-async fn entry(State(s): State<Server>, UrlPath(id): UrlPath<String>) -> HttpResult<impl IntoResponse> {
+async fn entry(
+    State(s): State<Server>,
+    UrlPath(id): UrlPath<String>,
+) -> HttpResult<impl IntoResponse> {
     let id = EntryId(id);
     let found = blocking(s, move |s| Ok(s.entry(&id).ok())).await?;
     match found {
         Some(entry) => Ok(Json(entry)),
-        None => Err(HttpError(StatusCode::NOT_FOUND, "no entry with this id".to_string())),
+        None => Err(HttpError(
+            StatusCode::NOT_FOUND,
+            "no entry with this id".to_string(),
+        )),
     }
 }
 
@@ -202,7 +213,10 @@ fn unified(lines: &[DiffLine]) -> String {
     out
 }
 
-async fn summaries(State(s): State<Server>, Query(q): Query<IdsQuery>) -> HttpResult<impl IntoResponse> {
+async fn summaries(
+    State(s): State<Server>,
+    Query(q): Query<IdsQuery>,
+) -> HttpResult<impl IntoResponse> {
     let ids = recap_api::split_ids(&q.ids);
     Ok(Json(blocking(s, move |s| s.summaries(&ids)).await?))
 }
@@ -213,7 +227,9 @@ async fn search(
     Query(q): Query<SearchQuery>,
     Query(filter): Query<Filter>,
 ) -> HttpResult<impl IntoResponse> {
-    Ok(Json(blocking(s, move |s| s.search(kind, &q.q, &filter)).await?))
+    Ok(Json(
+        blocking(s, move |s| s.search(kind, &q.q, &filter)).await?,
+    ))
 }
 
 async fn running(State(s): State<Server>) -> HttpResult<impl IntoResponse> {
@@ -230,12 +246,18 @@ async fn start_embedding(State(s): State<Server>) -> HttpResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn restore_session(State(s): State<Server>, UrlPath(id): UrlPath<String>) -> HttpResult<StatusCode> {
+async fn restore_session(
+    State(s): State<Server>,
+    UrlPath(id): UrlPath<String>,
+) -> HttpResult<StatusCode> {
     blocking(s, move |s| s.restore_session(&id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn blame(State(s): State<Server>, Json(request): Json<BlameRequest>) -> HttpResult<impl IntoResponse> {
+async fn blame(
+    State(s): State<Server>,
+    Json(request): Json<BlameRequest>,
+) -> HttpResult<impl IntoResponse> {
     Ok(Json(blocking(s, move |s| s.blame(&request)).await?))
 }
 
@@ -289,7 +311,8 @@ async fn events(State(s): State<Server>, Query(q): Query<EventsQuery>) -> Respon
             line.push('\n');
             line
         });
-        let keep_alive = IntervalStream::new(tokio::time::interval(KEEP_ALIVE)).map(|_| "\n".to_string());
+        let keep_alive =
+            IntervalStream::new(tokio::time::interval(KEEP_ALIVE)).map(|_| "\n".to_string());
         let body = lines.merge(keep_alive).map(Ok::<_, Infallible>);
         return (
             [(header::CONTENT_TYPE, "application/x-ndjson")],
@@ -298,7 +321,9 @@ async fn events(State(s): State<Server>, Query(q): Query<EventsQuery>) -> Respon
             .into_response();
     }
     let body = events.map(|event| {
-        Ok::<_, Infallible>(sse::Event::default().data(serde_json::to_string(&event).unwrap_or_default()))
+        Ok::<_, Infallible>(
+            sse::Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
+        )
     });
     Sse::new(body)
         .keep_alive(KeepAlive::new().interval(KEEP_ALIVE))
@@ -418,7 +443,8 @@ mod tests {
     /// Two prompts in /dev/proj, and two edits of one file in /dev/other.
     /// The second edit adds one line.
     fn fixture(name: &str) -> Server {
-        let dir = std::env::temp_dir().join(format!("recap-http-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("recap-http-test-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, "one\n").unwrap();
@@ -435,8 +461,12 @@ mod tests {
     fn the_history_route_applies_the_filter_and_the_page() {
         let client = serve(fixture("history"));
 
-        let all = client.history(&Filter::default(), &Page::default()).unwrap();
-        let count = |r: &recap_api::HistoryResponse| r.groups.iter().map(|g| g.entries.len()).sum::<usize>();
+        let all = client
+            .history(&Filter::default(), &Page::default())
+            .unwrap();
+        let count = |r: &recap_api::HistoryResponse| {
+            r.groups.iter().map(|g| g.entries.len()).sum::<usize>()
+        };
         assert_eq!(count(&all), 4);
 
         let prompts = Filter {
@@ -482,9 +512,17 @@ mod tests {
         let newest = client.history(&other, &Page::default()).unwrap().groups[0].entries[0].clone();
 
         let lines = client.diff(std::slice::from_ref(&newest.id)).unwrap();
-        assert!(lines.contains(&DiffLine::Added("two".to_string())), "{lines:?}");
+        assert!(
+            lines.contains(&DiffLine::Added("two".to_string())),
+            "{lines:?}"
+        );
 
-        let url = format!("{}{}?ids={}&format=unified", client.base(), routes::DIFF, newest.id);
+        let url = format!(
+            "{}{}?ids={}&format=unified",
+            client.base(),
+            routes::DIFF,
+            newest.id
+        );
         let text = ureq::get(&url).call().unwrap().into_string().unwrap();
         assert!(text.lines().any(|l| l == "+two"), "{text}");
     }
@@ -498,16 +536,25 @@ mod tests {
             other => panic!("expected 404, got {other:?}"),
         }
 
-        let id = client.history(&Filter::default(), &Page::default()).unwrap().groups[0].entries[0]
+        let id = client
+            .history(&Filter::default(), &Page::default())
+            .unwrap()
+            .groups[0]
+            .entries[0]
             .id
             .clone();
-        assert_eq!(client.entry(&id).unwrap().prompt_text(), Some("fix the parser"));
+        assert_eq!(
+            client.entry(&id).unwrap().prompt_text(),
+            Some("fix the parser")
+        );
     }
 
     #[test]
     fn the_search_route_reads_the_kind_from_the_path() {
         let client = serve(fixture("search"));
-        let r = client.search(SearchKind::Content, "parser", &Filter::default()).unwrap();
+        let r = client
+            .search(SearchKind::Content, "parser", &Filter::default())
+            .unwrap();
         assert_eq!(r.matches.len(), 1);
     }
 
@@ -522,7 +569,13 @@ mod tests {
         // the events that the server sends now reach this stream.
         server.send(Event::Loading { loading: true });
         server.send(Event::Changed { version: 7 });
-        assert_eq!(events.next().unwrap().unwrap(), Event::Loading { loading: true });
-        assert_eq!(events.next().unwrap().unwrap(), Event::Changed { version: 7 });
+        assert_eq!(
+            events.next().unwrap().unwrap(),
+            Event::Loading { loading: true }
+        );
+        assert_eq!(
+            events.next().unwrap().unwrap(),
+            Event::Changed { version: 7 }
+        );
     }
 }

@@ -16,7 +16,7 @@
 //!   mismatch) are skipped.
 //! - Files renamed or deleted since the last save are skipped.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::history::{find_project_chain, HistoryEntry};
+use crate::history::{HistoryEntry, find_project_chain};
 use recap_api::{EditSource, EntryKind};
 
 const UF_START_MAGIC: &[u8] = b"Vim\x9FUnDo\xE5";
@@ -233,7 +233,8 @@ fn process_undofile(
     loop {
         let header = &parsed.headers[cur];
         if let Some(save_nr) = header.save_nr
-            && let Some(snapshot_path) = write_snapshot(&cache_dir, save_nr, &state, trailing_newline)
+            && let Some(snapshot_path) =
+                write_snapshot(&cache_dir, save_nr, &state, trailing_newline)
             && !seen_keys.contains(&snapshot_path)
         {
             let timestamp = Local
@@ -715,10 +716,7 @@ mod tests {
     #[test]
     fn split_lines_trailing_newline() {
         let s = b"a\nb\n";
-        assert_eq!(
-            split_lines(s, true),
-            vec![b"a".to_vec(), b"b".to_vec()]
-        );
+        assert_eq!(split_lines(s, true), vec![b"a".to_vec(), b"b".to_vec()]);
     }
 
     #[test]
@@ -757,12 +755,8 @@ mod tests {
         // Regression: bot=0 is vim's sentinel for "change extends to end".
         // Walking back from ["a","b","c","d"] after appending "d" should
         // yield ["a","b","c"], not insert at position 0.
-        let mut state: Vec<Vec<u8>> = vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"c".to_vec(),
-            b"d".to_vec(),
-        ];
+        let mut state: Vec<Vec<u8>> =
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
         // The two-entry pattern neovim writes for a pure append:
         let e1 = UndoEntry {
             top: 3,
@@ -820,5 +814,4 @@ mod tests {
         apply_undo_entry(&mut state, &entry);
         assert_eq!(state, vec![b"A".to_vec(), b"B".to_vec()]);
     }
-
 }

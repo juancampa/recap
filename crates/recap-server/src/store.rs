@@ -206,12 +206,18 @@ impl Store {
                 (&self.history.entries[b].timestamp, &self.meta[b].id),
             )
         });
-        let mut entries: Vec<Option<HistoryEntry>> =
-            std::mem::take(&mut self.history.entries).into_iter().map(Some).collect();
-        let mut meta: Vec<Option<Meta>> =
-            std::mem::take(&mut self.meta).into_iter().map(Some).collect();
+        let mut entries: Vec<Option<HistoryEntry>> = std::mem::take(&mut self.history.entries)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut meta: Vec<Option<Meta>> = std::mem::take(&mut self.meta)
+            .into_iter()
+            .map(Some)
+            .collect();
         for i in order {
-            self.history.entries.push(entries[i].take().expect("each index once"));
+            self.history
+                .entries
+                .push(entries[i].take().expect("each index once"));
             self.meta.push(meta[i].take().expect("each index once"));
         }
         self.history.recompute_projects();
@@ -278,7 +284,8 @@ impl Store {
             if entry.base_path.is_some() || !entry.is_file_change() {
                 continue;
             }
-            entry.session_id = sessions.attribute(&entry.file_path, entry.timestamp.timestamp_millis());
+            entry.session_id =
+                sessions.attribute(&entry.file_path, entry.timestamp.timestamp_millis());
         }
     }
 
@@ -295,7 +302,10 @@ impl Store {
     }
 
     fn session_summary(&self, entry: &HistoryEntry) -> Option<&String> {
-        entry.session_id.as_ref().and_then(|sid| self.session_summaries.get(sid))
+        entry
+            .session_id
+            .as_ref()
+            .and_then(|sid| self.session_summaries.get(sid))
     }
 
     /// Add the parent links of sessions.
@@ -699,9 +709,15 @@ mod tests {
             .iter()
             .map(|a| (a.chain_id.as_str(), a.session_id.as_str(), a.prompt_count))
             .collect();
-        assert_eq!(chains, vec![("solo", "solo", 1), ("root", "other-child", 3)]);
+        assert_eq!(
+            chains,
+            vec![("solo", "solo", 1), ("root", "other-child", 3)]
+        );
 
-        let filter = Filter { agent: Some("root".to_string()), ..Filter::default() };
+        let filter = Filter {
+            agent: Some("root".to_string()),
+            ..Filter::default()
+        };
         let texts: Vec<(String, Option<usize>, Option<String>)> = store
             .filtered(&filter)
             .into_iter()
@@ -777,7 +793,10 @@ mod tests {
     #[test]
     fn a_loop_in_the_parent_links_ends() {
         let mut store = Store::default();
-        store.extend_parents([("a".to_string(), "b".to_string()), ("b".to_string(), "a".to_string())]);
+        store.extend_parents([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ]);
         assert!(["a", "b"].contains(&store.chain_id("a")));
     }
 
@@ -794,13 +813,24 @@ mod tests {
         store.merge(vec![again, nvim_entry("/dev/proj/a.rs", "/snap/1", 1)]);
         let changed = store.commit();
 
-        let prompts: Vec<&HistoryEntry> =
-            store.history.entries.iter().filter(|e| e.is_prompt()).collect();
+        let prompts: Vec<&HistoryEntry> = store
+            .history
+            .entries
+            .iter()
+            .filter(|e| e.is_prompt())
+            .collect();
         assert_eq!(prompts.len(), 1, "the prompt is replaced, not duplicated");
         assert_eq!(prompts[0].response_text(), Some("Fixed."));
         assert_eq!(store.len(), 2);
-        assert!(changed.contains(&id), "the replaced prompt has a new version");
-        assert_eq!(store.index_of(&id).map(|i| store.id_at(i)), Some(&id), "the id stays");
+        assert!(
+            changed.contains(&id),
+            "the replaced prompt has a new version"
+        );
+        assert_eq!(
+            store.index_of(&id).map(|i| store.id_at(i)),
+            Some(&id),
+            "the id stays"
+        );
     }
 
     /// A Cursor prompt has the composer that wrote it. The fuzzy join runs on
@@ -817,10 +847,23 @@ mod tests {
         let mut store = Store::from_entries(vec![prompt, edit]);
         store.apply_cursor_attribution(&CursorSessions::default());
 
-        let prompt = store.history.entries.iter().find(|e| e.is_prompt()).unwrap();
+        let prompt = store
+            .history
+            .entries
+            .iter()
+            .find(|e| e.is_prompt())
+            .unwrap();
         assert_eq!(prompt.session_id.as_deref(), Some("composer-1"));
-        let edit = store.history.entries.iter().find(|e| !e.is_prompt()).unwrap();
-        assert_eq!(edit.session_id, None, "an unattributed edit loses its composer");
+        let edit = store
+            .history
+            .entries
+            .iter()
+            .find(|e| !e.is_prompt())
+            .unwrap();
+        assert_eq!(
+            edit.session_id, None,
+            "an unattributed edit loses its composer"
+        );
     }
 
     /// An older entry that arrives later changes the base of a newer entry of
@@ -836,7 +879,10 @@ mod tests {
         let changed = store.commit();
 
         assert!(store.version() > v1);
-        assert!(changed.contains(&newer), "the base of the newer edit changed");
+        assert!(
+            changed.contains(&newer),
+            "the base of the newer edit changed"
+        );
         let wire = store.wire(store.index_of(&newer).unwrap());
         assert_eq!(wire.base_path, Some(PathBuf::from("/snap/1")));
 
@@ -848,7 +894,10 @@ mod tests {
 
     #[test]
     fn an_archived_session_gives_its_entries_a_new_version() {
-        let mut store = Store::from_entries(vec![prompt_entry("one", "s1", 5), prompt_entry("two", "s2", 1)]);
+        let mut store = Store::from_entries(vec![
+            prompt_entry("one", "s1", 5),
+            prompt_entry("two", "s2", 1),
+        ]);
         let v1 = store.version();
 
         store.set_archived_sessions(HashSet::from(["s1".to_string()]));
@@ -860,7 +909,10 @@ mod tests {
         assert_eq!(wire.session_id.as_deref(), Some("s1"));
         assert!(wire.session_archived);
         let agents = store.agents(None);
-        let archived: Vec<(&str, bool)> = agents.iter().map(|a| (a.session_id.as_str(), a.archived)).collect();
+        let archived: Vec<(&str, bool)> = agents
+            .iter()
+            .map(|a| (a.session_id.as_str(), a.archived))
+            .collect();
         assert_eq!(archived, vec![("s2", false), ("s1", true)]);
 
         // A restore: the next load sends a set without s1.
@@ -872,7 +924,10 @@ mod tests {
     fn since_returns_the_changed_entries_and_the_removed_ids() {
         let mut store = Store::from_entries(vec![prompt_entry("one", "s1", 5)]);
         let v1 = store.version();
-        store.merge(vec![prompt_entry("two", "s2", 1), nvim_entry("/dev/proj/a.rs", "/snap/1", 2)]);
+        store.merge(vec![
+            prompt_entry("two", "s2", 1),
+            nvim_entry("/dev/proj/a.rs", "/snap/1", 2),
+        ]);
         store.commit();
 
         let filter = Filter {
@@ -891,7 +946,11 @@ mod tests {
             .map(|e| e.prompt_text().unwrap().to_string())
             .collect();
         assert_eq!(texts, vec!["two"], "only the new prompt");
-        assert_eq!(delta.removed.len(), 1, "the new edit does not pass the filter");
+        assert_eq!(
+            delta.removed.len(),
+            1,
+            "the new edit does not pass the filter"
+        );
 
         let full = store.history(&filter, &Page::default());
         assert_eq!(full.groups.len(), 2);
@@ -926,7 +985,10 @@ mod tests {
         assert_eq!(keys.len(), 1, "the entries share one vector key");
 
         store.merge(vec![first]);
-        assert!(store.commit().is_empty(), "a later identical copy changes nothing");
+        assert!(
+            store.commit().is_empty(),
+            "a later identical copy changes nothing"
+        );
         assert_eq!(store.len(), 3);
     }
 

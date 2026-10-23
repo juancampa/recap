@@ -81,7 +81,9 @@ mod tests {
     fn a_path_is_in_one_of_the_protected_folders() {
         let home = PathBuf::from(std::env::var("HOME").unwrap());
         assert!(in_protected_folder(&home.join("Downloads/a.txt")));
-        assert!(in_protected_folder(&home.join("Library/Mobile Documents/x/b.sh")));
+        assert!(in_protected_folder(
+            &home.join("Library/Mobile Documents/x/b.sh")
+        ));
         assert!(in_protected_folder(Path::new("/Volumes/usb/c.rs")));
         assert!(!in_protected_folder(&home.join("git/recap/src/main.rs")));
         assert!(!in_protected_folder(&home.join("DownloadsOld/a.txt")));

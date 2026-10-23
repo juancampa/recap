@@ -40,7 +40,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::history::{find_project_chain, HistoryEntry};
+use crate::history::{HistoryEntry, find_project_chain};
 use recap_api::{EditSource, EntryKind};
 
 #[derive(Debug, Deserialize)]
@@ -132,7 +132,11 @@ pub fn load(
     let mut chain_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
     let all = transcripts(projects_dir, archive_dir);
-    let archived: HashSet<String> = all.iter().filter(|t| t.archived).map(|t| t.id.clone()).collect();
+    let archived: HashSet<String> = all
+        .iter()
+        .filter(|t| t.archived)
+        .map(|t| t.id.clone())
+        .collect();
 
     let mut sessions: Vec<(Transcript, SystemTime)> = Vec::new();
     for t in all {
@@ -155,9 +159,16 @@ pub fn load(
     for (t, mtime) in sessions {
         let mut batch: Vec<HistoryEntry> = Vec::new();
         let mut facts = SessionFacts::default();
-        let loaded = t
-            .read()
-            .and_then(|content| load_session(&t.id, &content, &mut batch, &mut chain_cache, seen_keys, &mut facts));
+        let loaded = t.read().and_then(|content| {
+            load_session(
+                &t.id,
+                &content,
+                &mut batch,
+                &mut chain_cache,
+                seen_keys,
+                &mut facts,
+            )
+        });
         if let Err(e) = loaded {
             log::warn!("skipped session {}: {e}", t.path.display());
         }
@@ -302,7 +313,11 @@ fn transcripts(projects_dir: &Path, archive_dir: &Path) -> Vec<Transcript> {
     let mut out = Vec::new();
     for (root, suffix, archived) in [
         (projects_dir, TRANSCRIPT_SUFFIX.to_string(), false),
-        (archive_dir, format!("{TRANSCRIPT_SUFFIX}{ARCHIVE_SUFFIX}"), true),
+        (
+            archive_dir,
+            format!("{TRANSCRIPT_SUFFIX}{ARCHIVE_SUFFIX}"),
+            true,
+        ),
     ] {
         let Ok(read) = fs::read_dir(root) else {
             continue;
@@ -323,14 +338,28 @@ fn transcripts(projects_dir: &Path, archive_dir: &Path) -> Vec<Transcript> {
                 if !path.is_file() {
                     continue;
                 }
-                let Some(id) = f.file_name().to_str().and_then(|n| n.strip_suffix(&suffix)).map(str::to_string)
+                let Some(id) = f
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(&suffix))
+                    .map(str::to_string)
                 else {
                     continue;
                 };
-                if archived && projects_dir.join(&project).join(format!("{id}{TRANSCRIPT_SUFFIX}")).exists() {
+                if archived
+                    && projects_dir
+                        .join(&project)
+                        .join(format!("{id}{TRANSCRIPT_SUFFIX}"))
+                        .exists()
+                {
                     continue;
                 }
-                out.push(Transcript { project: project.clone(), id, path, archived });
+                out.push(Transcript {
+                    project: project.clone(),
+                    id,
+                    path,
+                    archived,
+                });
             }
         }
     }
@@ -369,7 +398,10 @@ fn add_dir_files(root: &Path, dir: &Path, suffix: &str, out: &mut Vec<PathBuf>) 
         if kind.is_dir() {
             add_dir_files(root, &rel, suffix, out);
         } else if kind.is_file()
-            && let Some(name) = item.file_name().to_str().and_then(|n| n.strip_suffix(suffix))
+            && let Some(name) = item
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(suffix))
         {
             out.push(dir.join(name));
         }
@@ -401,7 +433,10 @@ fn archive_session(projects_dir: &Path, archive_dir: &Path, project: &str, id: &
             fs::create_dir_all(parent)?;
         }
         crate::cache::write_atomic(&dst, &data)?;
-        fs::File::options().write(true).open(&dst)?.set_modified(mtime)?;
+        fs::File::options()
+            .write(true)
+            .open(&dst)?
+            .set_modified(mtime)?;
     }
     Ok(())
 }
@@ -423,13 +458,18 @@ pub fn restore_session(projects_dir: &Path, archive_dir: &Path, id: &str) -> Res
         if dst.exists() {
             continue;
         }
-        let data = zstd::decode_all(fs::File::open(archive_dir.join(with_suffix(&rel, ARCHIVE_SUFFIX)))?)?;
+        let data = zstd::decode_all(fs::File::open(
+            archive_dir.join(with_suffix(&rel, ARCHIVE_SUFFIX)),
+        )?)?;
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
         crate::cache::write_atomic(&dst, &data)?;
     }
-    log::info!("restored the archived Claude Code session {id} to {}", projects_dir.join(&t.project).display());
+    log::info!(
+        "restored the archived Claude Code session {id} to {}",
+        projects_dir.join(&t.project).display()
+    );
     Ok(())
 }
 
@@ -496,9 +536,14 @@ fn load_session(
         if l.kind.as_deref() != Some("system") || l.subtype.as_deref() != Some("away_summary") {
             return None;
         }
-        l.content.as_ref()?.as_str().filter(|t| !t.trim().is_empty())
+        l.content
+            .as_ref()?
+            .as_str()
+            .filter(|t| !t.trim().is_empty())
     }) {
-        facts.summaries.insert(session_id.clone(), summary.to_string());
+        facts
+            .summaries
+            .insert(session_id.clone(), summary.to_string());
     }
 
     // The lines that Claude Code copied from the parent session. The loop
@@ -643,8 +688,14 @@ fn load_session(
                     Some(state.insert(file_path.clone(), content))
                 }
                 "Edit" => {
-                    let old = input.get("old_string").and_then(|s| s.as_str()).unwrap_or("");
-                    let new = input.get("new_string").and_then(|s| s.as_str()).unwrap_or("");
+                    let old = input
+                        .get("old_string")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
+                    let new = input
+                        .get("new_string")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     let replace_all = input
                         .get("replace_all")
                         .and_then(|b| b.as_bool())
@@ -660,14 +711,26 @@ fn load_session(
                         .unwrap_or_default();
                     let mut first: Option<String> = None;
                     for edit in edits {
-                        let old = edit.get("old_string").and_then(|s| s.as_str()).unwrap_or("");
-                        let new = edit.get("new_string").and_then(|s| s.as_str()).unwrap_or("");
+                        let old = edit
+                            .get("old_string")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        let new = edit
+                            .get("new_string")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
                         let replace_all = edit
                             .get("replace_all")
                             .and_then(|b| b.as_bool())
                             .unwrap_or(false);
-                        let before =
-                            apply_edit(&mut state, &read_results, &file_path, old, new, replace_all);
+                        let before = apply_edit(
+                            &mut state,
+                            &read_results,
+                            &file_path,
+                            old,
+                            new,
+                            replace_all,
+                        );
                         if first.is_none() {
                             first = before;
                         }
@@ -683,8 +746,12 @@ fn load_session(
             if copied {
                 continue;
             }
-            let Some(ts_str) = &line.timestamp else { continue };
-            let Ok(ts) = DateTime::parse_from_rfc3339(ts_str) else { continue };
+            let Some(ts_str) = &line.timestamp else {
+                continue;
+            };
+            let Ok(ts) = DateTime::parse_from_rfc3339(ts_str) else {
+                continue;
+            };
             let timestamp: DateTime<Local> = ts.with_timezone(&Local);
 
             let uuid = line
@@ -830,7 +897,15 @@ fn extract_prompt(
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Option<HistoryEntry> {
     let text = user_text(line)?;
-    conversation_entry(line, session_id, chain_cache, EntryKind::Prompt { text, response: None })
+    conversation_entry(
+        line,
+        session_id,
+        chain_cache,
+        EntryKind::Prompt {
+            text,
+            response: None,
+        },
+    )
 }
 
 /// Make a `Compaction` entry from the user line that holds the summary of a
@@ -841,7 +916,12 @@ fn extract_compaction(
     chain_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
 ) -> Option<HistoryEntry> {
     let summary = user_text(line)?;
-    conversation_entry(line, session_id, chain_cache, EntryKind::Compaction { summary })
+    conversation_entry(
+        line,
+        session_id,
+        chain_cache,
+        EntryKind::Compaction { summary },
+    )
 }
 
 /// An entry of the kind `kind` at the time and in the directory of `line`.
@@ -906,7 +986,11 @@ fn apply_edit(
 ) -> Option<String> {
     if old.is_empty() {
         // Edit semantics for empty old_string is "create file" — match Write.
-        return Some(state.insert(file_path.to_path_buf(), new.to_string()).unwrap_or_default());
+        return Some(
+            state
+                .insert(file_path.to_path_buf(), new.to_string())
+                .unwrap_or_default(),
+        );
     }
     let stale = !state.get(file_path).is_some_and(|c| c.contains(old));
     if stale {
@@ -996,7 +1080,11 @@ mod tests {
     }
 
     fn assistant_text(uuid: &str, text: &str) -> String {
-        line("assistant", uuid, serde_json::json!([{ "type": "text", "text": text }]))
+        line(
+            "assistant",
+            uuid,
+            serde_json::json!([{ "type": "text", "text": text }]),
+        )
     }
 
     fn assistant_tool(uuid: &str) -> String {
@@ -1029,7 +1117,15 @@ mod tests {
         let mut chain_cache = HashMap::new();
         let mut facts = SessionFacts::default();
         let mut seen = HashSet::new();
-        load_session("titled", &lines.join("\n"), &mut out, &mut chain_cache, &mut seen, &mut facts).unwrap();
+        load_session(
+            "titled",
+            &lines.join("\n"),
+            &mut out,
+            &mut chain_cache,
+            &mut seen,
+            &mut facts,
+        )
+        .unwrap();
         assert_eq!(
             facts.titles.get("titled").map(String::as_str),
             Some("Page embed argument handling")
@@ -1041,7 +1137,8 @@ mod tests {
     #[test]
     fn the_last_away_summary_line_summarizes_the_session() {
         let summary = |text: &str| {
-            serde_json::json!({ "type": "system", "subtype": "away_summary", "content": text }).to_string()
+            serde_json::json!({ "type": "system", "subtype": "away_summary", "content": text })
+                .to_string()
         };
         let lines = vec![
             summary("I read the loader."),
@@ -1059,7 +1156,10 @@ mod tests {
             &mut facts,
         )
         .unwrap();
-        assert_eq!(facts.summaries.get("summarized").map(String::as_str), Some("I added the archive."));
+        assert_eq!(
+            facts.summaries.get("summarized").map(String::as_str),
+            Some("I added the archive.")
+        );
     }
 
     /// Load `lines` as the session `name`. Each test uses its own name,
@@ -1077,7 +1177,15 @@ mod tests {
         let mut out = Vec::new();
         let mut chain_cache = HashMap::new();
         let mut facts = SessionFacts::default();
-        load_session(name, &lines.join("\n"), &mut out, &mut chain_cache, seen, &mut facts).unwrap();
+        load_session(
+            name,
+            &lines.join("\n"),
+            &mut out,
+            &mut chain_cache,
+            seen,
+            &mut facts,
+        )
+        .unwrap();
         (out, facts)
     }
 
@@ -1128,7 +1236,11 @@ mod tests {
 
         // Nothing changed: the prompt is not emitted a third time.
         let third = load_lines("rescan", &lines, &mut seen);
-        assert_eq!(third.len(), 1, "a prompt with a response is emitted on every scan");
+        assert_eq!(
+            third.len(),
+            1,
+            "a prompt with a response is emitted on every scan"
+        );
     }
 
     fn edit_tool(uuid: &str, id: &str, path: &str, old: &str, new: &str) -> String {
@@ -1159,7 +1271,10 @@ mod tests {
             user("u1", "fix the bug"),
             assistant_tool("a1"),
             with_fields(
-                user("c1", "This session is being continued from a previous conversation."),
+                user(
+                    "c1",
+                    "This session is being continued from a previous conversation.",
+                ),
                 serde_json::json!({ "isCompactSummary": true }),
             ),
             assistant_text("a2", "Done."),
@@ -1170,9 +1285,13 @@ mod tests {
             kinds,
             vec![
                 &EntryKind::Compaction {
-                    summary: "This session is being continued from a previous conversation.".to_string()
+                    summary: "This session is being continued from a previous conversation."
+                        .to_string()
                 },
-                &EntryKind::Prompt { text: "fix the bug".to_string(), response: Some("Done.".to_string()) },
+                &EntryKind::Prompt {
+                    text: "fix the bug".to_string(),
+                    response: Some("Done.".to_string())
+                },
             ]
         );
     }
@@ -1203,7 +1322,10 @@ mod tests {
             with_fields(edit_tool("a3", "t2", &path, "b", "c"), child),
         ];
         let (out, facts) = load_lines_with_facts("copied", &lines, &mut HashSet::new());
-        assert_eq!(facts.parents.get("copied").map(String::as_str), Some("parent"));
+        assert_eq!(
+            facts.parents.get("copied").map(String::as_str),
+            Some("parent")
+        );
         assert_eq!(out.len(), 2, "{out:?}");
         // The loader emits a prompt when its turn closes, after its edits.
         assert_eq!(out[1].prompt_text(), Some("again"));
@@ -1226,7 +1348,13 @@ mod tests {
         let lines = vec![
             user("u1", "edit twice"),
             edit_tool("a1", "t1", &path, "fn one() {}", "fn one() { 1 }"),
-            edit_tool("a2", "t2", &path, "fn bash_added() {}", "fn bash_added() { 2 }"),
+            edit_tool(
+                "a2",
+                "t2",
+                &path,
+                "fn bash_added() {}",
+                "fn bash_added() { 2 }",
+            ),
         ];
         let out = load_lines("stale", &lines, &mut HashSet::new());
         let edits: Vec<&HistoryEntry> = out.iter().filter(|e| !e.is_prompt()).collect();
@@ -1255,11 +1383,22 @@ mod tests {
     fn load_prompts(projects: &Path, archive: &Path) -> (Vec<String>, HashSet<String>) {
         let mut prompts = Vec::new();
         let mut on_batch = |batch: Vec<HistoryEntry>, _facts: SessionFacts| -> bool {
-            prompts.extend(batch.iter().filter_map(|e| e.prompt_text().map(str::to_string)));
+            prompts.extend(
+                batch
+                    .iter()
+                    .filter_map(|e| e.prompt_text().map(str::to_string)),
+            );
             true
         };
-        let archived =
-            load(projects, archive, &mut HashMap::new(), &mut HashSet::new(), None, &mut on_batch).unwrap();
+        let archived = load(
+            projects,
+            archive,
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+            None,
+            &mut on_batch,
+        )
+        .unwrap();
         (prompts, archived)
     }
 
@@ -1268,12 +1407,17 @@ mod tests {
     /// same files back.
     #[test]
     fn a_deleted_session_loads_from_the_archive_and_restores() {
-        let root = std::env::temp_dir().join(format!("recap-claude-archive-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("recap-claude-archive-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let projects = root.join("projects");
         let archive = root.join("archive");
         let project = projects.join("-tmp-proj");
-        let transcript = [user("u1", "archive me"), bash_tool("a1", "sed -i s/a/b/ x.rs")].join("\n");
+        let transcript = [
+            user("u1", "archive me"),
+            bash_tool("a1", "sed -i s/a/b/ x.rs"),
+        ]
+        .join("\n");
         fs::create_dir_all(project.join("s1/subagents")).unwrap();
         fs::write(project.join("s1.jsonl"), &transcript).unwrap();
         fs::write(project.join("s1/subagents/agent-a.jsonl"), "subagent").unwrap();
@@ -1282,7 +1426,11 @@ mod tests {
         assert_eq!(prompts, vec!["archive me"]);
         assert!(archived.is_empty());
         assert!(archive.join("-tmp-proj/s1.jsonl.zst").is_file());
-        assert!(archive.join("-tmp-proj/s1/subagents/agent-a.jsonl.zst").is_file());
+        assert!(
+            archive
+                .join("-tmp-proj/s1/subagents/agent-a.jsonl.zst")
+                .is_file()
+        );
 
         // Claude Code deletes the session.
         fs::remove_dir_all(&project).unwrap();
@@ -1294,18 +1442,28 @@ mod tests {
         assert_eq!(bash[0].session_id, "s1");
 
         restore_session(&projects, &archive, "s1").unwrap();
-        assert_eq!(fs::read_to_string(project.join("s1.jsonl")).unwrap(), transcript);
-        assert_eq!(fs::read_to_string(project.join("s1/subagents/agent-a.jsonl")).unwrap(), "subagent");
+        assert_eq!(
+            fs::read_to_string(project.join("s1.jsonl")).unwrap(),
+            transcript
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("s1/subagents/agent-a.jsonl")).unwrap(),
+            "subagent"
+        );
         let (_, archived) = load_prompts(&projects, &archive);
         assert!(archived.is_empty());
-        assert!(restore_session(&projects, &archive, "s1").is_err(), "a live session is not archived");
+        assert!(
+            restore_session(&projects, &archive, "s1").is_err(),
+            "a live session is not archived"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
     /// The restore never replaces a file that Claude Code wrote.
     #[test]
     fn a_restore_keeps_the_files_that_exist() {
-        let root = std::env::temp_dir().join(format!("recap-claude-restore-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("recap-claude-restore-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let projects = root.join("projects");
         let archive = root.join("archive");
@@ -1318,8 +1476,14 @@ mod tests {
         fs::remove_file(project.join("s2.jsonl")).unwrap();
         fs::write(project.join("s2/tool-results/r.txt"), "new").unwrap();
         restore_session(&projects, &archive, "s2").unwrap();
-        assert_eq!(fs::read_to_string(project.join("s2.jsonl")).unwrap(), user("u1", "hi"));
-        assert_eq!(fs::read_to_string(project.join("s2/tool-results/r.txt")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(project.join("s2.jsonl")).unwrap(),
+            user("u1", "hi")
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("s2/tool-results/r.txt")).unwrap(),
+            "new"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1340,14 +1504,24 @@ mod tests {
                     if e.response_text().is_some() {
                         with_response += 1;
                     }
-                    if e.prompt_text().is_some_and(|t| t.trim_start().starts_with('<')) {
+                    if e.prompt_text()
+                        .is_some_and(|t| t.trim_start().starts_with('<'))
+                    {
                         harness += 1;
                     }
                 }
             }
             true
         };
-        load(&dir, &archive_dir(), &mut mtimes, &mut seen, None, &mut on_batch).unwrap();
+        load(
+            &dir,
+            &archive_dir(),
+            &mut mtimes,
+            &mut seen,
+            None,
+            &mut on_batch,
+        )
+        .unwrap();
         eprintln!("prompts={prompts} with_response={with_response} tag-prefixed={harness}");
         assert!(with_response > 0);
     }

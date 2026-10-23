@@ -50,10 +50,12 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// The cache version of `root`.
 pub fn version(root: &Path) -> anyhow::Result<u32> {
     match fs::read_to_string(root.join(VERSION_FILE)) {
-        Ok(text) => text
-            .trim()
-            .parse()
-            .with_context(|| format!("{} is not a version number", root.join(VERSION_FILE).display())),
+        Ok(text) => text.trim().parse().with_context(|| {
+            format!(
+                "{} is not a version number",
+                root.join(VERSION_FILE).display()
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
         Err(e) => Err(e.into()),
     }
@@ -79,7 +81,10 @@ pub fn migrate(root: &Path) -> anyhow::Result<()> {
         })?;
         current += 1;
         write_atomic(&root.join(VERSION_FILE), format!("{current}\n").as_bytes())?;
-        log::info!("migrated the cache at {} to version {current}", root.display());
+        log::info!(
+            "migrated the cache at {} to version {current}",
+            root.display()
+        );
     }
     Ok(())
 }
@@ -135,7 +140,8 @@ pub fn copy_cache(from: &Path, to: &Path) -> anyhow::Result<()> {
     }
     let db = from.join("embeddings.db");
     if db.exists() {
-        let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let target = to.join("embeddings.db");
         conn.execute("VACUUM INTO ?1", [target.to_string_lossy()])
             .context("cannot copy embeddings.db")?;
@@ -185,7 +191,8 @@ fn relative_cache_paths(root: &Path) -> anyhow::Result<()> {
         if let Some(composers) = value.get_mut("composers").and_then(|c| c.as_object_mut()) {
             for composer in composers.values_mut() {
                 for list in ["prompts", "edits"] {
-                    let Some(entries) = composer.get_mut(list).and_then(|l| l.as_array_mut()) else {
+                    let Some(entries) = composer.get_mut(list).and_then(|l| l.as_array_mut())
+                    else {
                         continue;
                     };
                     for entry in entries {
@@ -209,7 +216,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("recap-cache-test-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("recap-cache-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -249,8 +257,10 @@ mod tests {
         )
         .unwrap();
         let key = format!("{}::{}", base.display(), snapshot.display());
-        conn.execute("INSERT INTO embedding VALUES (?1, 1, x'00')", [&key]).unwrap();
-        conn.execute("INSERT INTO embedding VALUES ('claude:s:u', 0, x'00')", []).unwrap();
+        conn.execute("INSERT INTO embedding VALUES (?1, 1, x'00')", [&key])
+            .unwrap();
+        conn.execute("INSERT INTO embedding VALUES ('claude:s:u', 0, x'00')", [])
+            .unwrap();
     }
 
     /// The migrations change a version 1 cache to the current version. The
@@ -272,7 +282,10 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         keys.sort();
-        assert_eq!(keys, vec!["claude:s:u".to_string(), "cursor/bb::cursor/aa".to_string()]);
+        assert_eq!(
+            keys,
+            vec!["claude:s:u".to_string(), "cursor/bb::cursor/aa".to_string()]
+        );
 
         let sessions: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("cursor/sessions.json")).unwrap()).unwrap();
@@ -280,7 +293,10 @@ mod tests {
         let edit = &sessions["composers"]["c1"]["edits"][0];
         assert_eq!(edit["snapshot_path"], "cursor/aa");
         assert_eq!(edit["base_path"], "cursor/bb");
-        assert_eq!(sessions["composers"]["c1"]["prompts"][0]["snapshot_path"], "");
+        assert_eq!(
+            sessions["composers"]["c1"]["prompts"][0]["snapshot_path"],
+            ""
+        );
 
         // A second start finds the current version and changes nothing.
         migrate(&root).unwrap();

@@ -8,7 +8,7 @@
 
 use crate::embed::{EmbedClient, EmbedConfig, EmbedDb, EmbedIndex, EmbedKind, EmbedServer};
 use crate::history::HistoryEntry;
-use crate::store::{entry_key, Store};
+use crate::store::{Store, entry_key};
 use recap_api::{DiffLine, EmbedStatus, EntryFields, EntryKind};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -290,7 +290,9 @@ impl Embedder {
                     }
                 }
             } else {
-                log::info!("embedding: a model server already answers on its port. The server uses it");
+                log::info!(
+                    "embedding: a model server already answers on its port. The server uses it"
+                );
             }
             self.client = Some(client);
         }
@@ -319,7 +321,11 @@ impl Embedder {
             "embedding: {} round started: {} entries without a vector{}",
             if first_round { "first" } else { "next" },
             self.total,
-            if first_round { " (the stored vectors are not read yet)" } else { "" }
+            if first_round {
+                " (the stored vectors are not read yet)"
+            } else {
+                ""
+            }
         );
         std::thread::spawn(move || run_indexer(cfg, client, jobs, first_round, tx));
         self.status() != before

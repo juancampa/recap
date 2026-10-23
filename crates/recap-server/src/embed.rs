@@ -21,7 +21,7 @@
 //!   token-bound at about 7000 tokens per second, whatever the slot count.
 //! - `-ngl 99`, which puts all layers on the Metal GPU.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -44,8 +44,7 @@ pub const BATCH: usize = 16;
 
 /// Prefix that Qwen3-Embedding expects on the query side. The document side
 /// stays unchanged; the model is asymmetric.
-const QUERY_INSTRUCT: &str =
-    "Instruct: Given a search query, retrieve the developer prompts or code changes that answer it\nQuery: ";
+const QUERY_INSTRUCT: &str = "Instruct: Given a search query, retrieve the developer prompts or code changes that answer it\nQuery: ";
 
 /// Which corpus a stored vector belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,8 +170,12 @@ impl EmbedServer {
     /// Start the server. Returns as soon as the process spawns; the caller
     /// polls [`EmbedClient::wait_ready`] for the model load.
     pub fn spawn(cfg: &EmbedConfig) -> Result<EmbedServer> {
-        let bin = which(&cfg.llama_server_bin)
-            .ok_or_else(|| anyhow!("llama-server not found at {}", cfg.llama_server_bin.display()))?;
+        let bin = which(&cfg.llama_server_bin).ok_or_else(|| {
+            anyhow!(
+                "llama-server not found at {}",
+                cfg.llama_server_bin.display()
+            )
+        })?;
         let child = Command::new(bin)
             .arg("-m")
             .arg(&cfg.model_path)
@@ -303,7 +306,10 @@ impl EmbedClient {
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); texts.len()];
         for datum in resp.data {
             if datum.index >= out.len() {
-                return Err(anyhow!("server returned index {} out of range", datum.index));
+                return Err(anyhow!(
+                    "server returned index {} out of range",
+                    datum.index
+                ));
             }
             if datum.embedding.len() < self.dims {
                 return Err(anyhow!(
@@ -415,7 +421,10 @@ impl EmbedDb {
                 [&want],
             )?;
         }
-        Ok(EmbedDb { conn, dims: cfg.dims })
+        Ok(EmbedDb {
+            conn,
+            dims: cfg.dims,
+        })
     }
 
     /// Read every vector into memory.
@@ -454,9 +463,8 @@ impl EmbedDb {
     pub fn insert_batch(&mut self, rows: &[(String, EmbedKind, Vec<f32>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO embedding (key, kind, vec) VALUES (?1, ?2, ?3)",
-            )?;
+            let mut stmt = tx
+                .prepare("INSERT OR REPLACE INTO embedding (key, kind, vec) VALUES (?1, ?2, ?3)")?;
             for (key, kind, vec) in rows {
                 stmt.execute(rusqlite::params![key, *kind as i64, encode_vec(vec)])?;
             }
@@ -595,8 +603,14 @@ mod tests {
     #[test]
     fn a_closed_port_reports_the_transport_error() {
         // Port 9 is the discard port. Nothing answers there.
-        let cfg = EmbedConfig { port: 9, ..EmbedConfig::default() };
-        let err = EmbedClient::new(&cfg).embed_query("x").unwrap_err().to_string();
+        let cfg = EmbedConfig {
+            port: 9,
+            ..EmbedConfig::default()
+        };
+        let err = EmbedClient::new(&cfg)
+            .embed_query("x")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("cannot reach the server"), "{err}");
     }
 
@@ -621,7 +635,9 @@ mod tests {
                 "recipe for sourdough bread".to_string(),
             ])
             .unwrap();
-        let q = client.embed_query("how do i retry a failed network call").unwrap();
+        let q = client
+            .embed_query("how do i retry a failed network call")
+            .unwrap();
         assert_eq!(docs[0].len(), cfg.dims);
         assert!(cosine(&q, &docs[0]) > cosine(&q, &docs[1]));
     }

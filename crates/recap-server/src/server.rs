@@ -210,7 +210,10 @@ impl Server {
     /// Log a complete load. A load that changed nothing is a `debug` line,
     /// because the manager starts one load every poll interval.
     fn log_load(&self, stats: &LoadStats, first_load: bool) {
-        let elapsed = stats.started.map(|s| crate::logger::ms(s.elapsed())).unwrap_or_default();
+        let elapsed = stats
+            .started
+            .map(|s| crate::logger::ms(s.elapsed()))
+            .unwrap_or_default();
         let (version, total) = {
             let store = read(&self.inner.store);
             (store.version(), store.len())
@@ -380,9 +383,19 @@ impl Server {
             let sessions = scan.list();
             let ids: Vec<String> = sessions
                 .iter()
-                .map(|s| format!("{} {}", &s.session_id[..8.min(s.session_id.len())], s.status.as_deref().unwrap_or("-")))
+                .map(|s| {
+                    format!(
+                        "{} {}",
+                        &s.session_id[..8.min(s.session_id.len())],
+                        s.status.as_deref().unwrap_or("-")
+                    )
+                })
                 .collect();
-            log::info!("running Claude Code sessions: {} [{}]", sessions.len(), ids.join(", "));
+            log::info!(
+                "running Claude Code sessions: {} [{}]",
+                sessions.len(),
+                ids.join(", ")
+            );
             *running = scan;
             drop(running);
             self.send(Event::Running { sessions });
@@ -404,10 +417,16 @@ impl Server {
         let entry = &store.history.entries[idx];
         // The agent wrote the summary, so the summary shows as a response.
         if let Some(summary) = recap_api::EntryFields::compaction_summary(entry) {
-            return summary.lines().map(|l| DiffLine::Response(l.to_string())).collect();
+            return summary
+                .lines()
+                .map(|l| DiffLine::Response(l.to_string()))
+                .collect();
         }
         if let Some(text) = recap_api::EntryFields::prompt_text(entry) {
-            let mut lines: Vec<DiffLine> = text.lines().map(|l| DiffLine::Prompt(l.to_string())).collect();
+            let mut lines: Vec<DiffLine> = text
+                .lines()
+                .map(|l| DiffLine::Prompt(l.to_string()))
+                .collect();
             if lines.is_empty() {
                 lines.push(DiffLine::Prompt(String::new()));
             }
@@ -553,7 +572,11 @@ impl Api for Server {
             });
             out.insert(id.clone(), summary);
         }
-        log::debug!("summaries: {} asked, {computed} calculated, {} from the cache", ids.len(), ids.len() - computed);
+        log::debug!(
+            "summaries: {} asked, {computed} calculated, {} from the cache",
+            ids.len(),
+            ids.len() - computed
+        );
         Ok(out)
     }
 
@@ -574,7 +597,9 @@ impl Api for Server {
                 let Some(client) = lock(&self.inner.embed).client.clone() else {
                     let status = lock(&self.inner.embed).status();
                     log::warn!("search semantic {query:?}: not available: {status:?}");
-                    return Err(ApiError(format!("semantic search is not available: {status:?}")));
+                    return Err(ApiError(format!(
+                        "semantic search is not available: {status:?}"
+                    )));
                 };
                 // The model server needs a few seconds to load the model. A
                 // query before that gets a refused connection, so wait here.
@@ -597,7 +622,15 @@ impl Api for Server {
                 search::semantic_matches(&store, &embed.index, filter, &query_vec)
             }
         };
-        log_search(kind, query, filter, matches.len(), &scan, started.elapsed(), embed_time);
+        log_search(
+            kind,
+            query,
+            filter,
+            matches.len(),
+            &scan,
+            started.elapsed(),
+            embed_time,
+        );
         Ok(SearchResponse {
             version: read(&self.inner.store).version(),
             matches,
