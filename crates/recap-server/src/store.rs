@@ -571,6 +571,10 @@ impl Store {
     pub fn agents(&self, project: Option<&Path>) -> Vec<Agent> {
         let mut order: Vec<&str> = Vec::new();
         let mut by_id: HashMap<&str, Agent> = HashMap::new();
+        // The oldest prompt and the newest response of each chain. The loop
+        // converts them to one line only after it finds the final values.
+        let mut first_prompts: HashMap<&str, &HistoryEntry> = HashMap::new();
+        let mut last_responses: HashMap<&str, &str> = HashMap::new();
         for e in &self.history.entries {
             let Some(sid) = e.session_id.as_deref() else {
                 continue;
@@ -592,10 +596,17 @@ impl Store {
                     archived: self.is_archived(Some(sid)),
                     last_ts: e.timestamp,
                     prompt_count: 0,
+                    entry_count: 0,
                     project_roots: e.project_roots.clone(),
+                    first_prompt: String::new(),
+                    first_ordinal: None,
                     last_prompt: String::new(),
+                    last_ordinal: None,
+                    summary: None,
+                    last_response: None,
                 }
             });
+            agent.entry_count += 1;
             // The first entry of a subagent session made the agent. Take the
             // session and the title again from the first entry of a session
             // that is not a subagent.
@@ -614,19 +625,36 @@ impl Store {
                     // The newest prompt also gives the agent its display
                     // time, which the user reads as "when the agent last ran".
                     agent.last_ts = e.timestamp;
-                    agent.last_prompt = recap_api::single_line(text);
+                    agent.last_prompt = agent_line(text);
+                    agent.last_ordinal = self.ordinal(e);
                     if agent.project_roots.is_empty() {
                         agent.project_roots = e.project_roots.clone();
                     }
                 }
                 agent.prompt_count += 1;
+                first_prompts.insert(chain, e);
+                if let Some(response) = e.response_text() {
+                    last_responses.entry(chain).or_insert(response);
+                }
             }
         }
         let mut agents: Vec<Agent> = order
             .into_iter()
             .filter_map(|id| by_id.remove(id))
             .collect();
-        agents.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        for agent in &mut agents {
+            let chain = agent.chain_id.as_str();
+            if let Some(e) = first_prompts.get(chain) {
+                agent.first_prompt = agent_line(e.prompt_text().unwrap_or(""));
+                agent.first_ordinal = self.ordinal(e);
+            }
+            agent.last_response = last_responses.get(chain).map(|r| agent_line(r));
+            agent.summary = self
+                .session_summaries
+                .get(&agent.session_id)
+                .map(|s| agent_line(s));
+        }
+        agents.sort_by(Agent::order);
         agents
     }
 
@@ -778,6 +806,10 @@ mod tests {
             ("parent".to_string(), "Main".to_string()),
             ("sub2".to_string(), "Review".to_string()),
         ]);
+        store.extend_summaries([
+            ("parent".to_string(), "Built it.".to_string()),
+            ("sub2".to_string(), "Reviewed it.".to_string()),
+        ]);
         store.commit();
 
         let agents = store.agents(None);
@@ -787,7 +819,12 @@ mod tests {
         assert_eq!(agent.session_id, "parent");
         assert_eq!(agent.title.as_deref(), Some("Main"));
         assert_eq!(agent.prompt_count, 2);
+        assert_eq!(agent.entry_count, 4);
+        assert_eq!(agent.first_prompt, "plan it");
         assert_eq!(agent.last_prompt, "now build it");
+        assert_eq!(agent.first_ordinal, Some(1));
+        assert_eq!(agent.last_ordinal, Some(2));
+        assert_eq!(agent.summary.as_deref(), Some("Built it."));
 
         let rows: Vec<(String, Option<usize>, bool)> = store
             .filtered(&Filter {

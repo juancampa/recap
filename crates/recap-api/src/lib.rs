@@ -995,8 +995,14 @@ mod tests {
                 archived: false,
                 last_ts: entry.timestamp,
                 prompt_count: 1,
+                entry_count: 3,
                 project_roots: vec![],
+                first_prompt: "plan the fix".to_string(),
+                first_ordinal: Some(1),
                 last_prompt: "fix the bug".to_string(),
+                last_ordinal: Some(2),
+                summary: Some("I fixed the bug.".to_string()),
+                last_response: Some("Done.".to_string()),
             }],
         });
         round_trip(&vec![

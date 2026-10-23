@@ -153,6 +153,10 @@ const SUBAGENT_LABEL: &str = "[sub] ";
 /// Color of [`SUBAGENT_LABEL`]. The blue differs from the timestamp gray of
 /// the prompt count.
 const SUBAGENT_COLOR: Color = Color::Rgb(110, 170, 230);
+/// Color of the prompt count (the ordinal of a prompt in its session chain).
+/// The deep blue differs from the light blue of the response, and from the
+/// blue of [`SUBAGENT_COLOR`].
+const ORDINAL_COLOR: Color = Color::Rgb(80, 110, 230);
 /// The glyph of a session that Claude Code deleted and recap archived.
 const ARCHIVED_GLYPH: &str = "◌";
 
@@ -253,7 +257,7 @@ fn continuation_bar_span(session_id: Option<&str>, last: bool) -> Span<'static> 
 /// label, and the session bar. Kept in one place so the prompt-wrapping
 /// width used for row-height math ([`crate::app::App::recompute_row_heights`])
 /// matches what the renderer lays out. Column order doesn't affect the total.
-/// A prompt's `[N] ` count sits after this prefix; see
+/// A prompt's `N ` count sits after this prefix; see
 /// [`prompt_prefix_width`].
 pub fn history_prefix_cols(ts_width: usize, list_width: usize, settings: &Settings) -> usize {
     // leading(2) + ts + ' ' + change + ' ' + source + ' ' + title + ' ' + bar
@@ -329,12 +333,18 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 }
 
 /// Append the trailing session glyph flush against the right edge of a row
-/// of the given inner width: a green play glyph when the session runs, a gray
-/// dotted circle when the session is archived. No-op for the other states.
-fn append_run_state(spans: &mut Vec<Span<'static>>, inner_width: usize, state: RunState) {
+/// of the given inner width: the green `running_glyph` when the session
+/// runs, a gray dotted circle when the session is archived. No-op for the
+/// other states.
+fn append_run_state(
+    spans: &mut Vec<Span<'static>>,
+    inner_width: usize,
+    state: RunState,
+    running_glyph: &'static str,
+) {
     let glyph = match state {
         RunState::Running => Span::styled(
-            "▶",
+            running_glyph,
             Style::default()
                 .fg(RUNNING_COLOR)
                 .add_modifier(Modifier::BOLD),
@@ -468,12 +478,12 @@ fn dim_color(color: Color) -> Color {
     }
 }
 
-/// The label in front of the prompt text: `[N] ` for a user prompt with a
-/// count, [`SUBAGENT_LABEL`] for a subagent prompt. `None` for a prompt
+/// The label in front of the prompt text: `N ` for a user prompt with a
+/// count (in [`ORDINAL_COLOR`]), [`SUBAGENT_LABEL`] for a subagent prompt. `None` for a prompt
 /// without a session.
 fn prompt_prefix(ordinal: Option<usize>, subagent: bool) -> Option<String> {
     match ordinal {
-        Some(n) => Some(format!("[{}] ", n)),
+        Some(n) => Some(format!("{n} ")),
         None if subagent => Some(SUBAGENT_LABEL.to_string()),
         None => None,
     }
@@ -1313,7 +1323,7 @@ fn group_row_line(
         // The prompt count sits in front of the text, in the timestamp gray.
         // A subagent prompt has a label in its own color instead.
         let ord_width = prompt_prefix_width(ordinal, entry.subagent);
-        let ord_color = if entry.subagent { SUBAGENT_COLOR } else { time_color };
+        let ord_color = if entry.subagent { SUBAGENT_COLOR } else { ORDINAL_COLOR };
         let ord_span = prompt_prefix(ordinal, entry.subagent)
             .map(|label| Span::styled(label, Style::default().fg(ord_color)));
         // Column at which the prompt text begins on the first line.
@@ -1386,7 +1396,7 @@ fn group_row_line(
             }
             spans.extend(prompt_line_spans(seg, None));
             if i == 0 {
-                append_run_state(&mut spans, inner_width, run_state);
+                append_run_state(&mut spans, inner_width, run_state, "▶");
             }
             lines.push(Line::from(spans));
         }
@@ -1442,7 +1452,7 @@ fn group_row_line(
         spans.push(Span::styled(file_part.to_string(), file_base));
     }
 
-    append_run_state(&mut spans, inner_width, run_state);
+    append_run_state(&mut spans, inner_width, run_state, "▶");
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
     lines.extend(date_row);
     lines.push(Line::from(spans));
@@ -1997,9 +2007,83 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Render the Agents panel: one row per agent session, newest first. Each row
-/// carries the time of the agent's last prompt, its prompt count, its source,
-/// its project chain, and its last prompt. Agent mode only.
+/// The number of lines of one agent in the Agents panel.
+pub const AGENT_ROW_LINES: usize = 4;
+/// The number of screen lines of one agent in the Agents panel: the
+/// [`AGENT_ROW_LINES`] and one empty line after them.
+pub const AGENT_ROW_HEIGHT: usize = AGENT_ROW_LINES + 1;
+/// The widest metadata column of the Agents panel.
+const AGENT_META_MAX_WIDTH: usize = 24;
+/// The glyph of a running agent in the Agents panel. It is the same glyph as
+/// the "Still Running" line of the Selected box.
+const AGENT_RUNNING_GLYPH: &str = "●";
+/// The glyph in front of the last response of an agent. It points up to the
+/// count of the last prompt, as the turn of that prompt holds the response.
+const AGENT_RESPONSE_GLYPH: &str = "└";
+/// The glyph in front of the summary of an agent. A summary describes the
+/// full session, not only the last prompt.
+const AGENT_SUMMARY_GLYPH: &str = "Σ";
+
+/// The project chain of an agent, as the title line of its row shows it.
+pub fn agent_chain(agent: &Agent, names: &HashMap<PathBuf, String>) -> String {
+    let chain: Vec<String> = agent
+        .project_roots
+        .iter()
+        .map(|p| match names.get(p) {
+            Some(s) => s.clone(),
+            None => p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string(),
+        })
+        .collect();
+    if chain.is_empty() {
+        "—".to_string()
+    } else {
+        chain.join(&format!(" {PROJECT_ARROW} "))
+    }
+}
+
+/// The four content lines of an agent row, with their colors: the session
+/// title, the first prompt, the last prompt, and the summary (or the last
+/// response when the agent has no summary). The title has the session color,
+/// as in the title column of the History panel.
+pub fn agent_content(agent: &Agent) -> [(&str, Color); AGENT_ROW_LINES] {
+    // The first prompt line stays blank when the first prompt is also the
+    // last prompt.
+    let first_prompt = if agent.prompt_count > 1 { agent.first_prompt.as_str() } else { "" };
+    let tail = agent
+        .summary
+        .as_deref()
+        .or(agent.last_response.as_deref())
+        .unwrap_or("");
+    [
+        (agent.title.as_deref().unwrap_or(""), session_color(&agent.chain_id)),
+        (first_prompt, PROMPT_COLOR),
+        (agent.last_prompt.as_str(), PROMPT_COLOR),
+        (tail, RESPONSE_COLOR),
+    ]
+}
+
+/// Render the Agents panel, newest agent first. Each agent uses
+/// [`AGENT_ROW_LINES`] lines, and one empty line after them.
+///
+/// The title line uses the full width. It shows the session title in the
+/// color of the session chain, then the project chain, then the run state
+/// marker. The other three lines have three columns:
+///
+/// 1. The metadata: the time of the last prompt, and the source with the
+///    entry count.
+/// 2. The tree glyphs (`├`, `├`, `└`) in the color of the session chain.
+/// 3. The content: the first prompt, the last prompt with its count, and
+///    the summary (or the last response when the agent has no summary). The
+///    summary line starts with [`AGENT_SUMMARY_GLYPH`] and the response line
+///    with [`AGENT_RESPONSE_GLYPH`], under the last digit of the count.
+///
+/// When the user turns the date row on, the panel draws a date row above
+/// the first agent of each day, and a sticky date row at the top, as the
+/// History panel does.
 fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active_panel == Panel::Agents;
     let block = Block::default()
@@ -2013,90 +2097,173 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style(active))
         .style(Style::default().bg(PANEL_BG));
 
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     f.render_widget(block, area);
 
-    let visible = inner.height as usize;
     let inner_width = inner.width as usize;
     let first = app.agent_scroll.min(app.agents.len());
-    let last = (first + visible).min(app.agents.len());
+    let last = (first + app.agents_fit(first, inner.height as usize)).min(app.agents.len());
+    let today = Local::now().date_naive();
+
+    // The sticky date row: when the top agent has no date row of its own,
+    // the top line shows the day of the top agent.
+    if let Some(day) = app.agent_sticky_date()
+        && inner.height > 0
+    {
+        let top = Rect { height: 1, ..inner };
+        f.render_widget(Paragraph::new(date_row_line(day, today, inner_width)), top);
+        inner.y += 1;
+        inner.height -= 1;
+    }
     let sel = app.sel_agent_idx();
 
     let timestamps: Vec<DateTime<Local>> =
         app.agents[first..last].iter().map(|a| a.last_ts).collect();
     let formatted_ts = format_panel_timestamps(&timestamps, app.absolute_time);
-    let ts_width = formatted_ts.first().map(|s| s.chars().count()).unwrap_or(0);
+
+    let meta_width = (inner_width / 3).min(AGENT_META_MAX_WIDTH);
+    // The metadata column, one blank column, and the bar column.
+    let content_x = meta_width + 1 + BAR_COL_WIDTH;
+    let content_width = inner_width.saturating_sub(content_x + RUNNING_RESERVE).max(1);
+
+    let search_active = app.agent_search.shows_matches();
+    let match_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
 
     let items: Vec<ListItem> = (first..last)
         .map(|i| {
             let agent = &app.agents[i];
             let state = app.run_state_of(agent.source, Some(&agent.session_id), agent.archived);
 
-            let mut spans: Vec<Span<'static>> = Vec::with_capacity(10);
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("{:<w$}", formatted_ts.get(i - first).cloned().unwrap_or_default(), w = ts_width),
-                Style::default().fg(TIME_COLOR_RECENT),
-            ));
-            spans.push(Span::raw(" "));
-            // Prompt count, in the same column the History panel uses for its
-            // change counts.
-            spans.push(Span::styled(
-                format!("{:>w$}", agent.prompt_count, w = CHANGE_COL_WIDTH),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(" "));
-            let (label, _) = source_label(agent.source);
-            let src_color = shade_for(session_color(&agent.chain_id), state);
-            spans.push(Span::styled(
-                format!("{:<w$}", label, w = SOURCE_WIDTH),
-                Style::default().fg(src_color),
-            ));
-            spans.push(Span::raw(" "));
-            spans.push(session_bar_span(Some(&agent.chain_id), false));
+            let chain = agent_chain(agent, &app.view.project_names);
+            let (label, src_color) = source_label(agent.source);
+            let count = format!(
+                " {} {}",
+                agent.entry_count,
+                if agent.entry_count == 1 { "entry" } else { "entries" }
+            );
+            let label_width = label.chars().count().min(meta_width);
+            let meta: [Vec<Span<'static>>; AGENT_ROW_LINES - 1] = [
+                vec![Span::styled(
+                    fit_width(&formatted_ts.get(i - first).cloned().unwrap_or_default(), meta_width),
+                    Style::default().fg(TIME_COLOR_RECENT),
+                )],
+                vec![
+                    Span::styled(
+                        fit_width(label, label_width),
+                        Style::default().fg(shade_for(src_color, state)),
+                    ),
+                    Span::styled(
+                        fit_width(&count, meta_width - label_width),
+                        Style::default().fg(TIME_COLOR_RECENT),
+                    ),
+                ],
+                vec![Span::raw(" ".repeat(meta_width))],
+            ];
 
-            let chain: Vec<String> = agent
-                .project_roots
-                .iter()
-                .map(|p| match app.view.project_names.get(p) {
-                    Some(s) => s.clone(),
-                    None => p
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                })
-                .collect();
-            if !chain.is_empty() {
-                spans.push(Span::styled(
-                    format!("{} → ", chain.join(" → ")),
-                    Style::default().fg(Color::Gray),
-                ));
-            }
+            // The counts of the first and the last prompt, and the glyph
+            // under the last digit of the last count, on the line of the
+            // summary or the response. All the prefixes use the same width,
+            // so the texts start in the same column.
+            let first_ordinal = agent.first_ordinal.map(|n| n.to_string()).unwrap_or_default();
+            let last_ordinal = agent.last_ordinal.map(|n| n.to_string()).unwrap_or_default();
+            let tail_glyph = if agent.summary.is_some() {
+                AGENT_SUMMARY_GLYPH
+            } else {
+                AGENT_RESPONSE_GLYPH
+            };
+            let last_digits = last_ordinal.chars().count().max(1);
+            let prefix_width = first_ordinal.chars().count().max(last_digits) + 1;
+            let tail_prefix = format!("{:<prefix_width$}", format!("{tail_glyph:>last_digits$}"));
 
-            // The last prompt fills whatever room is left on the row, with
-            // the same Markdown highlighting the other panels apply.
-            let used = spans_width(&spans);
-            let budget = inner_width.saturating_sub(used + RUNNING_RESERVE).max(1);
-            let hl = prompt::highlight(&agent.last_prompt, PROMPT_COLOR);
-            let empty: Vec<prompt::Piece> = Vec::new();
-            let one = prompt::wrap_line(hl.first().unwrap_or(&empty), budget, false, 1);
-            spans.extend(prompt_line_spans(&one[0], None));
-            append_run_state(&mut spans, inner_width, state);
+            let [(title, title_color), first_line, last_line, tail_line] = agent_content(agent);
 
+            let is_match = search_active && app.agent_search.is_match(&agent.chain_id);
+            let highlight = app
+                .agent_search
+                .regex
+                .as_ref()
+                .filter(|_| is_match)
+                .map(|re| (re, match_style));
             let mut style = Style::default();
             if sel == Some(i) {
                 style = style.bg(SELECTED_BG);
+            } else if search_active && !is_match {
+                // While a search shows its matches, the other rows are dim, as
+                // in the Projects and Files panels.
+                style = style.add_modifier(Modifier::DIM);
             }
-            ListItem::new(Line::from(spans)).style(style)
+            let mut lines: Vec<Line> = Vec::with_capacity(AGENT_ROW_HEIGHT + 1);
+            if app.agent_starts_day(i) {
+                lines.push(date_row_line(agent.last_ts.date_naive(), today, inner_width));
+            }
+            // The title line: the session title and the project chain, cut
+            // with an ellipsis at the run state marker.
+            let mut title_pieces = Vec::with_capacity(3);
+            if !title.is_empty() {
+                title_pieces.push(prompt::Piece {
+                    text: format!("{title} "),
+                    style: Style::default().fg(title_color),
+                });
+            }
+            title_pieces.push(prompt::Piece {
+                text: chain,
+                style: Style::default().fg(Color::Gray),
+            });
+            let title_width = inner_width.saturating_sub(RUNNING_RESERVE).max(1);
+            let one = prompt::wrap_line(&title_pieces, title_width, false, 1);
+            let mut spans = prompt_line_spans(&one[0], highlight);
+            append_run_state(&mut spans, inner_width, state, AGENT_RUNNING_GLYPH);
+            lines.push(Line::from(spans).style(style));
+
+            lines.extend(meta
+                .into_iter()
+                .zip([first_line, last_line, tail_line])
+                .enumerate()
+                .map(|(idx, (meta_spans, (text, color)))| {
+                    // The title line is line 0.
+                    let line_idx = idx + 1;
+                    let mut spans: Vec<Span<'static>> = Vec::with_capacity(12);
+                    spans.extend(meta_spans);
+                    spans.push(Span::raw(" "));
+                    let mut width = content_width;
+                    let glyph = if line_idx == AGENT_ROW_LINES - 1 { TREE_END } else { TREE_BRANCH };
+                    spans.push(Span::styled(
+                        format!("{glyph} "),
+                        Style::default()
+                            .fg(session_color(&agent.chain_id))
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    let prefix = match line_idx {
+                        1 if !text.is_empty() => {
+                            Some((format!("{first_ordinal:<prefix_width$}"), ORDINAL_COLOR))
+                        }
+                        2 => Some((format!("{last_ordinal:<prefix_width$}"), ORDINAL_COLOR)),
+                        3 if !text.is_empty() => Some((tail_prefix.clone(), TIME_COLOR_RECENT)),
+                        _ => None,
+                    };
+                    if let Some((prefix, color)) = prefix {
+                        spans.push(Span::styled(prefix, Style::default().fg(color)));
+                        width = width.saturating_sub(prefix_width).max(1);
+                    }
+                    let hl = prompt::highlight(text, color);
+                    let empty: Vec<prompt::Piece> = Vec::new();
+                    let one = prompt::wrap_line(hl.first().unwrap_or(&empty), width, false, 1);
+                    spans.extend(prompt_line_spans(&one[0], highlight));
+                    Line::from(spans).style(style)
+                }));
+            // The empty line keeps the panel background, also for the
+            // selected agent.
+            lines.push(Line::default());
+            ListItem::new(lines)
         })
         .collect();
 
     f.render_widget(List::new(items), inner);
 
-    if app.agents.len() > visible {
+    if last - first < app.agents.len() {
         let mut sb = ScrollbarState::new(app.agents.len()).position(app.agent_scroll);
         f.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
@@ -2453,7 +2620,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                             .fg(if is_selected { Color::White } else { Color::Gray })
                     };
                     spans.push(Span::styled(fname.to_string(), fname_style));
-                    append_run_state(&mut spans, inner_width, app.entry_run_state(entry_idx));
+                    append_run_state(&mut spans, inner_width, app.entry_run_state(entry_idx), "▶");
                     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
                     lines.extend(date_row);
                     lines.push(Line::from(spans));
@@ -3342,7 +3509,7 @@ mod render_tests {
         assert_eq!(fg_at(&app, 190, 20, label_x as u16, label_y as u16), SUBAGENT_COLOR);
         let (text_x, text_y) = find(&out, "explore the code");
         assert_eq!((text_x, text_y), (label_x + SUBAGENT_LABEL.len(), label_y), "{out}");
-        let (count_x, count_y) = find(&out, "[1] plan it");
+        let (count_x, count_y) = find(&out, "1 plan it");
         assert_eq!(count_x, label_x, "{out}");
         assert_ne!(count_y, label_y);
     }
@@ -3636,7 +3803,7 @@ mod render_tests {
     }
 
     #[test]
-    fn prompt_rows_carry_their_count_in_brackets() {
+    fn prompt_rows_carry_their_count() {
         // Two prompts in one session. `store.entries` sorts newest first, so
         // the older prompt is number 1 and the newer one is number 2.
         let mut older = prompt("first ask", "sessionAAAA-1111");
@@ -3648,22 +3815,18 @@ mod render_tests {
         app.recompute_row_heights(90, 18);
         let out = render(&app, 190, 20);
 
-        assert!(out.contains("[2] second ask"), "newest prompt is number 2\n{out}");
-        assert!(out.contains("[1] first ask"), "oldest prompt is number 1\n{out}");
+        assert!(out.contains("2 second ask"), "newest prompt is number 2\n{out}");
+        assert!(out.contains("1 first ask"), "oldest prompt is number 1\n{out}");
     }
 
     #[test]
-    fn prompt_count_uses_the_timestamp_gray() {
+    fn prompt_count_uses_the_ordinal_blue() {
         let store = (vec![prompt("only ask", "sessionAAAA-1111")]);
         let mut app = test_app(store);
         app.recompute_row_heights(60, 18);
         let out = history_half(&render(&app, 120, 20), 120);
-        let (x, y) = find(&out, "[1]");
-        let color = fg_at(&app, 120, 20, x as u16, y as u16);
-        assert!(
-            color == TIME_COLOR_RECENT || color == TIME_COLOR_OLD,
-            "the count must use a timestamp gray, got {color:?}"
-        );
+        let (x, y) = find(&out, "1 only ask");
+        assert_eq!(fg_at(&app, 120, 20, x as u16, y as u16), ORDINAL_COLOR);
     }
 
     #[test]
@@ -4092,7 +4255,86 @@ mod render_tests {
             .find(|a| a.session_id == "sessionAAAA-1111")
             .unwrap();
         assert_eq!(a.prompt_count, 2);
+        assert_eq!(a.entry_count, 2);
+        assert_eq!(a.first_prompt, "first ask");
         assert_eq!(a.last_prompt, "newest ask");
+    }
+
+    /// An agent uses three lines. The metadata column and the content
+    /// column put each value on its own line.
+    #[test]
+    fn an_agent_row_shows_the_first_and_the_last_prompt_on_separate_lines() {
+        let mut older = prompt("first ask", "sessionAAAA-1111");
+        older.timestamp = Local::now() - chrono::Duration::minutes(30);
+        let mut app = test_app(vec![
+            turn("newest ask", "Done it.", "sessionAAAA-1111"),
+            older,
+        ]);
+        app.toggle_mode(18, 18);
+
+        let out = render(&app, 240, 20);
+        // The Agents panel uses the left third of the screen. The History
+        // border on the right also draws `┃`.
+        let agents_col = |l: &str| l.chars().take(70).collect::<String>();
+        let lines: Vec<String> = out.lines().map(agents_col).collect();
+        let first = lines
+            .iter()
+            .position(|l| l.contains("first ask"))
+            .unwrap_or_else(|| panic!("the first prompt is missing\n{out}"));
+        // The title line is above the first prompt.
+        let top = first - 1;
+        assert!(lines[top + 1].contains("1 first ask"), "the first prompt has no count\n{out}");
+        assert!(lines[top + 2].contains("2 newest ask"), "the last prompt has no count\n{out}");
+        let (x, y) = find(&out, "1 first ask");
+        assert_eq!(fg_at(&app, 240, 20, x as u16, y as u16), ORDINAL_COLOR);
+        assert!(lines[top + 2].contains("claude 2 entries"), "the source and the entry count are missing\n{out}");
+        let response = lines[top + 3].find("└ Done it.");
+        let ordinal = lines[top + 2].find("2 newest ask");
+        assert!(response.is_some() && response == ordinal, "the response glyph is not under the count\n{out}");
+        assert!(
+            lines[top + 1].contains("├ 1 first ask")
+                && lines[top + 2].contains("├ 2 newest ask")
+                && lines[top + 3].contains("└ └ Done it."),
+            "the tree glyphs are missing\n{out}"
+        );
+        assert!(!lines[top].contains(['├', '└', '┃']), "the title line has a tree glyph\n{out}");
+        assert!(lines[top].starts_with("│proj"), "the project chain does not start the title line\n{out}");
+        assert!(
+            lines[top + AGENT_ROW_LINES].trim_matches(['│', ' ']).is_empty(),
+            "the line after the agent is not empty\n{out}"
+        );
+    }
+
+    /// With the date row on, the Agents panel draws a date row above the
+    /// first agent of each day.
+    #[test]
+    fn the_agents_panel_draws_a_date_row_for_each_day() {
+        let mut old = prompt("older ask", "sessionBBBB-2222");
+        old.timestamp = Local::now() - chrono::Duration::days(3);
+        let mut app = test_app(vec![prompt("new ask", "sessionAAAA-1111"), old]);
+        app.settings.date_separator = true;
+        app.toggle_mode(18, 18);
+
+        let out = render(&app, 240, 20);
+        let agents_col = |l: &str| l.chars().take(70).collect::<String>();
+        let lines: Vec<String> = out.lines().map(agents_col).collect();
+        let today = lines.iter().position(|l| l.contains("today - ")).unwrap_or_else(|| panic!("{out}"));
+        // The agent has one prompt, so the prompt is on the third line.
+        assert!(lines[today + 3].contains("new ask"), "the date row is above the agent\n{out}");
+        assert!(
+            lines.iter().any(|l| l.contains("3 days ago - ")),
+            "the older agent has its own date row\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_short_date_names_the_year_only_for_an_earlier_year() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        assert_eq!(short_date(day(2026, 9, 26), today), "Sept-26");
+        assert_eq!(short_date(day(2026, 6, 3), today), "June-3");
+        assert_eq!(short_date(day(2025, 9, 26), today), "Sept-26 '25");
+        assert_eq!(short_date(day(2009, 1, 2), today), "Jan-2 '09");
     }
 
     #[test]
