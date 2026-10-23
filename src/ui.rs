@@ -2799,6 +2799,47 @@ fn panel_typing_prompt(
 
 /// Render the `[N/total]  n:next  N:prev  Esc:clear  /:new search` bar shown
 /// for a committed side-panel search.
+/// The prompt line of a `/` search whose query is a regex: the Agents panel
+/// and the Diff panel. `valid` is false when the query does not compile.
+fn regex_typing_prompt(
+    query: &str,
+    valid: bool,
+    total: usize,
+    hint: Span<'static>,
+) -> Line<'static> {
+    let regex_invalid = !query.is_empty() && !valid;
+    let count_str = if query.is_empty() {
+        String::new()
+    } else if regex_invalid {
+        "(invalid regex)".to_string()
+    } else {
+        format!("({} match{})", total, if total == 1 { "" } else { "es" })
+    };
+    let count_style = if regex_invalid {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Line::from(vec![
+        Span::styled(
+            "/",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(query.to_string(), Style::default().fg(Color::White)),
+        Span::styled(
+            "█",
+            Style::default().fg(Color::White).add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            " [regex]".to_string(),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+        ),
+        Span::raw("  "),
+        Span::styled(count_str, count_style),
+        hint,
+    ])
+}
+
 fn panel_active_nav(total: usize, current: usize) -> Line<'static> {
     let curr = if total == 0 { 0 } else { current + 1 };
     Line::from(vec![
@@ -2829,10 +2870,12 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         HistoryTyping,
         ProjectTyping,
         FileTyping,
+        AgentTyping,
         DiffTyping,
         HistoryActive,
         ProjectActive,
         FileActive,
+        AgentActive,
         DiffActive,
         Default,
     }
@@ -2842,6 +2885,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         HelpMode::ProjectTyping
     } else if app.file_search.phase == SearchPhase::Typing {
         HelpMode::FileTyping
+    } else if app.agent_search.phase == SearchPhase::Typing {
+        HelpMode::AgentTyping
     } else if app.diff_search.phase == SearchPhase::Typing {
         HelpMode::DiffTyping
     } else if app.active_panel == Panel::History
@@ -2859,6 +2904,11 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         && app.file_search.highlights
     {
         HelpMode::FileActive
+    } else if app.active_panel == Panel::Agents
+        && app.agent_search.phase == SearchPhase::Active
+        && app.agent_search.highlights
+    {
+        HelpMode::AgentActive
     } else if app.active_panel == Panel::Diff
         && app.diff_search.phase == SearchPhase::Active
         && app.diff_search.highlights
@@ -2937,47 +2987,21 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             app.file_search.matches.len(),
             history_hint(app, SearchMode::File, &app.file_search.query),
         ),
-        HelpMode::DiffTyping => {
-            // Regex prompt for `/` in the Diff panel. Mirrors History's `f`
-            // typing prompt — including the `[regex]` tag and the invalid-
-            // regex error styling — so the two surfaces feel like one.
-            let total = app.diff_search.matches.len();
-            let regex_invalid = !app.diff_search.query.is_empty()
-                && app.diff_search.regex.is_none();
-            let count_str = if app.diff_search.query.is_empty() {
-                String::new()
-            } else if regex_invalid {
-                "(invalid regex)".to_string()
-            } else {
-                format!("({} match{})", total, if total == 1 { "" } else { "es" })
-            };
-            let count_style = if regex_invalid {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            Line::from(vec![
-                Span::styled(
-                    "/",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    app.diff_search.query.clone(),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    "█",
-                    Style::default().fg(Color::White).add_modifier(Modifier::DIM),
-                ),
-                Span::styled(
-                    " [regex]".to_string(),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
-                ),
-                Span::raw("  "),
-                Span::styled(count_str, count_style),
-                history_hint(app, SearchMode::Diff, &app.diff_search.query),
-            ])
-        }
+        HelpMode::AgentTyping => regex_typing_prompt(
+            &app.agent_search.query,
+            app.agent_search.regex.is_some(),
+            app.agent_search.matches.len(),
+            history_hint(app, SearchMode::Agent, &app.agent_search.query),
+        ),
+        // Regex prompt for `/` in the Diff panel. Mirrors History's `f`
+        // typing prompt — including the `[regex]` tag and the invalid-
+        // regex error styling — so the two surfaces feel like one.
+        HelpMode::DiffTyping => regex_typing_prompt(
+            &app.diff_search.query,
+            app.diff_search.regex.is_some(),
+            app.diff_search.matches.len(),
+            history_hint(app, SearchMode::Diff, &app.diff_search.query),
+        ),
         HelpMode::HistoryActive => {
             let total = app.search.matches.len();
             let curr = if total == 0 { 0 } else { app.search.current + 1 };
@@ -3032,6 +3056,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             app.file_search.matches.len(),
             app.file_search.current,
         ),
+        HelpMode::AgentActive => panel_active_nav(
+            app.agent_search.matches.len(),
+            app.agent_search.current,
+        ),
         HelpMode::DiffActive => panel_active_nav(
             app.diff_search.matches.len(),
             app.diff_search.current,
@@ -3079,11 +3107,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
-                Panel::Projects | Panel::Files => {
+                Panel::Projects | Panel::Files | Panel::Agents => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":search  ", Style::default().fg(Color::DarkGray)));
                 }
-                Panel::Agents => {}
                 Panel::Diff => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":find  ", Style::default().fg(Color::DarkGray)));

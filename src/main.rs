@@ -1099,6 +1099,19 @@ fn run(
                         }
                         continue;
                     }
+                    if app.agent_search.phase == app::SearchPhase::Typing {
+                        match key.code {
+                            KeyCode::Esc => app.agent_search_cancel(visible_agents),
+                            KeyCode::Enter => app.agent_search_commit(),
+                            KeyCode::Backspace => app.agent_search_pop_char(visible_agents),
+                            KeyCode::Char('c') if ctrl => app.agent_search_cancel(visible_agents),
+                            KeyCode::Up => app.agent_search_history_older(visible_agents),
+                            KeyCode::Down => app.agent_search_history_newer(visible_agents),
+                            KeyCode::Char(c) => app.agent_search_push_char(c, visible_agents),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if app.diff_search.phase == app::SearchPhase::Typing {
                         match key.code {
                             KeyCode::Esc => app.diff_search_cancel(),
@@ -1148,7 +1161,7 @@ fn run(
                                     app.diff_select_clear();
                                     app.diff_search_hide();
                                 }
-                                app::Panel::Agents => {}
+                                app::Panel::Agents => app.agent_search_hide(),
                             }
                         }
                         KeyCode::Tab => {
@@ -1222,7 +1235,7 @@ fn run(
                             app::Panel::Projects => app.project_search_open(),
                             app::Panel::Files => app.file_search_open(),
                             app::Panel::Diff => app.diff_search_open(),
-                            app::Panel::Agents => {}
+                            app::Panel::Agents => app.agent_search_open(),
                         },
                         KeyCode::Char('F') if app.active_panel == app::Panel::History => {
                             app.search_open_semantic();
@@ -1249,6 +1262,11 @@ fn run(
                             {
                                 app.diff_search_next()
                             }
+                            app::Panel::Agents
+                                if app.agent_search.phase == app::SearchPhase::Active =>
+                            {
+                                app.agent_search_next(visible_agents)
+                            }
                             _ => {}
                         },
                         KeyCode::Char('N') => match app.active_panel {
@@ -1269,6 +1287,11 @@ fn run(
                                 if app.diff_search.phase == app::SearchPhase::Active =>
                             {
                                 app.diff_search_prev()
+                            }
+                            app::Panel::Agents
+                                if app.agent_search.phase == app::SearchPhase::Active =>
+                            {
+                                app.agent_search_prev(visible_agents)
                             }
                             _ => {}
                         },

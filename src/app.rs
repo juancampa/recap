@@ -366,6 +366,54 @@ impl Default for DiffSearchState {
     }
 }
 
+/// `/` search in the Agents panel. The query is a case-insensitive regex, as
+/// in the `f` search and the Diff panel. An agent row holds long prompts, and
+/// a fuzzy match on long text matches almost every row.
+pub struct AgentSearchState {
+    pub phase: SearchPhase,
+    pub query: String,
+    /// The chain ids of the agents that match, in the order of the panel.
+    pub matches: Vec<String>,
+    /// Index in `matches` of the agent that the last jump selected.
+    pub current: usize,
+    pub highlights: bool,
+    /// `None` when the query is empty or is not a valid regex.
+    pub regex: Option<Regex>,
+    /// The agent that was selected when the prompt opened. Esc selects it
+    /// again. The field is set only while `phase == Typing`.
+    restore: Option<String>,
+}
+
+impl Default for AgentSearchState {
+    fn default() -> Self {
+        Self {
+            phase: SearchPhase::Inactive,
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+            highlights: true,
+            regex: None,
+            restore: None,
+        }
+    }
+}
+
+impl AgentSearchState {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The matches show on screen: the search runs, it has matches, and Esc
+    /// did not hide them.
+    pub fn shows_matches(&self) -> bool {
+        self.phase != SearchPhase::Inactive && self.highlights && !self.matches.is_empty()
+    }
+
+    pub fn is_match(&self, chain_id: &str) -> bool {
+        self.matches.iter().any(|id| id == chain_id)
+    }
+}
+
 /// Per-line searchable text for diff content search. Matches the corpus the
 /// History panel's `f` search builds (Added/Removed body lines, plus Prompt
 /// lines for prompt entries), so `/` in the Diff panel feels like the same
@@ -554,6 +602,7 @@ pub struct App {
     pub project_search: PanelSearchState,
     pub file_search: PanelSearchState,
     pub diff_search: DiffSearchState,
+    pub agent_search: AgentSearchState,
     /// The committed query of every search prompt, which Up and Down walk.
     /// See [`crate::search_history`].
     pub search_history: SearchHistories,
@@ -639,6 +688,7 @@ impl App {
             project_search: PanelSearchState::default(),
             file_search: PanelSearchState::default(),
             diff_search: DiffSearchState::default(),
+            agent_search: AgentSearchState::default(),
             search_history: SearchHistories::default(),
             auto_expand: false,
             running: HashMap::new(),
@@ -1003,6 +1053,10 @@ impl App {
             self.agent_scroll = 0;
         }
         self.agents = agents;
+        // The list can have other agents or another order now.
+        if self.agent_search.phase != SearchPhase::Inactive {
+            self.refresh_agent_matches();
+        }
     }
 
     /// Position of a prompt inside its own agent session, counted from 1.
@@ -2032,7 +2086,7 @@ impl App {
             if display_idx >= self.file_scroll + visible {
                 self.file_scroll += 1;
             }
-            self.refilter();
+            self.refilter_history();
         }
     }
 
@@ -2042,7 +2096,7 @@ impl App {
             Some(0) => {
                 self.selected_file_path = None;
                 self.file_scroll = self.file_scroll.saturating_sub(1);
-                self.refilter();
+                self.refilter_history();
             }
             Some(i) => {
                 self.selected_file_path = Some(self.files[i - 1].path.clone());
@@ -2050,7 +2104,7 @@ impl App {
                 if display_idx < self.file_scroll {
                     self.file_scroll = display_idx;
                 }
-                self.refilter();
+                self.refilter_history();
             }
         }
     }
@@ -2080,7 +2134,7 @@ impl App {
     pub fn file_top(&mut self) {
         self.selected_file_path = None;
         self.file_scroll = 0;
-        self.refilter();
+        self.refilter_history();
     }
 
     pub fn file_bottom(&mut self, visible: usize) {
@@ -2091,7 +2145,7 @@ impl App {
         self.selected_file_path = Some(self.files[n - 1].path.clone());
         let total_rows = n + 1;
         self.file_scroll = total_rows.saturating_sub(visible);
-        self.refilter();
+        self.refilter_history();
     }
 
     pub fn diff_top(&mut self) {
@@ -2205,6 +2259,7 @@ impl App {
         // The filtered set changes, so any search result now points at rows
         // the panel no longer lists.
         self.search_clear();
+        self.agent_search.clear();
         self.refilter_preserving(target, visible);
         // The new filter list has a different length, so the old scroll
         // offset points at the wrong place. Put the selected row near the
@@ -2336,6 +2391,171 @@ impl App {
             return;
         }
         self.select_agent_row(self.agents.len() - 1, visible);
+    }
+
+    // ── Agents-panel search ──────────────────────────────────────────────
+
+    pub fn agent_search_open(&mut self) {
+        self.agent_search.clear();
+        self.agent_search.phase = SearchPhase::Typing;
+        self.agent_search.restore = self.selected_agent.clone();
+        self.search_history.get_mut(SearchMode::Agent).reset_walk();
+    }
+
+    pub fn agent_search_push_char(&mut self, c: char, visible: usize) {
+        self.agent_search.query.push(c);
+        self.search_history.get_mut(SearchMode::Agent).reset_walk();
+        self.agent_search_query_changed(visible);
+    }
+
+    pub fn agent_search_pop_char(&mut self, visible: usize) {
+        self.agent_search.query.pop();
+        self.search_history.get_mut(SearchMode::Agent).reset_walk();
+        self.agent_search_query_changed(visible);
+    }
+
+    /// Put the next older remembered query on the Agents prompt (Up).
+    pub fn agent_search_history_older(&mut self, visible: usize) {
+        let current = self.agent_search.query.clone();
+        let Some(query) = self.search_history.get_mut(SearchMode::Agent).older(&current) else {
+            return;
+        };
+        self.agent_search.query = query;
+        self.agent_search_query_changed(visible);
+    }
+
+    /// Put the next newer remembered query on the Agents prompt (Down).
+    pub fn agent_search_history_newer(&mut self, visible: usize) {
+        let Some(query) = self.search_history.get_mut(SearchMode::Agent).newer() else {
+            return;
+        };
+        self.agent_search.query = query;
+        self.agent_search_query_changed(visible);
+    }
+
+    pub fn agent_search_commit(&mut self) {
+        let query = self.agent_search.query.clone();
+        self.search_history.get_mut(SearchMode::Agent).push(&query);
+        if self.agent_search.matches.is_empty() {
+            self.agent_search.clear();
+            return;
+        }
+        self.agent_search.phase = SearchPhase::Active;
+        self.agent_search.highlights = true;
+        self.agent_search.restore = None;
+    }
+
+    /// Vim's `:noh`: hide the highlights, but keep the matches for n/N.
+    pub fn agent_search_hide(&mut self) {
+        if self.agent_search.phase == SearchPhase::Active {
+            self.agent_search.highlights = false;
+        }
+    }
+
+    /// Esc on the prompt: drop the search and select the agent that was
+    /// selected when the prompt opened.
+    pub fn agent_search_cancel(&mut self, visible: usize) {
+        let query = self.agent_search.query.clone();
+        self.search_history.get_mut(SearchMode::Agent).push(&query);
+        let target = self.agent_search.restore.take();
+        let was_typing = self.agent_search.phase == SearchPhase::Typing;
+        self.agent_search.clear();
+        if was_typing
+            && let Some(i) = target.and_then(|id| self.agents.iter().position(|a| a.chain_id == id))
+        {
+            self.select_agent_row(i, visible);
+        }
+    }
+
+    pub fn agent_search_next(&mut self, visible: usize) {
+        self.agent_search_step(visible, RevealDir::Down, false);
+    }
+
+    pub fn agent_search_prev(&mut self, visible: usize) {
+        self.agent_search_step(visible, RevealDir::Up, false);
+    }
+
+    /// Calculate the matches for the new query. The selection stays on the
+    /// selected agent if it matches, else it goes to the first match below
+    /// it, as vim's incremental search does.
+    fn agent_search_query_changed(&mut self, visible: usize) {
+        self.refresh_agent_matches();
+        let selected_matches = self
+            .selected_agent
+            .as_deref()
+            .is_some_and(|id| self.agent_search.is_match(id));
+        if !selected_matches {
+            self.agent_search_step(visible, RevealDir::Down, true);
+        }
+    }
+
+    /// Match the query against the text of each agent row. `current` stays on
+    /// the selected agent when it matches.
+    fn refresh_agent_matches(&mut self) {
+        let regex = if self.agent_search.query.is_empty() {
+            None
+        } else {
+            recap_api::content_regex(&self.agent_search.query).ok()
+        };
+        self.agent_search.matches = match &regex {
+            Some(re) => self
+                .agents
+                .iter()
+                .filter(|a| self.agent_search_texts(a).iter().any(|t| re.is_match(t)))
+                .map(|a| a.chain_id.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        self.agent_search.regex = regex;
+        self.agent_search.current = self
+            .selected_agent
+            .as_deref()
+            .and_then(|id| self.agent_search.matches.iter().position(|m| m == id))
+            .unwrap_or(0);
+    }
+
+    /// The text of an agent row that the search reads: the project chain and
+    /// the four content lines, as the Agents panel shows them.
+    fn agent_search_texts(&self, agent: &Agent) -> [String; 5] {
+        let [title, first, last, tail] = crate::ui::agent_content(agent);
+        [
+            crate::ui::agent_chain(agent, &self.view.project_names),
+            title.0.to_string(),
+            first.0.to_string(),
+            last.0.to_string(),
+            tail.0.to_string(),
+        ]
+    }
+
+    /// Select the match below (`Down`) or above (`Up`) the selected agent.
+    /// The walk wraps around, as it does in vim. With `include_selected`, the
+    /// selected agent itself counts as the match below it.
+    fn agent_search_step(&mut self, visible: usize, dir: RevealDir, include_selected: bool) {
+        if self.agent_search.matches.is_empty() {
+            return;
+        }
+        // `matches` holds the agents in the order of the panel.
+        let rows: Vec<usize> = self
+            .agent_search
+            .matches
+            .iter()
+            .filter_map(|id| self.agents.iter().position(|a| &a.chain_id == id))
+            .collect();
+        let here = self.sel_agent_idx();
+        let pick = match (dir, here) {
+            (_, None) => rows.first(),
+            (RevealDir::Down, Some(h)) => rows
+                .iter()
+                .find(|&&r| r > h || (include_selected && r == h))
+                .or(rows.first()),
+            (RevealDir::Up, Some(h)) => rows.iter().rev().find(|&&r| r < h).or(rows.last()),
+        };
+        let Some(&row) = pick else {
+            return;
+        };
+        self.agent_search.highlights = true;
+        self.agent_search.current = rows.iter().position(|&r| r == row).unwrap_or(0);
+        self.select_agent_row(row, visible);
     }
 
     /// Move to the next entry-kind filter. This keeps the selection and the
@@ -3119,7 +3339,7 @@ impl App {
         } else if visible > 0 && display_row >= self.file_scroll + visible {
             self.file_scroll = display_row + 1 - visible;
         }
-        self.refilter();
+        self.refilter_history();
     }
 
     // ── Diff-panel content search ────────────────────────────────────────────
@@ -3649,6 +3869,112 @@ mod tests {
         // History keeps the same row, now inside that one agent.
         assert_eq!(selected(&app), "b1");
         assert_eq!(app.groups.len(), 2, "History holds only sessionB's prompts");
+    }
+
+    /// Agent mode on a store with three agents, each with one prompt. The
+    /// Agents panel lists them newest first: C, B, A.
+    fn three_agents_app() -> App {
+        let mut app = test_app(vec![
+            prompt_entry("deploy the server", "sessionC", 1),
+            prompt_entry("fix the parser", "sessionB", 2),
+            prompt_entry("Parse the logs", "sessionA", 3),
+        ]);
+        app.toggle_mode(20, 20);
+        app.active_panel = Panel::Agents;
+        app.agent_top(20);
+        app
+    }
+
+    /// The selected agent can move down the list, for example when a newer
+    /// agent appears. The Agents panel then scrolls to it.
+    #[test]
+    fn the_agents_panel_scrolls_to_the_selected_agent() {
+        let mut app = three_agents_app();
+        // One agent fits in 4 lines.
+        assert_eq!(app.agents_fit(0, 4), 1);
+        app.selected_agent = Some("sessionA".to_string());
+        app.ensure_agent_visible(4);
+        assert_eq!(app.agent_scroll, 2);
+        app.selected_agent = Some("sessionC".to_string());
+        app.ensure_agent_visible(4);
+        assert_eq!(app.agent_scroll, 0);
+    }
+
+    #[test]
+    fn a_date_row_makes_the_first_agent_of_a_day_one_line_taller() {
+        let mut app = test_app(vec![
+            prompt_entry("deploy the server", "sessionC", 1),
+            prompt_entry("fix the parser", "sessionB", 2),
+            prompt_entry("Parse the logs", "sessionA", 3 * 24 * 60),
+        ]);
+        app.settings.date_separator = true;
+        app.toggle_mode(20, 20);
+
+        let heights: Vec<usize> = (0..3).map(|i| app.agent_height(i)).collect();
+        assert_eq!(heights, [6, 5, 6]);
+        // The sticky date row keeps one line, so 12 lines fit two agents.
+        assert_eq!(app.agents_fit(0, 12), 2);
+        assert_eq!(app.agent_sticky_date(), None, "the top agent has its own date row");
+        assert_eq!(app.agent_at_line(0), Some(0));
+        assert_eq!(app.agent_at_line(6), Some(1));
+
+        app.agent_scroll = 1;
+        assert!(app.agent_sticky_date().is_some());
+        assert_eq!(app.agent_at_line(0), None, "a click on the sticky date row selects no agent");
+        assert_eq!(app.agent_at_line(1), Some(1));
+        assert_eq!(app.agent_at_line(6), Some(2));
+    }
+
+    fn type_agent_query(app: &mut App, query: &str) {
+        app.agent_search_open();
+        for c in query.chars() {
+            app.agent_search_push_char(c, 20);
+        }
+    }
+
+    #[test]
+    fn the_agent_search_selects_the_agents_that_match() {
+        let mut app = three_agents_app();
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionC"));
+
+        // The regex ignores the case, so it matches "parser" and "Parse".
+        type_agent_query(&mut app, "pars");
+        assert_eq!(app.agent_search.matches, ["sessionB", "sessionA"]);
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionB"));
+        assert_eq!(selected(&app), "fix the parser", "History follows the agent");
+
+        app.agent_search_commit();
+        assert_eq!(app.agent_search.phase, SearchPhase::Active);
+        app.agent_search_next(20);
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionA"));
+        app.agent_search_next(20);
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionB"), "n wraps around");
+        app.agent_search_prev(20);
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionA"), "N wraps around");
+        assert_eq!(app.agent_search.current, 1);
+    }
+
+    #[test]
+    fn esc_on_the_agent_prompt_selects_the_first_agent_again() {
+        let mut app = three_agents_app();
+        type_agent_query(&mut app, "logs");
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionA"));
+
+        app.agent_search_cancel(20);
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionC"));
+        assert_eq!(app.agent_search.phase, SearchPhase::Inactive);
+    }
+
+    #[test]
+    fn an_agent_query_without_a_match_ends_the_search() {
+        let mut app = three_agents_app();
+        // An invalid regex matches no agent, and the selection stays.
+        type_agent_query(&mut app, "(");
+        assert!(app.agent_search.matches.is_empty());
+        assert_eq!(app.selected_agent.as_deref(), Some("sessionC"));
+
+        app.agent_search_commit();
+        assert_eq!(app.agent_search.phase, SearchPhase::Inactive);
     }
 
     #[test]

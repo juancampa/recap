@@ -1,7 +1,7 @@
 //! Remembered search queries, one list per search prompt.
 //!
 //! Every search prompt in the UI (History path / content / semantic, the
-//! Projects and Files panels, and the Diff panel) keeps its own query list.
+//! Projects, Files and Agents panels, and the Diff panel) keeps its own query list.
 //! The user commits a query with Enter, and the prompt appends it to that
 //! list. Up and Down then walk the list, as vim walks its command line.
 //!
@@ -31,6 +31,8 @@ pub enum SearchMode {
     Project,
     /// Files panel.
     File,
+    /// Agents panel.
+    Agent,
     /// Diff panel.
     Diff,
 }
@@ -45,17 +47,19 @@ impl SearchMode {
             SearchMode::Semantic => "semantic",
             SearchMode::Project => "project",
             SearchMode::File => "file",
+            SearchMode::Agent => "agent",
             SearchMode::Diff => "diff",
         }
     }
 
     /// Every mode, so the caller can save or load all the lists.
-    pub const ALL: [SearchMode; 6] = [
+    pub const ALL: [SearchMode; 7] = [
         SearchMode::Path,
         SearchMode::Content,
         SearchMode::Semantic,
         SearchMode::Project,
         SearchMode::File,
+        SearchMode::Agent,
         SearchMode::Diff,
     ];
 }
