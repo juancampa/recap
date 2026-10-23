@@ -530,11 +530,10 @@ fn log_search(
     let detail = match kind {
         SearchKind::Path => String::new(),
         SearchKind::Content => format!(
-            ", {} cached, {} snapshot pairs read ({}), {} without a match in the snapshots",
+            ", {} cached, {} snapshot pairs read ({})",
             scan.cached,
             scan.snapshots_read,
-            crate::logger::bytes(scan.bytes_read),
-            scan.rejected
+            crate::logger::bytes(scan.bytes_read)
         ),
         SearchKind::Semantic => format!(
             ", {} without a vector, query embedded in {}",

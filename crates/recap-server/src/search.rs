@@ -2,12 +2,11 @@
 //! content, and a rank by the embedding similarity. Each search reads only
 //! the entries that pass the filter of the client.
 
-use crate::embed::{cosine, EmbedIndex};
+use crate::embed::{EmbedIndex, cosine};
 use crate::embedder::{diff_text, entry_snapshots, turn_text};
-use crate::store::{entry_key, Store};
+use crate::store::{Store, entry_key};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use recap_api::{EntryFields, EntryId, EntryKind, Filter, SearchMatch, SEMANTIC_SCORE_SCALE};
-use regex::RegexBuilder;
+use recap_api::{EntryFields, EntryId, EntryKind, Filter, SEMANTIC_SCORE_SCALE, SearchMatch};
 use std::collections::HashMap;
 
 /// The number of results that a semantic search keeps. The list is ranked,
@@ -36,9 +35,6 @@ pub struct SearchScan {
     pub snapshots_read: usize,
     /// Content search: the bytes of those snapshots.
     pub bytes_read: u64,
-    /// Content search: the file changes whose snapshots have no match, so
-    /// the search made no diff for them.
-    pub rejected: usize,
     /// Semantic search: the candidates without a vector.
     pub without_vector: usize,
 }
@@ -105,7 +101,7 @@ pub fn content_matches(
     let Ok(regex) = recap_api::content_regex(query) else {
         return (Vec::new(), scan);
     };
-    fill_content_cache(store, cache, &indices, query, &mut scan);
+    fill_content_cache(store, cache, &indices, &mut scan);
 
     let matches = indices
         .into_iter()
@@ -126,29 +122,17 @@ pub fn content_matches(
 /// Calculate the searchable text of each entry in `indices` that the cache
 /// does not hold yet.
 ///
-/// Two things keep this fast. First, a prefilter: an added line is part of
-/// the new snapshot and a removed line is part of the old one, so an entry
-/// whose two snapshots contain no match cannot produce a matching diff line.
-/// Such an entry needs no diff, and a query normally rejects almost every
-/// entry this way. `multi_line` makes `^` and `$` match at line breaks, so a
-/// query with line anchors gives the same result on the snapshot text as on a
-/// diff line. Second, the scan runs on all cores, because it reads gigabytes
-/// of snapshots.
+/// The cache keeps the text of every entry, also of an entry that does not
+/// match the query. The text of all entries is approximately 70 MB, but the
+/// snapshots that a file change diffs are approximately 2 GB. Thus only the
+/// first search reads the snapshots, and the next searches read only memory.
+/// The scan runs on all cores.
 fn fill_content_cache(
     store: &Store,
     cache: &mut ContentCache,
     indices: &[usize],
-    query: &str,
     scan: &mut SearchScan,
 ) {
-    let Ok(prefilter) = RegexBuilder::new(query)
-        .case_insensitive(true)
-        .multi_line(true)
-        .build()
-    else {
-        return;
-    };
-
     let todo: Vec<usize> = indices
         .iter()
         .copied()
@@ -164,15 +148,14 @@ fn fill_content_cache(
         .unwrap_or(1)
         .min(todo.len());
     let chunk = todo.len().div_ceil(threads);
-    let prefilter = &prefilter;
 
-    let parts: Vec<(Vec<(EntryId, String)>, usize, u64, usize)> = std::thread::scope(|scope| {
+    let parts: Vec<(Vec<(EntryId, String)>, usize, u64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = todo
             .chunks(chunk)
             .map(|part| {
                 scope.spawn(move || {
                     let mut out: Vec<(EntryId, String)> = Vec::new();
-                    let (mut read, mut bytes, mut rejected) = (0usize, 0u64, 0usize);
+                    let (mut read, mut bytes) = (0usize, 0u64);
                     for &idx in part {
                         let entry = &store.history.entries[idx];
                         let id = store.id_at(idx).clone();
@@ -182,12 +165,6 @@ fn fill_content_cache(
                                 let (old_content, new_content) = entry_snapshots(store, idx);
                                 read += 1;
                                 bytes += (old_content.len() + new_content.len()) as u64;
-                                if !prefilter.is_match(&new_content)
-                                    && !prefilter.is_match(&old_content)
-                                {
-                                    rejected += 1;
-                                    continue;
-                                }
                                 out.push((id, diff_text(&old_content, &new_content)));
                             }
                             // The summary of a compaction is not searchable
@@ -195,23 +172,17 @@ fn fill_content_cache(
                             EntryKind::Compaction { .. } => {}
                         }
                     }
-                    (out, read, bytes, rejected)
+                    (out, read, bytes)
                 })
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    let mut found: Vec<(EntryId, String)> = Vec::new();
-    for (out, read, bytes, rejected) in parts {
-        found.extend(out);
+    for (out, read, bytes) in parts {
+        cache.extend(out);
         scan.snapshots_read += read;
         scan.bytes_read += bytes;
-        scan.rejected += rejected;
     }
-
-    // An entry that the prefilter rejected stays out of the cache. It holds
-    // no match for this query, and the next query checks it again.
-    cache.extend(found);
 }
 
 /// Rank the entries that pass the filter by the cosine similarity of their
