@@ -1178,6 +1178,7 @@ dependencies = [
  "percent-encoding",
  "recap-api",
  "recap-client",
+ "recap-unidiff",
  "regex",
  "rusqlite",
  "serde",
@@ -1189,6 +1190,10 @@ dependencies = [
  "ureq",
  "zstd",
 ]
+
+[[package]]
+name = "recap-unidiff"
+version = "0.1.0"
 
 [[package]]
 name = "redox_syscall"
@@ -1424,6 +1429,19 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slicer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "recap-api",
+ "recap-client",
+ "recap-unidiff",
+ "regex",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "smallvec"

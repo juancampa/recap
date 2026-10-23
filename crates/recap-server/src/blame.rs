@@ -7,8 +7,9 @@
 
 use crate::claude::BashCall;
 use crate::history::HistoryStore;
-use recap_api::{Attribution, EditSource, EntryFields, HunkBlame};
 use chrono::{DateTime, Local};
+use recap_api::{Attribution, EditSource, EntryFields, HunkBlame};
+use recap_unidiff::FileDiff;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -21,196 +22,6 @@ const MIN_VOTING_CHARS: usize = 4;
 /// of some session holds does not explain a hunk of 100 lines, and a wrong
 /// winner costs the caller more than none.
 const MIN_WINNER_SHARE: f64 = 0.25;
-
-/// One file section of a unified diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileDiff {
-    /// The path relative to the repository root. The new path for a rename,
-    /// the old path for a deleted file.
-    pub path: PathBuf,
-    /// The lines before the first hunk: `diff --git`, `index`, `---`, `+++`.
-    pub header: Vec<String>,
-    pub hunks: Vec<Hunk>,
-}
-
-/// One `@@` hunk of a unified diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hunk {
-    /// The `@@ -a,b +c,d @@` line.
-    pub header: String,
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
-    /// The body lines with their ` `, `+`, `-` or `\` prefix.
-    pub body: Vec<String>,
-}
-
-impl Hunk {
-    /// The file header plus this one hunk, as a patch that `git apply` reads.
-    pub fn patch(&self, file: &FileDiff) -> String {
-        let mut out = String::new();
-        for line in &file.header {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str(&self.header);
-        out.push('\n');
-        for line in &self.body {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out
-    }
-}
-
-/// Parse the text of a unified diff. Binary files are skipped.
-pub fn parse_unified(text: &str) -> Vec<FileDiff> {
-    let mut files: Vec<FileDiff> = Vec::new();
-    let mut file: Option<FileDiff> = None;
-    let mut hunk: Option<Hunk> = None;
-    let mut binary = false;
-    let mut old_path: Option<PathBuf> = None;
-    let mut new_path: Option<PathBuf> = None;
-
-    // Close the current file and push it, unless it is binary.
-    fn flush(
-        files: &mut Vec<FileDiff>,
-        file: &mut Option<FileDiff>,
-        hunk: &mut Option<Hunk>,
-        binary: &mut bool,
-        old_path: &mut Option<PathBuf>,
-        new_path: &mut Option<PathBuf>,
-    ) {
-        if let Some(mut f) = file.take() {
-            if let Some(h) = hunk.take() {
-                f.hunks.push(h);
-            }
-            if let Some(p) = new_path.take().or_else(|| old_path.take()) {
-                f.path = p;
-            }
-            if !*binary && !f.hunks.is_empty() {
-                files.push(f);
-            }
-        }
-        *binary = false;
-        *old_path = None;
-        *new_path = None;
-    }
-
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            flush(
-                &mut files, &mut file, &mut hunk, &mut binary, &mut old_path, &mut new_path,
-            );
-            file = Some(FileDiff {
-                path: git_header_path(rest),
-                header: vec![line.to_string()],
-                hunks: Vec::new(),
-            });
-            continue;
-        }
-        if file.is_none() {
-            // A diff without `diff --git` lines starts at `---`.
-            if line.starts_with("--- ") {
-                file = Some(FileDiff {
-                    path: PathBuf::new(),
-                    header: Vec::new(),
-                    hunks: Vec::new(),
-                });
-            } else {
-                continue;
-            }
-        }
-        let f = file.as_mut().expect("file is set");
-
-        if line.starts_with("@@ ") {
-            if let Some(h) = hunk.take() {
-                f.hunks.push(h);
-            }
-            hunk = parse_hunk_header(line);
-            continue;
-        }
-
-        match hunk.as_mut() {
-            Some(h) => {
-                let prefix = line.chars().next();
-                match prefix {
-                    Some(' ') | Some('+') | Some('-') | Some('\\') => h.body.push(line.to_string()),
-                    // Some tools print an empty context line with no space.
-                    None => h.body.push(" ".to_string()),
-                    _ => {
-                        // Not a hunk line: the file ends here.
-                        f.hunks.push(hunk.take().expect("hunk is set"));
-                        f.header.push(line.to_string());
-                    }
-                }
-            }
-            None => {
-                if line.starts_with("Binary files") || line.starts_with("GIT binary patch") {
-                    binary = true;
-                }
-                if let Some(p) = line.strip_prefix("--- ") {
-                    old_path = header_path(p);
-                }
-                if let Some(p) = line.strip_prefix("+++ ") {
-                    new_path = header_path(p);
-                }
-                f.header.push(line.to_string());
-            }
-        }
-    }
-    flush(
-        &mut files, &mut file, &mut hunk, &mut binary, &mut old_path, &mut new_path,
-    );
-    files
-}
-
-/// The new path of a `diff --git a/<old> b/<new>` line.
-fn git_header_path(rest: &str) -> PathBuf {
-    match rest.find(" b/") {
-        Some(i) => PathBuf::from(&rest[i + 3..]),
-        None => PathBuf::from(rest),
-    }
-}
-
-/// The path of a `--- a/<path>` or `+++ b/<path>` line. `None` for `/dev/null`.
-fn header_path(p: &str) -> Option<PathBuf> {
-    let p = p.split('\t').next().unwrap_or(p);
-    if p == "/dev/null" {
-        return None;
-    }
-    let p = p
-        .strip_prefix("a/")
-        .or_else(|| p.strip_prefix("b/"))
-        .unwrap_or(p);
-    Some(PathBuf::from(p))
-}
-
-/// Parse `@@ -a[,b] +c[,d] @@ ...`. A missing count means 1.
-fn parse_hunk_header(line: &str) -> Option<Hunk> {
-    let mut parts = line.split(' ');
-    parts.next()?; // "@@"
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    let (old_start, old_lines) = parse_range(old)?;
-    let (new_start, new_lines) = parse_range(new)?;
-    Some(Hunk {
-        header: line.to_string(),
-        old_start,
-        old_lines,
-        new_start,
-        new_lines,
-        body: Vec::new(),
-    })
-}
-
-fn parse_range(s: &str) -> Option<(usize, usize)> {
-    match s.split_once(',') {
-        Some((a, b)) => Some((a.parse().ok()?, b.parse().ok()?)),
-        None => Some((s.parse().ok()?, 1)),
-    }
-}
 
 /// The trimmed added and removed lines of one edit entry.
 struct LineSets {
@@ -499,85 +310,7 @@ mod tests {
     use super::*;
     use crate::history::HistoryEntry;
     use recap_api::EntryKind;
-
-    const TWO_FILES: &str = "\
-diff --git a/src/old.rs b/src/new.rs
-similarity index 90%
-rename from src/old.rs
-rename to src/new.rs
-index 1111111..2222222 100644
---- a/src/old.rs
-+++ b/src/new.rs
-@@ -1,3 +1,4 @@
- fn main() {
-+    println!(\"hello\");
-     let x = 1;
- }
-@@ -10 +11 @@
--old line
-+new line
-\\ No newline at end of file
-diff --git a/gone.txt b/gone.txt
-deleted file mode 100644
-index 3333333..0000000
---- a/gone.txt
-+++ /dev/null
-@@ -1,2 +0,0 @@
--first
--second
-diff --git a/img.png b/img.png
-index 4444444..5555555 100644
-Binary files a/img.png and b/img.png differ
-";
-
-    #[test]
-    fn parses_rename_delete_and_skips_binary() {
-        let files = parse_unified(TWO_FILES);
-        assert_eq!(files.len(), 2);
-
-        let f = &files[0];
-        assert_eq!(f.path, PathBuf::from("src/new.rs"));
-        assert_eq!(f.header.len(), 7);
-        assert_eq!(f.hunks.len(), 2);
-        let h = &f.hunks[0];
-        assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (1, 3, 1, 4));
-        assert_eq!(h.body.len(), 4);
-        let h = &f.hunks[1];
-        assert_eq!((h.old_start, h.old_lines, h.new_start, h.new_lines), (10, 1, 11, 1));
-        assert_eq!(h.body, vec!["-old line", "+new line", "\\ No newline at end of file"]);
-
-        let g = &files[1];
-        assert_eq!(g.path, PathBuf::from("gone.txt"));
-        assert_eq!(g.hunks.len(), 1);
-        assert_eq!(g.hunks[0].body, vec!["-first", "-second"]);
-    }
-
-    #[test]
-    fn line_sets_count_repeated_lines() {
-        let sets = line_sets_from("a\nb\n  c\n", "a\nb\nb\nc\nd\n");
-        assert_eq!(sets.added, HashSet::from(["b".to_string(), "d".to_string()]));
-        assert!(sets.removed.is_empty(), "`c` is only re-indented");
-    }
-
-    #[test]
-    fn patch_holds_the_header_and_one_hunk() {
-        let files = parse_unified(TWO_FILES);
-        let patch = files[0].hunks[1].patch(&files[0]);
-        let expected = "\
-diff --git a/src/old.rs b/src/new.rs
-similarity index 90%
-rename from src/old.rs
-rename to src/new.rs
-index 1111111..2222222 100644
---- a/src/old.rs
-+++ b/src/new.rs
-@@ -10 +11 @@
--old line
-+new line
-\\ No newline at end of file
-";
-        assert_eq!(patch, expected);
-    }
+    use recap_unidiff::parse_unified;
 
     fn ts(minutes: i64) -> DateTime<Local> {
         Local::now() - chrono::Duration::minutes(100 - minutes)
@@ -612,6 +345,16 @@ index 1111111..2222222 100644
             session_id: Some(session.to_string()),
             session_cwd: None,
         }
+    }
+
+    #[test]
+    fn line_sets_count_repeated_lines() {
+        let sets = line_sets_from("a\nb\n  c\n", "a\nb\nb\nc\nd\n");
+        assert_eq!(
+            sets.added,
+            HashSet::from(["b".to_string(), "d".to_string()])
+        );
+        assert!(sets.removed.is_empty(), "`c` is only re-indented");
     }
 
     #[test]

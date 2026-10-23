@@ -1,10 +1,11 @@
 [workspace]
-members = ["crates/recap-api", "crates/recap-client", "crates/recap-server"]
+members = ["crates/recap-api", "crates/recap-client", "crates/recap-server", "crates/recap-unidiff", "crates/slicer"]
 
 [workspace.dependencies]
 recap-api = { path = "crates/recap-api" }
 recap-client = { path = "crates/recap-client" }
 recap-server = { path = "crates/recap-server" }
+recap-unidiff = { path = "crates/recap-unidiff" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }

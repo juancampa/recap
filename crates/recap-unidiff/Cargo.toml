@@ -1,0 +1,7 @@
+[package]
+name = "recap-unidiff"
+version = "0.1.0"
+edition = "2024"
+description = "A parser and writer for unified diffs, shared by the recap server and slicer."
+
+[dependencies]

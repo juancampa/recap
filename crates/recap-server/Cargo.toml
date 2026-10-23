@@ -6,6 +6,7 @@ description = "The recap server: it loads the edit and prompt history and serves
 
 [dependencies]
 recap-api.workspace = true
+recap-unidiff.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
