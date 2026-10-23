@@ -1728,8 +1728,37 @@ impl App {
     // ── Navigation ────────────────────────────────────────────────────────────
 
     pub fn history_down(&mut self, visible: usize) {
+        if self.select_next_history_row() {
+            self.after_history_move(visible);
+        }
+    }
+
+    pub fn history_up(&mut self, visible: usize) {
+        if self.select_prev_history_row() {
+            self.after_history_move(visible);
+        }
+    }
+
+    pub fn history_page_down(&mut self, visible: usize) {
+        let steps = (visible / 2).max(1);
+        if (0..steps).take_while(|_| self.select_next_history_row()).count() > 0 {
+            self.after_history_move(visible);
+        }
+    }
+
+    pub fn history_page_up(&mut self, visible: usize) {
+        let steps = (visible / 2).max(1);
+        if (0..steps).take_while(|_| self.select_prev_history_row()).count() > 0 {
+            self.after_history_move(visible);
+        }
+    }
+
+    /// Select the next History row. The function returns false if the
+    /// selection is on the last row. It does not scroll and does not fetch
+    /// the diff, so a page move does these two steps one time only.
+    fn select_next_history_row(&mut self) -> bool {
         if self.groups.is_empty() {
-            return;
+            return false;
         }
         let group_len = self.groups[self.sel_group].entry_indices.len();
         let auto_expand = self.effective_auto_expand();
@@ -1738,23 +1767,26 @@ impl App {
         } else if self.sel_group + 1 < self.groups.len() {
             let leaving = self.sel_group;
             self.sel_group += 1;
+            self.sel_child = 0;
+            // Only auto-expand changes the display rows. A rebuild makes the
+            // row-height cache invalid, and the next `adjust_scroll` then
+            // wraps the text of every row again.
             if auto_expand {
                 self.groups[leaving].expanded = false;
                 self.groups[self.sel_group].expanded = true;
+                self.rebuild_display();
             }
-            self.rebuild_display();
-            self.sel_child = 0;
         } else {
-            return;
+            return false;
         }
-        self.diff_scroll = 0;
-        self.adjust_scroll(visible);
-        self.refresh_diff();
+        true
     }
 
-    pub fn history_up(&mut self, visible: usize) {
+    /// Select the previous History row. The function returns false if the
+    /// selection is on the first row. See `select_next_history_row`.
+    fn select_prev_history_row(&mut self) -> bool {
         if self.groups.is_empty() {
-            return;
+            return false;
         }
         let auto_expand = self.effective_auto_expand();
         if auto_expand && self.sel_child > 0 {
@@ -1766,38 +1798,21 @@ impl App {
                 self.groups[leaving].expanded = false;
                 self.groups[self.sel_group].expanded = true;
                 self.sel_child = self.groups[self.sel_group].entry_indices.len() - 1;
+                self.rebuild_display();
             } else {
                 self.sel_child = 0;
             }
-            self.rebuild_display();
         } else {
-            return;
+            return false;
         }
+        true
+    }
+
+    /// Scroll the History panel to the selected row and show its diff.
+    fn after_history_move(&mut self, visible: usize) {
         self.diff_scroll = 0;
         self.adjust_scroll(visible);
         self.refresh_diff();
-    }
-
-    pub fn history_page_down(&mut self, visible: usize) {
-        let steps = (visible / 2).max(1);
-        for _ in 0..steps {
-            let before = (self.sel_group, self.sel_child);
-            self.history_down(visible);
-            if (self.sel_group, self.sel_child) == before {
-                break;
-            }
-        }
-    }
-
-    pub fn history_page_up(&mut self, visible: usize) {
-        let steps = (visible / 2).max(1);
-        for _ in 0..steps {
-            let before = (self.sel_group, self.sel_child);
-            self.history_up(visible);
-            if (self.sel_group, self.sel_child) == before {
-                break;
-            }
-        }
     }
 
     // ── Diff panel text selection ─────────────────────────────────────────
