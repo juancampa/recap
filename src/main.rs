@@ -1,4 +1,5 @@
 mod app;
+mod markdown;
 mod persist;
 mod prompt;
 mod reltime;
@@ -813,8 +814,12 @@ fn handle_mouse(
                 }
             } else if rect_contains(rects.history, me.column, me.row) {
                 app.active_panel = app::Panel::History;
-                if let Some(row) = click_to_row(rects.history, me.column, me.row) {
-                    if let Some(target) = app.history_item_at_line(row) {
+                if let Some((label, _)) = ui::history_jump_label(app, rects.history)
+                    && rect_contains(label, me.column, me.row)
+                {
+                    app.history_bottom(visible_history);
+                } else if let Some(row) = click_to_row(rects.history, me.column, me.row) {
+                    if let Some(target) = app.history_item_at_line(row, visible_history) {
                         select_history_row(app, target, visible_history);
                     }
                 }
@@ -1023,6 +1028,7 @@ fn run(
         app.ensure_agent_visible(visible_agents);
         let list_width = (rects.history.width as usize).saturating_sub(2);
         app.recompute_row_heights(list_width, visible_history);
+        app.reveal_pending_selection(visible_history);
         app.set_diff_height(visible_diff);
         terminal.draw(|f| ui::draw(f, app))?;
 
