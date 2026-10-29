@@ -7,6 +7,10 @@
 //! launchd starts the server at login and starts it again when it stops.
 //! To upgrade the prod server, run `recap service install` again from the
 //! new build.
+//!
+//! `install --triage-dir <dir>` gives the server a triage directory, and
+//! `install --no-triage` removes it. Without these options, `install` keeps
+//! the triage directory of the agent file that exists.
 
 use anyhow::{Context, Result, bail};
 use recap_api::Api;
@@ -66,7 +70,15 @@ fn xml(text: &str) -> String {
 /// The agent file. The server gets the PATH of the shell that ran `install`,
 /// because it runs `nvim` and launchd gives a process only the system
 /// directories.
-fn plist(binary: &str, log: &str, path: &str) -> String {
+fn plist(binary: &str, log: &str, path: &str, triage_dir: Option<&str>) -> String {
+    let triage = triage_dir
+        .map(|dir| {
+            format!(
+                "\n        <string>--triage-dir</string>\n        <string>{}</string>",
+                xml(dir)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -79,7 +91,7 @@ fn plist(binary: &str, log: &str, path: &str) -> String {
         <string>{binary}</string>
         <string>serve</string>
         <string>--port</string>
-        <string>{port}</string>
+        <string>{port}</string>{triage}
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -108,7 +120,41 @@ fn plist(binary: &str, log: &str, path: &str) -> String {
     )
 }
 
-fn install() -> Result<()> {
+fn unxml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The triage directory in the agent file `text`: the string after the
+/// `--triage-dir` string.
+fn plist_triage_dir(text: &str) -> Option<String> {
+    let rest = &text[text.find("<string>--triage-dir</string>")? + 29..];
+    let start = rest.find("<string>")? + 8;
+    let end = start + rest[start..].find("</string>")?;
+    Some(unxml(&rest[start..end]))
+}
+
+/// The triage directory of the new agent file. `--triage-dir <dir>` sets
+/// it, `--no-triage` removes it. Else the directory of the agent file that
+/// exists stays.
+fn triage_dir_arg(args: &[String]) -> Result<Option<String>> {
+    if args.iter().any(|a| a == "--no-triage") {
+        return Ok(None);
+    }
+    if let Some(i) = args.iter().position(|a| a == "--triage-dir") {
+        let dir = args.get(i + 1).context("--triage-dir needs a directory")?;
+        // launchd starts the server in `/`, so a relative path is wrong.
+        let dir = std::path::absolute(dir)?;
+        return Ok(Some(dir.to_string_lossy().into_owned()));
+    }
+    Ok(fs::read_to_string(plist_path()?)
+        .ok()
+        .and_then(|text| plist_triage_dir(&text)))
+}
+
+fn install(args: &[String]) -> Result<()> {
+    let triage_dir = triage_dir_arg(args)?;
     let binary = installed_binary()?;
     let dir = binary.parent().expect("the path has a parent");
     fs::create_dir_all(dir)?;
@@ -131,6 +177,7 @@ fn install() -> Result<()> {
             &binary.to_string_lossy(),
             &log_file()?.to_string_lossy(),
             &path,
+            triage_dir.as_deref(),
         ),
     )?;
 
@@ -148,6 +195,10 @@ fn install() -> Result<()> {
     println!("agent file {}", plist_file.display());
     println!("log {}", log_file()?.display());
     println!("server {}", recap_client::local_url(recap_client::PROD_PORT));
+    match &triage_dir {
+        Some(dir) => println!("triage {dir}"),
+        None => println!("triage off"),
+    }
     Ok(())
 }
 
@@ -223,11 +274,13 @@ fn status() -> Result<()> {
 /// Run `recap service <command>`.
 pub fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("install") => install(),
+        Some("install") => install(&args[1..]),
         Some("uninstall") => uninstall(),
         Some("restart") => restart(),
         Some("status") => status(),
-        _ => bail!("usage: recap service install | uninstall | restart | status"),
+        _ => bail!(
+            "usage: recap service install [--triage-dir <dir> | --no-triage] | uninstall | restart | status"
+        ),
     }
 }
 
@@ -284,4 +337,17 @@ pub fn logs(args: &[String]) -> Result<()> {
         bail!("tail failed: {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_reads_back_the_triage_dir_that_it_wrote() {
+        let with = plist("/b/recap", "/l", "/usr/bin", Some("/t/a&b"));
+        assert_eq!(plist_triage_dir(&with).as_deref(), Some("/t/a&b"));
+        let without = plist("/b/recap", "/l", "/usr/bin", None);
+        assert_eq!(plist_triage_dir(&without), None);
+    }
 }

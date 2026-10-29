@@ -114,8 +114,11 @@ At the end of a run, the triage agent writes the delay to the next scheduled run
 The runner is off by default. To turn it on, give the server a triage directory:
 
 ```sh
+recap service install --triage-dir ~/.local/share/recap/triage
 recap serve --triage-dir ~/.local/share/recap/triage
 ```
+
+A later `recap service install` keeps the triage directory. `recap service install --no-triage` removes it.
 
 The triage directory contains these files:
 

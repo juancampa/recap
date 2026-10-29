@@ -608,6 +608,10 @@ serve options:
 
 service commands:
   install              Copy this binary, write the agent file and start the server.
+      --triage-dir <dir>
+                       Give the server this triage directory (see serve).
+      --no-triage      Remove the triage directory from the agent file.
+                       Without these options, install keeps the triage directory.
   uninstall            Stop the server and remove the agent file.
   restart              Stop the server and start it again.
   status               Print the state of the agent and of the server.
