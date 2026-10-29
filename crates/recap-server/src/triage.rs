@@ -225,6 +225,9 @@ impl Triage {
                 "--append-system-prompt",
                 INSTRUCTIONS,
             ])
+            // The sandbox of Claude Code refuses the connections to the
+            // recap server. The allowed tools limit the run instead.
+            .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])
             .arg("--allowedTools")
             .arg(allowed_tools(self.config.port))
             .env("PATH", child_path())
@@ -284,15 +287,15 @@ fn allowed_tools(port: u16) -> String {
         "Read".to_string(),
         "Glob".to_string(),
         "Grep".to_string(),
-        "Write(./**)".to_string(),
+        // An Edit rule also covers the Write tool.
         "Edit(./**)".to_string(),
         "Agent".to_string(),
         "Bash(recap list:*)".to_string(),
         format!("Bash(curl -s http://127.0.0.1:{port}/v1/*)"),
-        "Bash(git -C * log:*)".to_string(),
-        "Bash(git -C * status:*)".to_string(),
-        "Bash(git -C * diff:*)".to_string(),
-        "Bash(git -C * show:*)".to_string(),
+        "Bash(git -C * log *)".to_string(),
+        "Bash(git -C * status *)".to_string(),
+        "Bash(git -C * diff *)".to_string(),
+        "Bash(git -C * show *)".to_string(),
         "Bash(jq:*)".to_string(),
         "Bash(hs -c:*)".to_string(),
     ]
@@ -314,6 +317,7 @@ fn child_path() -> String {
     dirs.push(format!("{home}/.local/bin"));
     dirs.push("/opt/homebrew/bin".to_string());
     dirs.push("/usr/local/bin".to_string());
+    dirs.push("/Applications/Hammerspoon.app/Contents/Frameworks/hs".to_string());
     if let Ok(path) = std::env::var("PATH") {
         dirs.push(path);
     }
