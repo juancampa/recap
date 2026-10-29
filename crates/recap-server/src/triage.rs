@@ -18,6 +18,7 @@
 use crate::session::RunningSessions;
 use chrono::{DateTime, Local};
 use recap_api::{RunningSession, TriageStatus};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -200,7 +201,7 @@ impl Triage {
         // next run waits for a stop.
         self.next_run = None;
         let prompt = run_prompt(&self.config, &stops, running);
-        match self.start(&prompt) {
+        match self.start(&prompt, &repo_dirs(&self.config, &stops, running)) {
             Ok(run) => {
                 log::info!("triage run: started for {} stops", stops.len());
                 self.run = Some(run);
@@ -215,7 +216,7 @@ impl Triage {
         true
     }
 
-    fn start(&self, prompt: &str) -> anyhow::Result<Run> {
+    fn start(&self, prompt: &str, repo_dirs: &BTreeSet<PathBuf>) -> anyhow::Result<Run> {
         let mut child = Command::new(&self.config.claude)
             .current_dir(&self.config.dir)
             .args([
@@ -229,7 +230,7 @@ impl Triage {
             // recap server. The allowed tools limit the run instead.
             .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])
             .arg("--allowedTools")
-            .arg(allowed_tools(self.config.port))
+            .arg(allowed_tools(self.config.port, repo_dirs))
             .env("PATH", child_path())
             .env(
                 "RECAP_URL",
@@ -280,9 +281,29 @@ fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
 
+/// The directories of the stopped and the running sessions, except the
+/// triage directory. A triage run can read the repository state of these
+/// directories.
+fn repo_dirs(config: &TriageConfig, stops: &[Stop], running: &RunningSessions) -> BTreeSet<PathBuf> {
+    stops
+        .iter()
+        .filter_map(|s| s.cwd.clone())
+        .chain(running.list().into_iter().filter_map(|r| r.cwd))
+        .filter(|d| *d != config.dir)
+        .collect()
+}
+
 /// The tools that a triage run can use without a permission prompt.
 /// `claude -p` refuses all other tools.
-fn allowed_tools(port: u16) -> String {
+///
+/// Each repository rule names one exact directory. A `*` in the place of
+/// the directory also approves options such as `-c`, which can run any
+/// command.
+fn allowed_tools(port: u16, repo_dirs: &BTreeSet<PathBuf>) -> String {
+    let repo_rules = repo_dirs.iter().flat_map(|dir| {
+        ["log", "status", "diff", "show"]
+            .map(|cmd| format!("Bash(git -C {} {cmd} *)", dir.display()))
+    });
     [
         "Read".to_string(),
         "Glob".to_string(),
@@ -292,13 +313,12 @@ fn allowed_tools(port: u16) -> String {
         "Agent".to_string(),
         "Bash(recap list:*)".to_string(),
         format!("Bash(curl -s http://127.0.0.1:{port}/v1/*)"),
-        "Bash(git -C * log *)".to_string(),
-        "Bash(git -C * status *)".to_string(),
-        "Bash(git -C * diff *)".to_string(),
-        "Bash(git -C * show *)".to_string(),
         "Bash(jq:*)".to_string(),
         "Bash(hs -c:*)".to_string(),
     ]
+    .into_iter()
+    .chain(repo_rules)
+    .collect::<Vec<_>>()
     .join(",")
 }
 

@@ -97,7 +97,7 @@ Use the recap API with `curl -s`. The server URL is in the user message.
 
 Use `summary` when it exists. Claude Code writes it. Do not write a separate summary of a session.
 The transcript of a session is `~/.claude/projects/<project dir>/<session id>.jsonl`. Read only its end, because it can be very large.
-You can use `git -C <dir> log`, `status`, `diff` and `show` to check the state of a repository.
+You can use `git -C <dir> log`, `status`, `diff` and `show` to check the state of a repository. Use the exact directory of a session from the run message. Other directories need a permission, and a run cannot get a permission.
 
 ## The steps of each run
 
