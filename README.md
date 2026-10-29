@@ -87,6 +87,7 @@ The TUI has five panels: Projects, Files, Agents, History and Diff.
 | `p` | Show all the entries, only the prompts, or only the changes (History panel). |
 | `<` / `>` | Show fewer or more lines of each prompt (History panel). |
 | `m` | Change the mode of the panels. |
+| `Q` | Go to Queue mode (see [The follow-up queue](#the-follow-up-queue)). |
 | `t` | Show relative times or absolute times. |
 | `y` | Copy the entry, or the text that you selected with the mouse. |
 | `Y` | Copy the response of the agent. |
@@ -98,6 +99,58 @@ The TUI has five panels: Projects, Files, Agents, History and Diff.
 
 If the session of the entry runs, `o` focuses its terminal window.
 If the session does not run, `o` opens a new Ghostty window with `claude --resume <id>`.
+
+### The follow-up queue
+
+The follow-up queue shows the Claude Code sessions that wait for you.
+A triage agent (`claude -p --model opus`) keeps notes about each session in a directory of text files.
+
+The server starts a triage run when a session stops its turn.
+A stop is a change of the session from `busy` to `idle`, or a change to `waiting`.
+The server reads the status from the files in `~/.claude/sessions/`.
+One run occurs at a time. The stops that occur during a run go to the next run.
+At the end of a run, the triage agent writes the delay to the next scheduled run.
+
+The runner is off by default. To turn it on, give the server a triage directory:
+
+```sh
+recap serve --triage-dir ~/.local/share/recap/triage
+```
+
+The triage directory contains these files:
+
+| File | Content |
+|---|---|
+| `memory.md` | The notes of the triage agent that apply to many runs. |
+| `top.md` | The chain ids of rank 1, 2 and 3, one on each line. |
+| `next-run` | The delay to the next scheduled run (`90s`, `30m`, `2h`, `1d`), and the reason. |
+| `agents/<chain-id>.md` | The follow-ups, the agent TODO list and your TODO list for one session. |
+
+The server stores none of these data.
+`crates/recap-server/src/triage_prompt.md` contains the instructions and the file formats of the triage agent.
+
+`recap --queue`, or `Q` in the TUI, shows Queue mode.
+Queue mode has three panels: Queue, History and Triage.
+The Queue panel shows the sessions that have notes.
+A badge marks the sessions of rank 1, 2 and 3, and a resolved session is dim.
+The Triage panel shows the notes of the selected session.
+
+| Key | Panel | Action |
+|---|---|---|
+| `1`, `2`, `3` | All | Select the session of that rank. |
+| `s` | All | Change the order: creation time, last message, rank. |
+| `Enter` | Queue | Go to the session (the same action as `o`). |
+| `x` | Queue | Mark the current turn as resolved, or clear the mark. |
+| `d` | Queue | Hide the session until its next turn. |
+| `D` | Queue | Hide all the resolved sessions. |
+| `j` / `k` | Triage | Move between the follow-ups and the TODO items. |
+| `Enter` | Triage | Copy the follow-up, then go to the session. |
+| `Space` | Triage | Mark a TODO item as done, or clear the mark. |
+
+A new turn in a session clears the resolved mark and the hidden mark.
+
+`examples/hammerspoon/recap.lua` adds a global hotkey that focuses the queue window, and the `recapNotify` function that the triage agent uses for notifications.
+The comment at the start of the file tells how to install it.
 
 ### `recap list`
 

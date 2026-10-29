@@ -717,13 +717,18 @@ fn main() -> Result<()> {
     app.absolute_time = absolute_time || persisted.absolute_time;
     // The queue window starts in Queue mode. The panel heights are not
     // known yet; the main loop scrolls the selection into view.
-    if args.iter().any(|a| a == "--queue") {
+    let queue = args.iter().any(|a| a == "--queue");
+    if queue {
         app.enter_queue(0, 0);
     }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // The Hammerspoon module finds the queue window by this title.
+    if queue {
+        execute!(stdout, crossterm::terminal::SetTitle(QUEUE_WINDOW_TITLE))?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -982,6 +987,9 @@ fn select_history_row(app: &mut App, target: usize, visible: usize) {
     app.sel_child = new_child;
     app.rebuild_display_after_external_mutation(visible);
 }
+
+/// The terminal title of the TUI with `--queue`.
+const QUEUE_WINDOW_TITLE: &str = "recap queue";
 
 /// The interval between two checks of the triage files.
 const TRIAGE_FILES_CHECK: Duration = Duration::from_secs(1);
