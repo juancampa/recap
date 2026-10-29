@@ -10,7 +10,7 @@ pub use recap_api::{Agent, KindFilter, SearchKind};
 use recap_api::{
     Api, ApiError, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields, EntryId,
     Event, FileInfo, Filter, HistoryResponse, ListItem, Page, Project, RunningSession,
-    SEMANTIC_SCORE_SCALE,
+    SEMANTIC_SCORE_SCALE, TriageStatus,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -635,6 +635,10 @@ pub struct App {
     /// indicator in the help bar.
     pub loading: bool,
 
+    /// The state of the triage runner of the server. `None` when the server
+    /// runs without a triage directory.
+    pub triage: Option<TriageStatus>,
+
     /// The state of the semantic search on the server.
     pub embed: EmbedStatus,
 
@@ -752,6 +756,7 @@ impl App {
             search_history: SearchHistories::default(),
             auto_expand: false,
             running: HashMap::new(),
+            triage: None,
             loading: false,
             embed: EmbedStatus::Off,
             error: None,
@@ -834,6 +839,7 @@ impl App {
             Ok(status) => {
                 self.loading = status.loading;
                 self.embed = status.embed;
+                self.triage = status.triage;
                 self.error = None;
             }
             Err(e) => self.fail(e),
@@ -892,6 +898,7 @@ impl App {
             }
             Event::Embed(status) => self.embed = status,
             Event::Running { sessions } => self.set_running(sessions),
+            Event::Triage(status) => self.triage = Some(status),
         }
     }
 
@@ -3733,7 +3740,7 @@ mod tests {
     /// An App whose server loads the real sources of this machine. The
     /// function returns when the first load is complete.
     pub(super) fn real_app() -> App {
-        let server = recap_server::Server::start(Duration::from_secs(3600));
+        let server = recap_server::Server::start(Duration::from_secs(3600), None);
         let started = Instant::now();
         loop {
             let status = server.status().unwrap();

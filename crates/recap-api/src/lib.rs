@@ -548,6 +548,10 @@ pub struct Agent {
     /// The time of the newest prompt of the chain, or of its newest entry
     /// when the chain has no prompt.
     pub last_ts: DateTime<Local>,
+    /// The time of the oldest entry of the chain. The Queue panel sorts the
+    /// agents by this time.
+    #[serde(default)]
+    pub first_ts: Option<DateTime<Local>>,
     pub prompt_count: usize,
     /// The number of entries of the chain: prompts, file changes and
     /// compactions, subagent entries included.
@@ -762,6 +766,23 @@ pub struct Status {
     pub running: usize,
     /// The cache directory of this server.
     pub cache_dir: PathBuf,
+    /// The state of the triage runner. `None` when the server runs without
+    /// `--triage-dir`.
+    #[serde(default)]
+    pub triage: Option<TriageStatus>,
+}
+
+/// The state of the triage runner of the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageStatus {
+    /// The directory of the text files of the triage agent.
+    pub dir: PathBuf,
+    /// True while a triage run is active.
+    pub running: bool,
+    /// The number of stops that wait for the next run.
+    pub pending: usize,
+    /// The time of the next scheduled run, from the `next-run` file.
+    pub next_run: Option<DateTime<Local>>,
 }
 
 /// A running Claude Code session.
@@ -770,8 +791,15 @@ pub struct RunningSession {
     pub session_id: String,
     pub pid: i32,
     pub cwd: Option<PathBuf>,
-    /// The status that Claude Code reports (`idle`, `busy`, …).
+    /// The status that Claude Code reports (`idle`, `busy`, `waiting`).
     pub status: Option<String>,
+    /// What the session waits for when the status is `waiting`, for
+    /// example `permission prompt`.
+    #[serde(default)]
+    pub waiting_for: Option<String>,
+    /// The time of the last change of `status`.
+    #[serde(default)]
+    pub status_since: Option<DateTime<Local>>,
 }
 
 /// A change notice on `GET /v1/events`.
@@ -787,6 +815,8 @@ pub enum Event {
     Embed(EmbedStatus),
     /// The set of running Claude Code sessions changed.
     Running { sessions: Vec<RunningSession> },
+    /// The triage runner changed its state.
+    Triage(TriageStatus),
 }
 
 // ── Blame ────────────────────────────────────────────────────────────────────
@@ -994,6 +1024,7 @@ mod tests {
                 title: None,
                 archived: false,
                 last_ts: entry.timestamp,
+                first_ts: Some(entry.timestamp),
                 prompt_count: 1,
                 entry_count: 3,
                 project_roots: vec![],
@@ -1021,6 +1052,12 @@ mod tests {
             embed: EmbedStatus::Indexing { done: 1, total: 2 },
             running: 0,
             cache_dir: PathBuf::from("/tmp/c"),
+            triage: Some(TriageStatus {
+                dir: PathBuf::from("/tmp/t"),
+                running: true,
+                pending: 2,
+                next_run: Some(entry.timestamp),
+            }),
         });
         round_trip(&Filter {
             project: Some(PathBuf::from("/dev/proj")),

@@ -25,6 +25,11 @@ struct SessionFile {
     session_id: Option<String>,
     cwd: Option<String>,
     status: Option<String>,
+    #[serde(rename = "waitingFor")]
+    waiting_for: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    #[serde(rename = "statusUpdatedAt")]
+    status_updated_at: Option<i64>,
 }
 
 /// Snapshot of the live sessions, indexed by session id. Rebuild with
@@ -84,10 +89,25 @@ impl RunningSessions {
                     pid: sf.pid,
                     cwd: sf.cwd.map(PathBuf::from),
                     status: sf.status,
+                    waiting_for: sf.waiting_for,
+                    status_since: sf
+                        .status_updated_at
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .map(|t| t.with_timezone(&chrono::Local)),
                 },
             );
         }
         Self { by_session }
+    }
+
+    /// An index of `sessions`, without a scan.
+    pub fn from_list(sessions: Vec<RunningSession>) -> Self {
+        Self {
+            by_session: sessions
+                .into_iter()
+                .map(|s| (s.session_id.clone(), s))
+                .collect(),
+        }
     }
 
     /// The running session for `session_id`, if one is live.

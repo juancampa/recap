@@ -21,10 +21,11 @@ use crate::search::{self, ContentCache};
 use crate::session::RunningSessions;
 use crate::sources::{Load, LoadEvent, Sources};
 use crate::store::Store;
+use crate::triage::{Stop, Triage, TriageConfig};
 use recap_api::{
     Agent, AgentsResponse, Api, ApiError, ApiResult, BlameRequest, DiffLine, DiffSummary, Entry,
     EntryId, Event, FileInfo, FilesResponse, Filter, HistoryResponse, HunkBlame, ListItem, Page,
-    ProjectsResponse, RunningSession, SearchKind, SearchResponse, Status,
+    ProjectsResponse, RunningSession, SearchKind, SearchResponse, Status, TriageStatus,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -125,6 +126,9 @@ struct Inner {
     summaries: Mutex<HashMap<EntryId, DiffSummary>>,
     embed: Mutex<Embedder>,
     running: RwLock<RunningSessions>,
+    /// The last state of the triage runner, for `GET /v1/status`. The
+    /// manager thread owns the runner.
+    triage: RwLock<Option<TriageStatus>>,
     loading: AtomicBool,
     events: broadcast::Sender<Event>,
     files: ListCache<FileInfo>,
@@ -174,6 +178,7 @@ impl Server {
                 summaries: Mutex::new(HashMap::new()),
                 embed: Mutex::new(Embedder::default()),
                 running: RwLock::new(RunningSessions::default()),
+                triage: RwLock::new(None),
                 // A server with a manager thread starts with a load. Until
                 // the first load starts, the store is empty but not complete.
                 loading: AtomicBool::new(commands.is_some()),
@@ -198,14 +203,26 @@ impl Server {
     }
 
     /// A server that loads all sources and keeps the store current. It
-    /// starts a new load `poll` after the last load ends.
-    pub fn start(poll: Duration) -> Server {
+    /// starts a new load `poll` after the last load ends. With `triage`, it
+    /// also starts a triage run when a Claude Code session stops.
+    pub fn start(poll: Duration, triage: Option<TriageConfig>) -> Server {
         let (tx, rx) = mpsc::channel();
         let server = Server::with_store(Store::default(), Some(tx));
+        let triage = triage.and_then(|config| match Triage::new(config) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                log::error!("triage: the runner is off: {e}");
+                None
+            }
+        });
+        if let Some(t) = &triage {
+            log::info!("triage: the runner uses {}", t.status().dir.display());
+            *write(&server.inner.triage) = Some(t.status());
+        }
         let manager = server.clone();
         std::thread::Builder::new()
             .name("recap-manager".into())
-            .spawn(move || manager.manage(Sources::detect(), rx, poll))
+            .spawn(move || manager.manage(Sources::detect(), rx, poll, triage))
             .expect("cannot start the manager thread");
         server
     }
@@ -227,7 +244,13 @@ impl Server {
 
     // ── The manager thread ──────────────────────────────────────────────────
 
-    fn manage(&self, mut sources: Sources, commands: mpsc::Receiver<Command>, poll: Duration) {
+    fn manage(
+        &self,
+        mut sources: Sources,
+        commands: mpsc::Receiver<Command>,
+        poll: Duration,
+        mut triage: Option<Triage>,
+    ) {
         let mut load: Option<Load> = None;
         let mut next_load = Instant::now();
         let mut next_scan = Instant::now();
@@ -275,7 +298,23 @@ impl Server {
 
             if Instant::now() >= next_scan {
                 next_scan = Instant::now() + RUNNING_SCAN;
-                self.rescan_running();
+                let stops = self.rescan_running();
+                if let Some(t) = triage.as_mut() {
+                    t.add(stops);
+                }
+            }
+            if let Some(t) = triage.as_mut() {
+                let changed = t.tick(&read(&self.inner.running));
+                if changed {
+                    let status = t.status();
+                    *write(&self.inner.triage) = Some(status.clone());
+                    self.send(Event::Triage(status));
+                    // The run wrote a new transcript. Load it now, so that
+                    // the clients show what the triage agent did.
+                    if !t.status().running {
+                        next_load = next_load.min(Instant::now());
+                    }
+                }
             }
         }
     }
@@ -449,10 +488,17 @@ impl Server {
         }
     }
 
-    fn rescan_running(&self) {
+    /// Scan the running sessions, and return the sessions that stopped their
+    /// turn since the last scan.
+    fn rescan_running(&self) -> Vec<Stop> {
         let scan = RunningSessions::scan();
+        // Lock order: the store before the other locks.
+        let store = read(&self.inner.store);
         let mut running = write(&self.inner.running);
+        let mut stops = Vec::new();
         if *running != scan {
+            stops = crate::triage::stops(&running, &scan, |sid| store.chain_id(sid).to_string());
+            drop(store);
             let sessions = scan.list();
             let ids: Vec<String> = sessions
                 .iter()
@@ -473,6 +519,7 @@ impl Server {
             drop(running);
             self.send(Event::Running { sessions });
         }
+        stops
     }
 
     // ── Helpers of the API calls ────────────────────────────────────────────
@@ -571,6 +618,7 @@ impl Api for Server {
             embed: lock(&self.inner.embed).status(),
             running: read(&self.inner.running).len(),
             cache_dir: crate::paths::cache_root().clone(),
+            triage: read(&self.inner.triage).clone(),
         })
     }
 

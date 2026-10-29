@@ -595,6 +595,7 @@ impl Store {
                     title: None,
                     archived: self.is_archived(Some(sid)),
                     last_ts: e.timestamp,
+                    first_ts: None,
                     prompt_count: 0,
                     entry_count: 0,
                     project_roots: e.project_roots.clone(),
@@ -607,6 +608,9 @@ impl Store {
                 }
             });
             agent.entry_count += 1;
+            // The entries are newest first, so the last entry of the chain
+            // gives the oldest time.
+            agent.first_ts = Some(e.timestamp);
             // The first entry of a subagent session made the agent. Take the
             // session and the title again from the first entry of a session
             // that is not a subagent.

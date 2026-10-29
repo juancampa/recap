@@ -20,5 +20,6 @@ pub mod server;
 pub mod session;
 pub mod sources;
 pub mod store;
+pub mod triage;
 
 pub use server::Server;

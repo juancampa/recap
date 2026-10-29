@@ -510,7 +510,7 @@ fn run_list_cli(
     Ok(())
 }
 
-/// `recap serve [--port <n>] [--test] [--poll <seconds>]`: run the server
+/// `recap serve [--port <n>] [--test] [--poll <seconds>] [--triage-dir <dir>]`: run the server
 /// until SIGINT or SIGTERM. The prod server uses port 7717 and the prod
 /// cache. `--test` uses port 7718 and a fresh copy of the prod cache (see
 /// [`recap_server::cache::prepare_test_cache`]).
@@ -549,7 +549,14 @@ fn run_serve(args: &[String]) -> Result<()> {
         recap_server::cache::migrate(recap_server::paths::cache_root())?;
     }
     log::info!("cache {}", recap_server::paths::cache_root().display());
-    let server = recap_server::Server::start(poll);
+    // The triage runner starts an Opus run for each stop of a session, so
+    // it runs only when the user names a triage directory.
+    let triage = value("--triage-dir").map(|dir| recap_server::triage::TriageConfig {
+        dir: PathBuf::from(dir),
+        claude: PathBuf::from(claude_bin()),
+        port,
+    });
+    let server = recap_server::Server::start(poll, triage);
     recap_server::http::run(server, port)
 }
 
@@ -592,6 +599,9 @@ serve options:
       --port <n>       Listen on this port. The default is 7717, or 7718 with --test.
       --test           Use a copy of the prod cache.
       --poll <seconds> The interval between two loads of the sources. The default is 5.
+      --triage-dir <dir>
+                       Start a triage agent when a Claude Code session stops its turn.
+                       The triage agent keeps its text files in this directory.
 
 service commands:
   install              Copy this binary, write the agent file and start the server.
