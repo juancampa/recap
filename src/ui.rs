@@ -1,6 +1,6 @@
 use crate::app::{App, DisplayRow, KindFilter, Mode, Panel, RunState, SearchKind, SearchPhase};
 use crate::reltime::align_relative_times;
-use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
+use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields, TriageStatus};
 use crate::search_history::SearchMode;
 use crate::markdown::MdLine;
 use crate::settings::{Settings, SETTINGS_ITEMS};
@@ -2229,7 +2229,26 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             // with an ellipsis at the run state marker.
             let mut title_pieces = Vec::with_capacity(3);
             let rank = if queue { app.rank_of(agent) } else { None };
-            if let Some(rank) = rank {
+            if queue && app.is_triage_run(agent) {
+                title_pieces.push(prompt::Piece {
+                    text: "triage agent ".to_string(),
+                    style: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                });
+                let mut state = app.triage.as_ref().map(triage_state_text).unwrap_or_default();
+                if let Some(activity) = app
+                    .triage
+                    .as_ref()
+                    .filter(|t| t.running())
+                    .and_then(|t| t.run.as_ref())
+                    .and_then(|r| r.activity.as_deref())
+                {
+                    state.push_str(&format!(" · {activity}"));
+                }
+                title_pieces.push(prompt::Piece {
+                    text: state,
+                    style: Style::default().fg(Color::Gray),
+                });
+            } else if let Some(rank) = rank {
                 title_pieces.push(prompt::Piece {
                     text: format!(" {rank} "),
                     style: Style::default()
@@ -2242,16 +2261,18 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
                     style: Style::default(),
                 });
             }
-            if !title.is_empty() {
+            if !(queue && app.is_triage_run(agent)) {
+                if !title.is_empty() {
+                    title_pieces.push(prompt::Piece {
+                        text: format!("{title} "),
+                        style: Style::default().fg(title_color),
+                    });
+                }
                 title_pieces.push(prompt::Piece {
-                    text: format!("{title} "),
-                    style: Style::default().fg(title_color),
+                    text: chain,
+                    style: Style::default().fg(Color::Gray),
                 });
             }
-            title_pieces.push(prompt::Piece {
-                text: chain,
-                style: Style::default().fg(Color::Gray),
-            });
             let title_width = inner_width.saturating_sub(RUNNING_RESERVE).max(1);
             let one = prompt::wrap_line(&MdLine::Text(title_pieces), title_width, false, 1);
             let mut spans = prompt_line_spans(&one[0], highlight);
@@ -2356,45 +2377,35 @@ fn append_queue_state(
     spans.push(glyph);
 }
 
-/// Render the Triage panel of Queue mode: the follow-ups, the agent TODO
-/// items and the TODO items of the user for the selected agent. The last
-/// line shows the state of the triage runner.
-fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
+/// A heading line of the Triage panel.
+fn triage_heading(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The lines of the Triage panel above its status line, and for each line
+/// the index of its item in [`App::triage_items`]. A heading, an empty line
+/// or a message has no item.
+fn triage_lines(app: &App, width: usize, active: bool) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     use crate::app::TriageItem;
     use crate::triage_files::TodoList;
 
-    let active = app.active_panel == Panel::Diff;
-    let block = Block::default()
-        .title(" Triage ")
-        .borders(Borders::ALL)
-        .border_type(if active {
-            BorderType::Thick
-        } else {
-            BorderType::Plain
-        })
-        .border_style(border_style(active))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.height == 0 {
-        return;
+    if let Some(agent) = app.selected_agent_row().filter(|a| app.is_triage_run(a)) {
+        let lines = triage_run_lines(app, agent, width);
+        let items_of = vec![None; lines.len()];
+        return (lines, items_of);
     }
-    let width = inner.width as usize;
 
-    let heading = |text: &str| {
-        Line::from(Span::styled(
-            text.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut out: Vec<(Line<'static>, Option<usize>)> = Vec::new();
     let items = app.triage_items();
     if app.triage_files.is_none() {
-        lines.push(Line::from("The server runs without --triage-dir."));
+        out.push((Line::from("The server runs without --triage-dir."), None));
     } else if app.selected_agent_row().is_none() {
-        lines.push(Line::from("No agent waits for you."));
+        out.push((Line::from("No agent waits for you."), None));
     } else if items.is_empty() {
-        lines.push(Line::from("The triage agent wrote no notes for this agent."));
+        out.push((Line::from("The triage agent wrote no notes for this agent."), None));
     }
     let mut last_section = "";
     for (i, item) in items.iter().enumerate() {
@@ -2405,9 +2416,9 @@ fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
         };
         if section != last_section {
             if !last_section.is_empty() {
-                lines.push(Line::default());
+                out.push((Line::default(), None));
             }
-            lines.push(heading(section));
+            out.push((triage_heading(section), None));
             last_section = section;
         }
         let selected = active && i == app.triage_sel;
@@ -2424,48 +2435,213 @@ fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
                 for line in wrap_text(&follow_up.description, width.saturating_sub(pad.len()).max(1)) {
                     let lead = if first { number.clone() } else { pad.clone() };
                     first = false;
-                    lines.push(
+                    out.push((
                         Line::from(vec![
                             Span::styled(lead, Style::default().fg(ORDINAL_COLOR)),
                             Span::styled(line, Style::default().fg(Color::White)),
                         ])
                         .style(row_style),
-                    );
+                        Some(i),
+                    ));
                 }
                 for line in follow_up.prompt.lines() {
                     for part in wrap_text(line, width.saturating_sub(pad.len() + 2).max(1)) {
-                        lines.push(
+                        out.push((
                             Line::from(vec![
                                 Span::raw(format!("{pad}› ")),
                                 Span::styled(part, Style::default().fg(PROMPT_COLOR)),
                             ])
                             .style(row_style),
-                        );
+                            Some(i),
+                        ));
                     }
                 }
             }
             TriageItem::Todo(_, todo) => {
                 let (mark, color) = if todo.done {
-                    ("[x]", TIME_COLOR_OLD)
+                    (TODO_DONE_MARK, TIME_COLOR_OLD)
                 } else {
-                    ("[ ]", Color::White)
+                    (TODO_OPEN_MARK, Color::White)
                 };
                 let mut text_style = Style::default().fg(color);
                 if todo.done {
                     text_style = text_style.add_modifier(Modifier::CROSSED_OUT);
                 }
-                lines.push(
+                out.push((
                     Line::from(vec![
                         Span::styled(format!("{} ", todo.number), Style::default().fg(ORDINAL_COLOR)),
                         Span::styled(format!("{mark} "), Style::default().fg(color)),
                         Span::styled(todo.text.clone(), text_style),
                     ])
                     .style(row_style),
-                );
+                    Some(i),
+                ));
             }
         }
     }
+    out.into_iter().unzip()
+}
 
+/// The check box of an open and of a complete TODO item.
+const TODO_OPEN_MARK: &str = "[ ]";
+const TODO_DONE_MARK: &str = "[x]";
+
+/// The lines of the Triage panel for the row of the triage agent: the state
+/// of the runner, the current or last run, and the newest response of the
+/// run. History shows the full transcript of the run.
+fn triage_run_lines(app: &App, agent: &Agent, width: usize) -> Vec<Line<'static>> {
+    let Some(status) = &app.triage else {
+        return Vec::new();
+    };
+    let label = Style::default().fg(TIME_COLOR_RECENT);
+    let field = |name: &str, text: String| {
+        Line::from(vec![
+            Span::styled(format!("{name:<10}"), label),
+            Span::styled(text, Style::default().fg(Color::White)),
+        ])
+    };
+    let mut lines = vec![triage_heading("Triage runner")];
+    lines.push(field("state", triage_state_text(status)));
+    if let Some(run) = &status.run {
+        lines.push(field(
+            "run",
+            format!("started {} · {}", run.started.format("%H:%M:%S"), triage_run_reason(run)),
+        ));
+        // The last action of an ended run is its result, which the last
+        // response shows.
+        if let Some(activity) = run.activity.as_ref().filter(|_| run.ended.is_none()) {
+            let mut first = true;
+            for line in wrap_text(activity, width.saturating_sub(10).max(1)) {
+                lines.push(field(if first { "now" } else { "" }, line));
+                first = false;
+            }
+        }
+        if let (Some(ended), Some(success)) = (run.ended, run.success) {
+            lines.push(field(
+                "ended",
+                format!(
+                    "{} after {} · {}",
+                    ended.format("%H:%M:%S"),
+                    duration_text(ended - run.started),
+                    if success { "success" } else { "failed" }
+                ),
+            ));
+        }
+    }
+    let mut waiting = Vec::new();
+    if status.pending > 0 {
+        waiting.push(format!(
+            "{} {}",
+            status.pending,
+            if status.pending == 1 { "stop" } else { "stops" }
+        ));
+    }
+    if status.review {
+        waiting.push("a review".to_string());
+    }
+    if !waiting.is_empty() {
+        lines.push(field("waiting", waiting.join(", ")));
+    }
+    if let Some(next) = status.next_run {
+        let mut text = format!(
+            "{} (in {})",
+            next.format("%H:%M"),
+            duration_text(next - Local::now())
+        );
+        if let Some(reason) = app.triage_files.as_ref().and_then(|f| f.next_run_reason.as_deref()) {
+            text.push_str(&format!(" — {reason}"));
+        }
+        lines.push(field("next run", text));
+    }
+    lines.push(field("directory", status.dir.display().to_string()));
+    lines.push(Line::default());
+    lines.push(triage_heading(if status.running() {
+        "Newest response"
+    } else {
+        "Last response"
+    }));
+    let response = agent.last_response.as_deref().unwrap_or("No response yet.");
+    for line in wrap_text(response, width.max(1)) {
+        lines.push(Line::from(Span::styled(line, Style::default().fg(RESPONSE_COLOR))));
+    }
+    lines.push(Line::default());
+    for line in wrap_text(
+        "History shows the transcript of the run. R asks for a review of the agents of the last 24 hours.",
+        width.max(1),
+    ) {
+        lines.push(Line::from(Span::styled(line, label)));
+    }
+    lines
+}
+
+/// "running for 1m 20s" or "idle".
+fn triage_state_text(status: &TriageStatus) -> String {
+    match &status.run {
+        Some(run) if run.ended.is_none() => {
+            format!("running for {}", duration_text(Local::now() - run.started))
+        }
+        _ => "idle".to_string(),
+    }
+}
+
+/// The reason of a run: its stops and the review.
+fn triage_run_reason(run: &recap_api::TriageRun) -> String {
+    let mut parts = Vec::new();
+    if run.stops > 0 {
+        parts.push(format!("{} {}", run.stops, if run.stops == 1 { "stop" } else { "stops" }));
+    }
+    if run.review {
+        parts.push("review of 24 hours".to_string());
+    }
+    if parts.is_empty() {
+        parts.push("scheduled".to_string());
+    }
+    parts.join(", ")
+}
+
+/// A duration as "45s", "3m 20s" or "2h 5m".
+fn duration_text(d: chrono::TimeDelta) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+    }
+}
+
+/// The first line that the Triage panel shows. When the panel has the
+/// focus, it scrolls so that the first line of the selected item shows.
+fn triage_skip(items_of: &[Option<usize>], sel: usize, height: usize, active: bool) -> usize {
+    if !active {
+        return 0;
+    }
+    let first = items_of.iter().position(|i| *i == Some(sel)).unwrap_or(0);
+    first.saturating_sub(height.saturating_sub(3))
+}
+
+/// Render the Triage panel of Queue mode: the follow-ups, the agent TODO
+/// items and the TODO items of the user for the selected agent, or the
+/// state of the runner for the row of the triage agent. The last line shows
+/// the state of the triage runner.
+fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
+    let active = app.active_panel == Panel::Diff;
+    let block = Block::default()
+        .title(" Triage ")
+        .borders(Borders::ALL)
+        .border_type(if active {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(border_style(active))
+        .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
     // The state of the runner takes the last line.
     let status_area = Rect {
         y: inner.y + inner.height - 1,
@@ -2476,9 +2652,8 @@ fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
         height: inner.height - 1,
         ..inner
     };
-    // Keep the selected item in view: scroll so that its first line shows.
-    let selected_line = selected_triage_line(&lines, active);
-    let skip = selected_line.saturating_sub((list_area.height as usize).saturating_sub(3));
+    let (lines, items_of) = triage_lines(app, inner.width as usize, active);
+    let skip = triage_skip(&items_of, app.triage_sel, list_area.height as usize, active);
     f.render_widget(
         Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
         list_area,
@@ -2486,16 +2661,34 @@ fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(triage_status_line(app)), status_area);
 }
 
-/// The first line of the selected item in the lines of the Triage panel.
-/// The selected item is the only one with the selection background.
-fn selected_triage_line(lines: &[Line<'static>], active: bool) -> usize {
-    if !active {
-        return 0;
+/// What a click at `(row, col)` of the inner area of the Triage panel hits:
+/// the index of an item, and true when the click hits the check box of a
+/// TODO item. `area` is the panel with its border. The function uses the
+/// layout of the last frame, so it runs before the click changes the focus.
+pub fn triage_click(app: &App, area: Rect, row: usize, col: usize) -> Option<(usize, bool)> {
+    let width = area.width.saturating_sub(2) as usize;
+    // The status line takes the last line of the inner area.
+    let height = (area.height.saturating_sub(2) as usize).saturating_sub(1);
+    if row >= height {
+        return None;
     }
-    lines
-        .iter()
-        .position(|line| line.style.bg == Some(SELECTED_BG))
-        .unwrap_or(0)
+    let active = app.active_panel == Panel::Diff;
+    let (lines, items_of) = triage_lines(app, width, active);
+    let skip = triage_skip(&items_of, app.triage_sel, height, active);
+    let item = items_of.get(skip + row).copied().flatten()?;
+    let line = &lines[skip + row];
+    let mut x = 0;
+    let mut on_box = false;
+    for span in &line.spans {
+        let w = span.content.chars().count();
+        if col >= x && col < x + w {
+            let text = span.content.trim_end();
+            on_box = text == TODO_OPEN_MARK || text == TODO_DONE_MARK;
+            break;
+        }
+        x += w;
+    }
+    Some((item, on_box))
 }
 
 /// The state of the triage runner, on one line.
@@ -2505,16 +2698,22 @@ fn triage_status_line(app: &App) -> Line<'static> {
     };
     let dim = Style::default().fg(TIME_COLOR_RECENT);
     let mut spans = vec![Span::styled("triage ", dim)];
-    if status.running {
+    if status.running() {
         spans.push(Span::styled(
-            "running",
+            triage_state_text(status),
             Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD),
         ));
+        if let Some(activity) = status.run.as_ref().and_then(|r| r.activity.as_deref()) {
+            spans.push(Span::styled(format!(" · {activity}"), dim));
+        }
     } else {
         spans.push(Span::styled("idle", dim));
     }
     if status.pending > 0 {
         spans.push(Span::styled(format!(" · {} stops wait", status.pending), dim));
+    }
+    if status.review {
+        spans.push(Span::styled(" · a review waits", dim));
     }
     if let Some(next) = status.next_run {
         spans.push(Span::styled(format!(" · next {}", next.format("%H:%M")), dim));
@@ -3612,12 +3811,17 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                         ("d", "hide"),
                         ("D", "hide resolved"),
                         ("s", "order"),
+                        ("R", "review 24h"),
                     ] {
                         spans.extend(key(k, label));
                     }
                 }
                 (Mode::Queue, Panel::Diff) => {
-                    for (k, label) in [("enter", "copy follow-up and go"), ("space", "toggle TODO")] {
+                    for (k, label) in [
+                        ("enter", "copy follow-up and go"),
+                        ("space", "toggle TODO"),
+                        ("R", "review 24h"),
+                    ] {
                         spans.extend(key(k, label));
                     }
                 }

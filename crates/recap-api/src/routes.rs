@@ -38,6 +38,9 @@ pub const SESSIONS: &str = "/v1/sessions";
 pub const RELOAD: &str = "/v1/reload";
 /// `POST`: start the semantic search model and indexer.
 pub const EMBED_START: &str = "/v1/embed/start";
+/// `POST`: ask the triage runner for a review of the agents of the last 24
+/// hours.
+pub const TRIAGE_REVIEW: &str = "/v1/triage/review";
 /// `POST` a [`crate::BlameRequest`]: a list of [`crate::HunkBlame`].
 pub const BLAME: &str = "/v1/blame";
 /// `GET`: a stream of [`crate::Event`]. Server-sent events by default;

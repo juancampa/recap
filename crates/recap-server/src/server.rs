@@ -118,6 +118,7 @@ impl<T: ListItem> ListCache<T> {
 /// A request from an API call to the manager thread.
 enum Command {
     Reload,
+    TriageReview,
 }
 
 struct Inner {
@@ -262,6 +263,14 @@ impl Server {
         loop {
             match commands.recv_timeout(TICK) {
                 Ok(Command::Reload) => next_load = Instant::now(),
+                Ok(Command::TriageReview) => {
+                    if let Some(t) = triage.as_mut() {
+                        t.request_review();
+                        let status = t.status();
+                        *write(&self.inner.triage) = Some(status.clone());
+                        self.send(Event::Triage(status));
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -303,15 +312,17 @@ impl Server {
                     t.add(stops);
                 }
             }
-            if let Some(t) = triage.as_mut() {
-                let changed = t.tick(&read(&self.inner.running));
+            // A run reads the agents through the API, so it waits for the
+            // first load.
+            if let Some(t) = triage.as_mut().filter(|_| !first_load) {
+                let changed = t.tick(&read(&self.inner.running), || self.recent_project_dirs());
                 if changed {
                     let status = t.status();
                     *write(&self.inner.triage) = Some(status.clone());
                     self.send(Event::Triage(status));
                     // The run wrote a new transcript. Load it now, so that
                     // the clients show what the triage agent did.
-                    if !t.status().running {
+                    if !t.status().running() {
                         next_load = next_load.min(Instant::now());
                     }
                 }
@@ -321,6 +332,18 @@ impl Server {
 
     /// Log a complete load. A load that changed nothing is a `debug` line,
     /// because the manager starts one load every poll interval.
+    /// The project directories of the agents with activity in the last 24
+    /// hours.
+    fn recent_project_dirs(&self) -> Vec<PathBuf> {
+        let since = chrono::Local::now() - chrono::Duration::hours(24);
+        read(&self.inner.store)
+            .agents(None)
+            .into_iter()
+            .filter(|a| a.last_ts >= since)
+            .flat_map(|a| a.project_roots)
+            .collect()
+    }
+
     fn log_load(&self, stats: &LoadStats, first_load: bool) {
         let elapsed = stats
             .started
@@ -787,6 +810,20 @@ impl Api for Server {
 
     fn start_embedding(&self) -> ApiResult<()> {
         self.start_embedding_round();
+        Ok(())
+    }
+
+    fn triage_review(&self) -> ApiResult<()> {
+        if read(&self.inner.triage).is_none() {
+            return Err(ApiError(
+                "the server runs without --triage-dir".to_string(),
+            ));
+        }
+        if let Some(commands) = &self.inner.commands {
+            lock(commands)
+                .send(Command::TriageReview)
+                .map_err(|_| ApiError("the manager thread stopped".to_string()))?;
+        }
         Ok(())
     }
 

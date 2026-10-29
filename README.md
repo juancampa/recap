@@ -142,6 +142,7 @@ The Triage panel shows the notes of the selected session.
 |---|---|---|
 | `1`, `2`, `3` | All | Select the session of that rank. |
 | `s` | All | Change the order: creation time, last message, rank. |
+| `R` | All | Start a review of the agents of the last 24 hours. |
 | `Enter` | Queue | Go to the session (the same action as `o`). |
 | `x` | Queue | Mark the current turn as resolved, or clear the mark. |
 | `d` | Queue | Hide the session until its next turn. |
@@ -151,6 +152,14 @@ The Triage panel shows the notes of the selected session.
 | `Space` | Triage | Mark a TODO item as done, or clear the mark. |
 
 A new turn in a session clears the resolved mark and the hidden mark.
+In the Triage panel, a click selects an item, a click on a check box toggles the item, and the mouse wheel moves the selection.
+
+The first row of the Queue panel is the current or last run of the triage agent.
+For that row, the Triage panel shows the state of the runner, the current action of the run, the end of the last run, and the next scheduled run.
+The History panel shows the prompt of the run.
+
+A review run reads all the agents of the last 24 hours, and writes notes for the agents that need you.
+The server starts a review when the triage directory has no agent files, and when you press `R`.
 
 `examples/hammerspoon/recap.lua` adds a global hotkey that focuses the queue window, and the `recapNotify` function that the triage agent uses for notifications.
 The comment at the start of the file tells how to install it.

@@ -777,12 +777,47 @@ pub struct Status {
 pub struct TriageStatus {
     /// The directory of the text files of the triage agent.
     pub dir: PathBuf,
-    /// True while a triage run is active.
-    pub running: bool,
     /// The number of stops that wait for the next run.
     pub pending: usize,
+    /// True when a review of the agents of the last 24 hours waits for the
+    /// next run.
+    #[serde(default)]
+    pub review: bool,
     /// The time of the next scheduled run, from the `next-run` file.
     pub next_run: Option<DateTime<Local>>,
+    /// The active run, or the last run when no run is active. None before
+    /// the first run after the start of the server.
+    #[serde(default)]
+    pub run: Option<TriageRun>,
+}
+
+impl TriageStatus {
+    /// True while a triage run is active.
+    pub fn running(&self) -> bool {
+        self.run.as_ref().is_some_and(|r| r.ended.is_none())
+    }
+}
+
+/// One run of the triage agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageRun {
+    /// The Claude Code session of the run. The transcript of the run is the
+    /// agent with this chain id.
+    pub session_id: String,
+    pub started: DateTime<Local>,
+    /// The number of stops that started the run.
+    pub stops: usize,
+    /// True for a review of the agents of the last 24 hours.
+    pub review: bool,
+    /// None while the run is active.
+    pub ended: Option<DateTime<Local>>,
+    /// True when the process ended with success. None while the run is
+    /// active.
+    pub success: Option<bool>,
+    /// The newest action of the run on one line, for example
+    /// `Read agents/4f2a.md`.
+    #[serde(default)]
+    pub activity: Option<String>,
 }
 
 /// A running Claude Code session.
@@ -915,6 +950,9 @@ pub trait Api: Send + Sync {
     fn reload(&self) -> ApiResult<()>;
     /// Start the model server and the indexer, if they do not run.
     fn start_embedding(&self) -> ApiResult<()>;
+    /// Ask the triage runner for a review of the agents of the last 24
+    /// hours. The review starts when no run is active.
+    fn triage_review(&self) -> ApiResult<()>;
     fn blame(&self, request: &BlameRequest) -> ApiResult<Vec<HunkBlame>>;
     /// Write the files of an archived session back where the agent reads
     /// them, so the agent can resume the session.
@@ -1054,9 +1092,18 @@ mod tests {
             cache_dir: PathBuf::from("/tmp/c"),
             triage: Some(TriageStatus {
                 dir: PathBuf::from("/tmp/t"),
-                running: true,
                 pending: 2,
+                review: true,
                 next_run: Some(entry.timestamp),
+                run: Some(TriageRun {
+                    session_id: "s1".to_string(),
+                    started: entry.timestamp,
+                    stops: 1,
+                    review: false,
+                    ended: None,
+                    success: None,
+                    activity: Some("Read memory.md".to_string()),
+                }),
             }),
         });
         round_trip(&Filter {

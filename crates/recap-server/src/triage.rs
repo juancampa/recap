@@ -14,15 +14,20 @@
 //! the next run gets all of them. At the end of each run, the runner reads
 //! the `next-run` file that the triage agent wrote, and starts a run at that
 //! time if no stop starts one first.
+//!
+//! A review run reads all the agents of the last 24 hours. The runner starts
+//! one when the triage directory has no agent file, and when a client asks
+//! for one (`POST /v1/triage/review`).
 
 use crate::session::RunningSessions;
 use chrono::{DateTime, Local};
-use recap_api::{RunningSession, TriageStatus};
+use recap_api::{RunningSession, TriageRun, TriageStatus};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 /// The instructions of the triage agent. The runner gives them to `claude`
@@ -35,6 +40,9 @@ const NEXT_RUN_FILE: &str = "next-run";
 
 /// The runner stops a run that takes longer than this time.
 const MAX_RUN: Duration = Duration::from_secs(15 * 60);
+/// The runner stops a review run that takes longer than this time. A review
+/// reads many agents.
+const MAX_REVIEW_RUN: Duration = Duration::from_secs(40 * 60);
 
 /// The settings of the triage runner.
 #[derive(Debug, Clone)]
@@ -100,6 +108,19 @@ pub fn stops(
 struct Run {
     child: Child,
     started: Instant,
+    info: TriageRun,
+    /// The newest action of the run. The thread that reads stdout writes it.
+    activity: Arc<Mutex<Option<String>>>,
+}
+
+impl Run {
+    /// `info` with the newest action.
+    fn info(&self) -> TriageRun {
+        TriageRun {
+            activity: self.activity.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            ..self.info.clone()
+        }
+    }
 }
 
 impl Drop for Run {
@@ -114,22 +135,32 @@ pub struct Triage {
     config: TriageConfig,
     /// The stops that wait for the next run.
     pending: Vec<Stop>,
+    /// True when the next run is a review of the agents of the last 24 hours.
+    review: bool,
     run: Option<Run>,
+    /// The last run that ended.
+    last: Option<TriageRun>,
     /// The time that the `next-run` file gave at the end of the last run.
     next_run: Option<SystemTime>,
 }
 
 impl Triage {
     /// A runner for `config`. It makes the triage directory if it does not
-    /// exist.
+    /// exist. A directory without agent files gets a review run.
     pub fn new(config: TriageConfig) -> anyhow::Result<Triage> {
-        std::fs::create_dir_all(config.dir.join("agents"))?;
+        let agents = config.dir.join("agents");
+        std::fs::create_dir_all(&agents)?;
         let dir = config.dir.canonicalize()?;
         let next_run = read_next_run(&dir);
+        let review = !std::fs::read_dir(&agents)?
+            .filter_map(Result::ok)
+            .any(|e| e.path().extension().is_some_and(|x| x == "md"));
         Ok(Triage {
             config: TriageConfig { dir, ..config },
             pending: Vec::new(),
+            review,
             run: None,
+            last: None,
             next_run,
         })
     }
@@ -137,10 +168,17 @@ impl Triage {
     pub fn status(&self) -> TriageStatus {
         TriageStatus {
             dir: self.config.dir.clone(),
-            running: self.run.is_some(),
             pending: self.pending.len(),
+            review: self.review,
             next_run: self.next_run.map(DateTime::<Local>::from),
+            run: self.run.as_ref().map(Run::info).or_else(|| self.last.clone()),
         }
+    }
+
+    /// Make the next run a review of the agents of the last 24 hours.
+    pub fn request_review(&mut self) {
+        log::info!("triage: a client asked for a review");
+        self.review = true;
     }
 
     /// Add stops for the next run. The runner ignores the stops of its own
@@ -175,35 +213,79 @@ impl Triage {
     }
 
     /// End a run that finished, and start a run when one is due. `running`
-    /// is the last scan of the running sessions. It returns true when the
-    /// state changed.
-    pub fn tick(&mut self, running: &RunningSessions) -> bool {
+    /// is the last scan of the running sessions. `recent_dirs` gives the
+    /// project directories of the agents of the last 24 hours. It returns
+    /// true when the state changed.
+    pub fn tick(
+        &mut self,
+        running: &RunningSessions,
+        recent_dirs: impl FnOnce() -> Vec<PathBuf>,
+    ) -> bool {
         if let Some(run) = self.run.as_mut() {
-            match run.child.try_wait() {
-                Ok(None) if run.started.elapsed() < MAX_RUN => return false,
-                Ok(None) => log::warn!("triage run: stopped after {}", crate::logger::ms(MAX_RUN)),
-                Ok(Some(status)) => log::info!(
-                    "triage run: ended with {status} after {}",
-                    crate::logger::ms(run.started.elapsed())
-                ),
-                Err(e) => log::warn!("triage run: {e}"),
-            }
+            let limit = if run.info.review { MAX_REVIEW_RUN } else { MAX_RUN };
+            let success = match run.child.try_wait() {
+                Ok(None) if run.started.elapsed() < limit => {
+                    // A new action changes the status.
+                    let activity = run.info().activity;
+                    let changed = activity != run.info.activity;
+                    run.info.activity = activity;
+                    return changed;
+                }
+                Ok(None) => {
+                    log::warn!("triage run: stopped after {}", crate::logger::ms(limit));
+                    false
+                }
+                Ok(Some(status)) => {
+                    log::info!(
+                        "triage run: ended with {status} after {}",
+                        crate::logger::ms(run.started.elapsed())
+                    );
+                    status.success()
+                }
+                Err(e) => {
+                    log::warn!("triage run: {e}");
+                    false
+                }
+            };
+            let mut info = run.info();
+            info.ended = Some(Local::now());
+            info.success = Some(success);
+            self.last = Some(info);
             self.run = None;
             self.next_run = read_next_run(&self.config.dir);
             return true;
         }
         let scheduled = self.next_run.is_some_and(|t| SystemTime::now() >= t);
-        if self.pending.is_empty() && !scheduled {
+        if self.pending.is_empty() && !scheduled && !self.review {
             return false;
         }
         let stops = std::mem::take(&mut self.pending);
+        let review = std::mem::take(&mut self.review);
         // A scheduled run uses its time. Without a new `next-run` file, the
         // next run waits for a stop.
         self.next_run = None;
-        let prompt = run_prompt(&self.config, &stops, running);
-        match self.start(&prompt, &repo_dirs(&self.config, &stops, running)) {
+        let dirs = repo_dirs(&self.config, &stops, running, recent_dirs());
+        let prompt = run_prompt(&self.config, &stops, review, running, &dirs);
+        let info = |session_id: String| TriageRun {
+            session_id,
+            started: Local::now(),
+            stops: stops.len(),
+            review,
+            ended: None,
+            success: None,
+            activity: None,
+        };
+        match new_session_id()
+            .map_err(anyhow::Error::from)
+            .and_then(|id| self.start(&prompt, &dirs, info(id)))
+        {
             Ok(run) => {
-                log::info!("triage run: started for {} stops", stops.len());
+                log::info!(
+                    "triage run: started session {} for {} stops{}",
+                    short(&run.info.session_id),
+                    stops.len(),
+                    if review { " and a review" } else { "" }
+                );
                 self.run = Some(run);
             }
             // The stops of a run that cannot start are lost. A retry at each
@@ -216,7 +298,7 @@ impl Triage {
         true
     }
 
-    fn start(&self, prompt: &str, repo_dirs: &BTreeSet<PathBuf>) -> anyhow::Result<Run> {
+    fn start(&self, prompt: &str, repo_dirs: &BTreeSet<PathBuf>, info: TriageRun) -> anyhow::Result<Run> {
         let mut child = Command::new(&self.config.claude)
             .current_dir(&self.config.dir)
             .args([
@@ -229,6 +311,11 @@ impl Triage {
             // The sandbox of Claude Code refuses the connections to the
             // recap server. The allowed tools limit the run instead.
             .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])
+            // The TUI finds the transcript of the run by this id.
+            .args(["--session-id", &info.session_id])
+            // One JSON event for each message and tool call, so the runner
+            // can show the newest action. `-p` needs `--verbose` for it.
+            .args(["--output-format", "stream-json", "--verbose"])
             .arg("--allowedTools")
             .arg(allowed_tools(self.config.port, repo_dirs))
             .env("PATH", child_path())
@@ -245,34 +332,34 @@ impl Triage {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(prompt.as_bytes())?;
         }
-        for (name, pipe) in [
-            (
-                "stdout",
-                child
-                    .stdout
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            ),
-            (
-                "stderr",
-                child
-                    .stderr
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-            ),
-        ] {
-            let Some(pipe) = pipe else { continue };
+        let activity = Arc::new(Mutex::new(None));
+        if let Some(stdout) = child.stdout.take() {
+            let activity = Arc::clone(&activity);
             std::thread::Builder::new()
-                .name(format!("triage-{name}"))
+                .name("triage-stdout".to_string())
                 .spawn(move || {
-                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                        log::info!("triage {name}: {line}");
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        for action in stream_actions(&line) {
+                            log::info!("triage: {action}");
+                            *activity.lock().unwrap_or_else(|e| e.into_inner()) = Some(action);
+                        }
+                    }
+                })?;
+        }
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::Builder::new()
+                .name("triage-stderr".to_string())
+                .spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        log::info!("triage stderr: {line}");
                     }
                 })?;
         }
         Ok(Run {
             child,
             started: Instant::now(),
+            info,
+            activity,
         })
     }
 }
@@ -281,16 +368,75 @@ fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
 
-/// The directories of the stopped and the running sessions, except the
-/// triage directory. A triage run can read the repository state of these
-/// directories.
-fn repo_dirs(config: &TriageConfig, stops: &[Stop], running: &RunningSessions) -> BTreeSet<PathBuf> {
+/// The directories of the stopped and the running sessions and the
+/// `recent` project directories, except the triage directory. A triage run
+/// can read the repository state of these directories.
+fn repo_dirs(
+    config: &TriageConfig,
+    stops: &[Stop],
+    running: &RunningSessions,
+    recent: Vec<PathBuf>,
+) -> BTreeSet<PathBuf> {
     stops
         .iter()
         .filter_map(|s| s.cwd.clone())
         .chain(running.list().into_iter().filter_map(|r| r.cwd))
+        .chain(recent)
         .filter(|d| *d != config.dir)
         .collect()
+}
+
+/// The actions in one line of `--output-format stream-json`, each on one
+/// line: the tool calls and the texts of the agent, and the final result.
+fn stream_actions(line: &str) -> Vec<String> {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match event["type"].as_str() {
+        Some("assistant") => event["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| match part["type"].as_str() {
+                Some("text") => part["text"].as_str().map(one_line),
+                Some("tool_use") => {
+                    let input = &part["input"];
+                    let detail = ["description", "file_path", "pattern", "command"]
+                        .iter()
+                        .find_map(|k| input[k].as_str())
+                        .map(one_line)
+                        .unwrap_or_default();
+                    Some(format!("{} {detail}", part["name"].as_str().unwrap_or("tool")))
+                }
+                _ => None,
+            })
+            .filter(|s| !s.trim().is_empty())
+            .collect(),
+        Some("result") => vec![format!(
+            "result: {}",
+            one_line(event["result"].as_str().unwrap_or_default())
+        )],
+        _ => Vec::new(),
+    }
+}
+
+/// A random version 4 UUID, for the session id of a run.
+fn new_session_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
 }
 
 /// The tools that a triage run can use without a permission prompt.
@@ -314,7 +460,7 @@ fn allowed_tools(port: u16, repo_dirs: &BTreeSet<PathBuf>) -> String {
         "Bash(recap list:*)".to_string(),
         format!("Bash(curl -s http://127.0.0.1:{port}/v1/*)"),
         "Bash(jq:*)".to_string(),
-        "Bash(hs -c:*)".to_string(),
+        "Bash(hs -t 5 -c:*)".to_string(),
     ]
     .into_iter()
     .chain(repo_rules)
@@ -344,20 +490,33 @@ fn child_path() -> String {
     dirs.join(":")
 }
 
-/// The user message of a run: the time, the stops and the running sessions.
-fn run_prompt(config: &TriageConfig, stops: &[Stop], running: &RunningSessions) -> String {
+/// The user message of a run: the time, the reasons, the running sessions
+/// and the directories that the run can read with git.
+fn run_prompt(
+    config: &TriageConfig,
+    stops: &[Stop],
+    review: bool,
+    running: &RunningSessions,
+    repo_dirs: &BTreeSet<PathBuf>,
+) -> String {
     let mut s = String::new();
     let now = Local::now();
     let _ = writeln!(s, "Time: {}", now.format("%Y-%m-%d %H:%M %:z (%A)"));
     let _ = writeln!(s, "recap server: http://127.0.0.1:{}", config.port);
     let _ = writeln!(s, "Triage directory: {}", config.dir.display());
     let _ = writeln!(s);
-    if stops.is_empty() {
+    if review {
+        let _ = writeln!(
+            s,
+            "Reason: a review of all the agents of the last 24 hours (see \"Review runs\")."
+        );
+    }
+    if stops.is_empty() && !review {
         let _ = writeln!(
             s,
             "Reason: the scheduled run. No session stopped since the last run."
         );
-    } else {
+    } else if !stops.is_empty() {
         let _ = writeln!(s, "Reason: these sessions stopped their turn.");
         for stop in stops {
             let _ = writeln!(
@@ -386,6 +545,11 @@ fn run_prompt(config: &TriageConfig, stops: &[Stop], running: &RunningSessions) 
             continue;
         }
         let _ = writeln!(s, "- {}", running_line(&r));
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Directories that you can read with git:");
+    for dir in repo_dirs {
+        let _ = writeln!(s, "- {}", dir.display());
     }
     s
 }
@@ -520,5 +684,47 @@ mod tests {
         triage.add(vec![stop(Path::new("/elsewhere"))]);
         assert_eq!(triage.status().pending, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_without_agent_files_gets_a_review() {
+        let dir = std::env::temp_dir().join(format!("recap-triage-review-{}", std::process::id()));
+        let config = TriageConfig {
+            dir: dir.clone(),
+            claude: PathBuf::from("/nonexistent/claude"),
+            port: 1,
+        };
+        assert!(Triage::new(config.clone()).unwrap().status().review);
+        std::fs::write(dir.join("agents/a.md"), "").unwrap();
+        assert!(!Triage::new(config).unwrap().status().review);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stream_gives_the_tool_calls_and_the_result() {
+        let assistant = r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"I read\nthe memory."},
+            {"type":"tool_use","name":"Read","input":{"file_path":"/t/memory.md"}},
+            {"type":"tool_use","name":"Bash","input":{"command":"curl -s x","description":"List the agents"}}]}}"#
+            .replace('\n', "");
+        assert_eq!(
+            stream_actions(&assistant),
+            ["I read the memory.", "Read /t/memory.md", "Bash List the agents"]
+        );
+        assert_eq!(
+            stream_actions(r#"{"type":"result","result":"Done."}"#),
+            ["result: Done."]
+        );
+        assert!(stream_actions(r#"{"type":"system"}"#).is_empty());
+        assert!(stream_actions("not json").is_empty());
+    }
+
+    #[test]
+    fn a_session_id_is_a_version_4_uuid() {
+        let id = new_session_id().unwrap();
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert!(parts[2].starts_with('4'));
+        assert!(matches!(&parts[3][..1], "8" | "9" | "a" | "b"));
     }
 }

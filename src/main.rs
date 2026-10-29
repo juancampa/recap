@@ -852,9 +852,22 @@ fn handle_mouse(
             } else if let Some(diff) = rects.diff
                 && rect_contains(diff, me.column, me.row)
             {
-                app.active_panel = app::Panel::Diff;
-                let (row, col) = click_to_cell(diff, me.column, me.row);
-                app.diff_select_start(row, col);
+                if app.mode == app::Mode::Queue {
+                    // The click uses the layout of the last frame, so it
+                    // runs before the focus changes.
+                    let hit = click_to_row(diff, me.column, me.row).and_then(|row| {
+                        let col = (me.column - diff.x).saturating_sub(1) as usize;
+                        ui::triage_click(app, diff, row, col)
+                    });
+                    app.active_panel = app::Panel::Diff;
+                    if let Some((item, on_box)) = hit {
+                        app.click_triage_item(item, on_box, visible_history);
+                    }
+                } else {
+                    app.active_panel = app::Panel::Diff;
+                    let (row, col) = click_to_cell(diff, me.column, me.row);
+                    app.diff_select_start(row, col);
+                }
             }
             // A click outside the Diff panel drops the selection it held.
             if app.active_panel != app::Panel::Diff {
@@ -862,7 +875,9 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(diff) = rects.diff {
+            if let Some(diff) = rects.diff
+                && app.mode != app::Mode::Queue
+            {
                 let (row, col) = click_to_cell(diff, me.column, me.row);
                 app.diff_select_to(row, col);
             }
@@ -870,7 +885,9 @@ fn handle_mouse(
         MouseEventKind::Up(MouseButton::Left) => {
             // The drag ended. Put the selected text on the clipboard, so the
             // user needs no second key to copy it.
-            if let Some(diff) = rects.diff {
+            if let Some(diff) = rects.diff
+                && app.mode != app::Mode::Queue
+            {
                 let inner_width = (diff.width as usize).saturating_sub(2);
                 if let Some(text) = ui::diff_selection_text(app, inner_width, visible_diff) {
                     copy_to_clipboard(&text);
@@ -885,6 +902,7 @@ fn handle_mouse(
                     Some(app::Panel::Files) => app.file_down(visible_files),
                     Some(app::Panel::Agents) => app.agent_down(visible_agents),
                     Some(app::Panel::History) => app.history_down(visible_history),
+                    Some(app::Panel::Diff) if app.mode == app::Mode::Queue => app.triage_down(),
                     Some(app::Panel::Diff) => app.diff_down(),
                     None => {}
                 }
@@ -899,6 +917,7 @@ fn handle_mouse(
                     Some(app::Panel::Files) => app.file_up(visible_files),
                     Some(app::Panel::Agents) => app.agent_up(visible_agents),
                     Some(app::Panel::History) => app.history_up(visible_history),
+                    Some(app::Panel::Diff) if app.mode == app::Mode::Queue => app.triage_up(),
                     Some(app::Panel::Diff) => app.diff_up(),
                     None => {}
                 }
@@ -1021,6 +1040,7 @@ fn handle_queue_key(
             app.select_rank(c as usize - '0' as usize, visible_history, visible_agents);
         }
         (_, KeyCode::Char('s')) => app.cycle_queue_order(visible_history, visible_agents),
+        (_, KeyCode::Char('R')) => app.request_triage_review(),
         (app::Panel::Agents, KeyCode::Enter) => {
             if let Some(entry) = app.selected_agent_entry().cloned() {
                 focus_or_resume_session(&entry, &app.running);

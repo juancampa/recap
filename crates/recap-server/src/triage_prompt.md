@@ -97,7 +97,8 @@ Use the recap API with `curl -s`. The server URL is in the user message.
 
 Use `summary` when it exists. Claude Code writes it. Do not write a separate summary of a session.
 The transcript of a session is `~/.claude/projects/<project dir>/<session id>.jsonl`. Read only its end, because it can be very large.
-You can use `git -C <dir> log`, `status`, `diff` and `show` to check the state of a repository. Use the exact directory of a session from the run message. Other directories need a permission, and a run cannot get a permission.
+You can use `git -C <dir> log`, `status`, `diff` and `show` to check the state of a repository.
+The run message lists the directories that you can use. Other directories need a permission, and a run cannot get a permission.
 
 ## The steps of each run
 
@@ -116,11 +117,24 @@ You can use `git -C <dir> log`, `status`, `diff` and `show` to check the state o
    Tell it to read the end of the transcript and to report if the session makes progress, repeats the same actions, or has an error.
    Use the report to decide if the session needs the user.
 8. Send a notification only when an agent becomes number 1 in `top.md`, or when a session waits for a permission:
-   `hs -c 'recapNotify("<title>", "<text>")'`
+   `hs -t 5 -c 'recapNotify("<title>", "<text>")'`
    The text has a maximum of 80 characters. Do not use quote characters in the title or the text.
 9. Write `next-run`. Choose a delay that fits the state:
    a few minutes when a session waits for a permission, 10 to 30 minutes when a session is busy, and some hours when nothing changes.
 10. Update `memory.md` if you learned something that is true for many runs.
+
+## Review runs
+
+The recap server starts a review run when the triage directory has no agent files, and when the user asks for a review.
+In a review run, do the normal steps for each agent of the last 24 hours, not only for the stopped sessions:
+
+1. Read `GET /v1/agents`. Keep the agents whose `last_ts` is in the last 24 hours and that have a prompt.
+2. Skip your own triage sessions. They have no project roots, and their first prompt starts with `Time:`.
+3. For each agent, read its newest turns and its summary.
+   When there are many agents, start subagents with `model: "sonnet"`, each for a few agents, and tell them to report the state of each agent.
+4. Write an agent file for each agent that needs the user, or that has open TODO items.
+   Do not write a file for an agent that needs nothing from the user.
+5. Update the agent files that exist, `top.md`, `next-run` and `memory.md` as in a normal run.
 
 ## Rules
 

@@ -289,6 +289,11 @@ impl Api for Client {
         Ok(())
     }
 
+    fn triage_review(&self) -> ApiResult<()> {
+        self.post(routes::TRIAGE_REVIEW).call().map_err(error)?;
+        Ok(())
+    }
+
     fn start_embedding(&self) -> ApiResult<()> {
         self.post(routes::EMBED_START).call().map_err(error)?;
         Ok(())

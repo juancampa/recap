@@ -921,14 +921,31 @@ impl App {
     }
 
     /// Keep the state of the triage runner, and read the triage files when
-    /// the directory is new.
+    /// the directory is new. A new run changes the row of the triage agent.
     fn set_triage(&mut self, status: Option<TriageStatus>) {
         let dir = status.as_ref().map(|s| s.dir.clone());
-        if self.triage_files.as_ref().map(|f| &f.dir) != dir.as_ref() {
+        let new_dir = self.triage_files.as_ref().map(|f| &f.dir) != dir.as_ref();
+        if new_dir {
             self.triage_files = dir.map(|d| TriageFiles::read(&d));
+        }
+        let run_id = |s: &Option<TriageStatus>| {
+            s.as_ref()
+                .and_then(|s| s.run.as_ref())
+                .map(|r| r.session_id.clone())
+        };
+        let new_run = run_id(&self.triage) != run_id(&status);
+        self.triage = status;
+        if new_dir || new_run {
             self.apply_agent_view();
         }
-        self.triage = status;
+    }
+
+    /// Ask the server for a review of the agents of the last 24 hours (the
+    /// `R` key in Queue mode).
+    pub fn request_triage_review(&mut self) {
+        if let Err(e) = self.api.triage_review() {
+            self.fail(e);
+        }
     }
 
     fn set_running(&mut self, sessions: Vec<RunningSession>) {
@@ -2607,7 +2624,8 @@ impl App {
 
     /// Fill `agents` from `all_agents` for the current mode. Queue mode
     /// keeps the agents that have a triage file and that the user did not
-    /// hide for their current turn.
+    /// hide for their current turn. The first row of Queue mode is the
+    /// current or last run of the triage agent.
     fn apply_agent_view(&mut self) {
         if self.mode != Mode::Queue {
             self.agents = self.all_agents.clone();
@@ -2636,7 +2654,30 @@ impl App {
                 (files.rank(&a.chain_id).unwrap_or(usize::MAX), created(a), a.chain_id.clone())
             }),
         }
+        // The transcript of a new run shows after the next load of the
+        // server.
+        if let Some(run) = self.all_agents.iter().find(|a| self.is_triage_run(a)) {
+            agents.insert(0, run.clone());
+        }
         self.agents = agents;
+    }
+
+    /// True when `agent` is the current or last run of the triage agent.
+    pub fn is_triage_run(&self, agent: &Agent) -> bool {
+        self.triage
+            .as_ref()
+            .and_then(|t| t.run.as_ref())
+            .is_some_and(|r| r.session_id == agent.chain_id)
+    }
+
+    /// Select the item `index` of the Triage panel. A click on the check box
+    /// of a TODO item also toggles the item.
+    pub fn click_triage_item(&mut self, index: usize, on_box: bool, visible: usize) {
+        self.triage_sel = index;
+        self.clamp_triage_sel();
+        if on_box {
+            self.toggle_selected_todo(visible);
+        }
     }
 
     /// Fill `agents` again, and keep a selection that is in the list. When
@@ -2764,7 +2805,7 @@ impl App {
     /// Mark the current turn of the selected agent as resolved, or clear the
     /// mark.
     pub fn toggle_resolved(&mut self, visible: usize) {
-        let Some(agent) = self.selected_agent_row() else {
+        let Some(agent) = self.selected_agent_row().filter(|a| !self.is_triage_run(a)) else {
             return;
         };
         let target = (agent.chain_id.clone(), agent.last_ordinal);
@@ -2775,7 +2816,10 @@ impl App {
     /// Hide the selected agent until its next turn. The selection moves to
     /// the next agent.
     pub fn hide_selected(&mut self, visible: usize) {
-        let Some(i) = self.sel_agent_idx() else {
+        let Some(i) = self
+            .sel_agent_idx()
+            .filter(|&i| !self.is_triage_run(&self.agents[i]))
+        else {
             return;
         };
         let agent = &self.agents[i];

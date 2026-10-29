@@ -107,6 +107,7 @@ pub fn router(server: Server) -> Router {
         .route(routes::RUNNING, get(running))
         .route(routes::RELOAD, post(reload))
         .route(routes::EMBED_START, post(start_embedding))
+        .route(routes::TRIAGE_REVIEW, post(triage_review))
         .route(routes::BLAME, post(blame))
         .route(
             &format!("{}/{{id}}/restore", routes::SESSIONS),
@@ -250,6 +251,11 @@ async fn running(State(s): State<Server>) -> HttpResult<impl IntoResponse> {
 
 async fn reload(State(s): State<Server>) -> HttpResult<StatusCode> {
     blocking(s, |s| s.reload()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn triage_review(State(s): State<Server>) -> HttpResult<StatusCode> {
+    blocking(s, |s| s.triage_review()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
