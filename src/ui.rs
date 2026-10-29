@@ -511,7 +511,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         content_area,
         projects_active,
         files_active,
-        app.mode == Mode::Agent,
+        app.mode.has_agents(),
     );
 
     if let Some(projects_area) = rects.projects {
@@ -526,7 +526,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_history(f, app, rects.history);
     draw_history_footer(f, app, rects.history_footer);
     if let Some(diff_area) = rects.diff {
-        draw_diff(f, app, diff_area);
+        if app.mode == Mode::Queue {
+            draw_triage(f, app, diff_area);
+        } else {
+            draw_diff(f, app, diff_area);
+        }
     }
     draw_help(f, app, help_area);
     if app.settings_menu.open {
@@ -2086,8 +2090,14 @@ pub fn agent_content(agent: &Agent) -> [(&str, Color); AGENT_ROW_LINES] {
 /// History panel does.
 fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active_panel == Panel::Agents;
+    let queue = app.mode == Mode::Queue;
+    let title = if queue {
+        format!(" Queue ({}) · {} ", app.agents.len(), app.queue_order.label())
+    } else {
+        format!(" Agents ({}) ", app.agents.len())
+    };
     let block = Block::default()
-        .title(format!(" Agents ({}) ", app.agents.len()))
+        .title(title)
         .borders(Borders::ALL)
         .border_type(if active {
             BorderType::Thick
@@ -2118,7 +2128,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let sel = app.sel_agent_idx();
 
     let timestamps: Vec<DateTime<Local>> =
-        app.agents[first..last].iter().map(|a| a.last_ts).collect();
+        app.agents[first..last].iter().map(|a| app.agent_time(a)).collect();
     let formatted_ts = format_panel_timestamps(&timestamps, app.absolute_time);
 
     let meta_width = (inner_width / 3).min(AGENT_META_MAX_WIDTH);
@@ -2195,13 +2205,31 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
                 // in the Projects and Files panels.
                 style = style.add_modifier(Modifier::DIM);
             }
+            // A resolved agent needs nothing from the user, so it is dim.
+            if queue && app.is_resolved(agent) {
+                style = style.add_modifier(Modifier::DIM);
+            }
             let mut lines: Vec<Line> = Vec::with_capacity(AGENT_ROW_HEIGHT + 1);
             if app.agent_starts_day(i) {
-                lines.push(date_row_line(agent.last_ts.date_naive(), today, inner_width));
+                lines.push(date_row_line(app.agent_time(agent).date_naive(), today, inner_width));
             }
             // The title line: the session title and the project chain, cut
             // with an ellipsis at the run state marker.
             let mut title_pieces = Vec::with_capacity(3);
+            let rank = if queue { app.rank_of(agent) } else { None };
+            if let Some(rank) = rank {
+                title_pieces.push(prompt::Piece {
+                    text: format!(" {rank} "),
+                    style: Style::default()
+                        .fg(Color::Black)
+                        .bg(RANK_COLORS[rank - 1])
+                        .add_modifier(Modifier::BOLD),
+                });
+                title_pieces.push(prompt::Piece {
+                    text: " ".to_string(),
+                    style: Style::default(),
+                });
+            }
             if !title.is_empty() {
                 title_pieces.push(prompt::Piece {
                     text: format!("{title} "),
@@ -2215,7 +2243,11 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             let title_width = inner_width.saturating_sub(RUNNING_RESERVE).max(1);
             let one = prompt::wrap_line(&title_pieces, title_width, false, 1);
             let mut spans = prompt_line_spans(&one[0], highlight);
-            append_run_state(&mut spans, inner_width, state, AGENT_RUNNING_GLYPH);
+            if queue {
+                append_queue_state(&mut spans, inner_width, app.running.get(&agent.session_id));
+            } else {
+                append_run_state(&mut spans, inner_width, state, AGENT_RUNNING_GLYPH);
+            }
             lines.push(Line::from(spans).style(style));
 
             lines.extend(meta
@@ -2271,6 +2303,234 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
             &mut sb,
         );
     }
+}
+
+/// The badge colors of rank 1, 2 and 3 in the Queue panel.
+const RANK_COLORS: [Color; 3] = [
+    Color::Rgb(255, 214, 10),
+    Color::Rgb(255, 140, 66),
+    Color::Rgb(120, 200, 255),
+];
+/// The color of a session that waits for a permission or an answer.
+const WAITING_COLOR: Color = Color::Rgb(255, 214, 10);
+
+/// Append the status of the session at the right edge of a Queue row: a
+/// yellow `?` when the session waits for the user, a green dot when it is
+/// busy, a gray circle when it is idle. A session that does not run shows
+/// nothing.
+fn append_queue_state(
+    spans: &mut Vec<Span<'static>>,
+    inner_width: usize,
+    running: Option<&recap_api::RunningSession>,
+) {
+    let Some(running) = running else {
+        return;
+    };
+    let glyph = match running.status.as_deref() {
+        Some("waiting") => Span::styled(
+            "?",
+            Style::default().fg(WAITING_COLOR).add_modifier(Modifier::BOLD),
+        ),
+        Some("busy") => Span::styled(
+            AGENT_RUNNING_GLYPH,
+            Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD),
+        ),
+        _ => Span::styled("○", Style::default().fg(Color::Gray)),
+    };
+    let used = spans_width(spans);
+    let target = inner_width.saturating_sub(1);
+    let pad = if target > used { target - used } else { 1 };
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(glyph);
+}
+
+/// Render the Triage panel of Queue mode: the follow-ups, the agent TODO
+/// items and the TODO items of the user for the selected agent. The last
+/// line shows the state of the triage runner.
+fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
+    use crate::app::TriageItem;
+    use crate::triage_files::TodoList;
+
+    let active = app.active_panel == Panel::Diff;
+    let block = Block::default()
+        .title(" Triage ")
+        .borders(Borders::ALL)
+        .border_type(if active {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(border_style(active))
+        .style(Style::default().bg(PANEL_BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+
+    let heading = |text: &str| {
+        Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let items = app.triage_items();
+    if app.triage_files.is_none() {
+        lines.push(Line::from("The server runs without --triage-dir."));
+    } else if app.selected_agent_row().is_none() {
+        lines.push(Line::from("No agent waits for you."));
+    } else if items.is_empty() {
+        lines.push(Line::from("The triage agent wrote no notes for this agent."));
+    }
+    let mut last_section = "";
+    for (i, item) in items.iter().enumerate() {
+        let section = match item {
+            TriageItem::FollowUp(_) => "Follow-ups",
+            TriageItem::Todo(TodoList::Agent, _) => "Agent TODO",
+            TriageItem::Todo(TodoList::Mine, _) => "My TODO",
+        };
+        if section != last_section {
+            if !last_section.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(heading(section));
+            last_section = section;
+        }
+        let selected = active && i == app.triage_sel;
+        let row_style = if selected {
+            Style::default().bg(SELECTED_BG)
+        } else {
+            Style::default()
+        };
+        match item {
+            TriageItem::FollowUp(follow_up) => {
+                let number = format!("{} ", follow_up.number);
+                let pad = " ".repeat(number.chars().count());
+                let mut first = true;
+                for line in wrap_text(&follow_up.description, width.saturating_sub(pad.len()).max(1)) {
+                    let lead = if first { number.clone() } else { pad.clone() };
+                    first = false;
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(lead, Style::default().fg(ORDINAL_COLOR)),
+                            Span::styled(line, Style::default().fg(Color::White)),
+                        ])
+                        .style(row_style),
+                    );
+                }
+                for line in follow_up.prompt.lines() {
+                    for part in wrap_text(line, width.saturating_sub(pad.len() + 2).max(1)) {
+                        lines.push(
+                            Line::from(vec![
+                                Span::raw(format!("{pad}› ")),
+                                Span::styled(part, Style::default().fg(PROMPT_COLOR)),
+                            ])
+                            .style(row_style),
+                        );
+                    }
+                }
+            }
+            TriageItem::Todo(_, todo) => {
+                let (mark, color) = if todo.done {
+                    ("[x]", TIME_COLOR_OLD)
+                } else {
+                    ("[ ]", Color::White)
+                };
+                let mut text_style = Style::default().fg(color);
+                if todo.done {
+                    text_style = text_style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(format!("{} ", todo.number), Style::default().fg(ORDINAL_COLOR)),
+                        Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        Span::styled(todo.text.clone(), text_style),
+                    ])
+                    .style(row_style),
+                );
+            }
+        }
+    }
+
+    // The state of the runner takes the last line.
+    let status_area = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    let list_area = Rect {
+        height: inner.height - 1,
+        ..inner
+    };
+    // Keep the selected item in view: scroll so that its first line shows.
+    let selected_line = selected_triage_line(&lines, active);
+    let skip = selected_line.saturating_sub((list_area.height as usize).saturating_sub(3));
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
+        list_area,
+    );
+    f.render_widget(Paragraph::new(triage_status_line(app)), status_area);
+}
+
+/// The first line of the selected item in the lines of the Triage panel.
+/// The selected item is the only one with the selection background.
+fn selected_triage_line(lines: &[Line<'static>], active: bool) -> usize {
+    if !active {
+        return 0;
+    }
+    lines
+        .iter()
+        .position(|line| line.style.bg == Some(SELECTED_BG))
+        .unwrap_or(0)
+}
+
+/// The state of the triage runner, on one line.
+fn triage_status_line(app: &App) -> Line<'static> {
+    let Some(status) = &app.triage else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(TIME_COLOR_RECENT);
+    let mut spans = vec![Span::styled("triage ", dim)];
+    if status.running {
+        spans.push(Span::styled(
+            "running",
+            Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled("idle", dim));
+    }
+    if status.pending > 0 {
+        spans.push(Span::styled(format!(" · {} stops wait", status.pending), dim));
+    }
+    if let Some(next) = status.next_run {
+        spans.push(Span::styled(format!(" · next {}", next.format("%H:%M")), dim));
+        if let Some(reason) = app.triage_files.as_ref().and_then(|f| f.next_run_reason.as_deref()) {
+            spans.push(Span::styled(format!(" — {reason}"), dim));
+        }
+    }
+    Line::from(spans)
+}
+
+/// Split `text` into lines of at most `width` chars, at spaces.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let len = line.chars().count();
+        if len > 0 && len + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 fn draw_history(f: &mut Frame, app: &App, area: Rect) {
@@ -3256,8 +3516,31 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("g/G", Style::default().fg(Color::White)),
                 Span::styled(":top/bottom  ", Style::default().fg(Color::DarkGray)),
             ];
-            match app.active_panel {
-                Panel::History => {
+            let key = |k: &str, label: &str| {
+                [
+                    Span::styled(k.to_string(), Style::default().fg(Color::White)),
+                    Span::styled(format!(":{label}  "), Style::default().fg(Color::DarkGray)),
+                ]
+            };
+            match (app.mode, app.active_panel) {
+                (Mode::Queue, Panel::Agents) => {
+                    for (k, label) in [
+                        ("1-3", "rank"),
+                        ("enter", "go to session"),
+                        ("x", "resolve"),
+                        ("d", "hide"),
+                        ("D", "hide resolved"),
+                        ("s", "order"),
+                    ] {
+                        spans.extend(key(k, label));
+                    }
+                }
+                (Mode::Queue, Panel::Diff) => {
+                    for (k, label) in [("enter", "copy follow-up and go"), ("space", "toggle TODO")] {
+                        spans.extend(key(k, label));
+                    }
+                }
+                (_, Panel::History) => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":path  ", Style::default().fg(Color::DarkGray)));
                     spans.push(Span::styled("f", Style::default().fg(Color::White)));
@@ -3288,14 +3571,17 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
-                Panel::Projects | Panel::Files | Panel::Agents => {
+                (_, Panel::Projects | Panel::Files | Panel::Agents) => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":search  ", Style::default().fg(Color::DarkGray)));
                 }
-                Panel::Diff => {
+                (_, Panel::Diff) => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":find  ", Style::default().fg(Color::DarkGray)));
                 }
+            }
+            if app.mode != Mode::Queue {
+                spans.extend(key("Q", "queue"));
             }
             spans.extend([
                 Span::styled("m", Style::default().fg(Color::White)),
@@ -4050,7 +4336,7 @@ mod render_tests {
                 content,
                 app.active_panel == Panel::Projects,
                 app.active_panel == Panel::Files,
-                app.mode == crate::app::Mode::Agent,
+                app.mode.has_agents(),
             )
             .diff;
             draw(f, app);

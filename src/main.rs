@@ -5,6 +5,7 @@ mod reltime;
 mod search_history;
 mod service;
 mod settings;
+mod triage_files;
 mod ui;
 
 use anyhow::Result;
@@ -578,6 +579,7 @@ Usage:
 
 TUI options:
   -a, --absolute       Show absolute times instead of relative times.
+      --queue          Start in Queue mode: the agents that the triage agent tracks.
       --index          Build the semantic search index, then stop.
       --query <text>   With --index, run a search and print the results.
                        You can give this option more than one time.
@@ -713,6 +715,11 @@ fn main() -> Result<()> {
     app.apply_persisted(&persisted);
     // CLI flag forces absolute time on; otherwise honor the persisted toggle.
     app.absolute_time = absolute_time || persisted.absolute_time;
+    // The queue window starts in Queue mode. The panel heights are not
+    // known yet; the main loop scrolls the selection into view.
+    if args.iter().any(|a| a == "--queue") {
+        app.enter_queue(0, 0);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -976,11 +983,61 @@ fn select_history_row(app: &mut App, target: usize, visible: usize) {
     app.rebuild_display_after_external_mutation(visible);
 }
 
+/// The interval between two checks of the triage files.
+const TRIAGE_FILES_CHECK: Duration = Duration::from_secs(1);
+
+/// The keys of Queue mode. In Queue mode the Diff panel shows the notes of
+/// the triage agent (the Triage panel). It returns false for a key that the
+/// general key handler must take.
+fn handle_queue_key(
+    app: &mut App,
+    code: KeyCode,
+    ctrl: bool,
+    visible_history: usize,
+    visible_agents: usize,
+) -> bool {
+    if ctrl {
+        return false;
+    }
+    match (app.active_panel, code) {
+        (_, KeyCode::Char(c @ '1'..='3')) => {
+            app.select_rank(c as usize - '0' as usize, visible_history, visible_agents);
+        }
+        (_, KeyCode::Char('s')) => app.cycle_queue_order(visible_history, visible_agents),
+        (app::Panel::Agents, KeyCode::Enter) => {
+            if let Some(entry) = app.selected_agent_entry().cloned() {
+                focus_or_resume_session(&entry, &app.running);
+            }
+        }
+        (app::Panel::Agents, KeyCode::Char('x')) => app.toggle_resolved(visible_history),
+        (app::Panel::Agents, KeyCode::Char('d')) => app.hide_selected(visible_history),
+        (app::Panel::Agents, KeyCode::Char('D')) => app.hide_resolved(visible_history),
+        (app::Panel::Diff, KeyCode::Char('j') | KeyCode::Down) => app.triage_down(),
+        (app::Panel::Diff, KeyCode::Char('k') | KeyCode::Up) => app.triage_up(),
+        (app::Panel::Diff, KeyCode::Char(' ')) => app.toggle_selected_todo(visible_history),
+        (app::Panel::Diff, KeyCode::Enter) => {
+            // A follow-up goes to the clipboard, because a running session
+            // takes its input only from its own terminal.
+            if let Some(prompt) = app.selected_follow_up() {
+                copy_to_clipboard(&prompt);
+                if let Some(entry) = app.selected_agent_entry().cloned() {
+                    focus_or_resume_session(&entry, &app.running);
+                }
+            } else {
+                app.toggle_selected_todo(visible_history);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     messages: &mpsc::Receiver<recap_client::Message>,
 ) -> Result<()> {
+    let mut next_triage_check = std::time::Instant::now();
     loop {
         let size = terminal.size()?;
         let area = Rect {
@@ -995,7 +1052,7 @@ fn run(
             area,
             projects_active,
             files_active,
-            app.mode == app::Mode::Agent,
+            app.mode.has_agents(),
         );
 
         // History has a footer carved off its bottom, so its list height is
@@ -1027,6 +1084,10 @@ fn run(
                 recap_client::Message::Event(event) => app.on_event(event, visible_history),
                 recap_client::Message::Disconnected(error) => app.on_disconnect(error),
             }
+        }
+        if std::time::Instant::now() >= next_triage_check {
+            next_triage_check = std::time::Instant::now() + TRIAGE_FILES_CHECK;
+            app.refresh_triage_files(visible_history);
         }
         app.maybe_run_pending_search(visible_history);
         app.ensure_summaries_visible(visible_history);
@@ -1158,6 +1219,12 @@ fn run(
                         continue;
                     }
 
+                    if app.mode == app::Mode::Queue
+                        && handle_queue_key(app, key.code, ctrl, visible_history, visible_agents)
+                    {
+                        continue;
+                    }
+
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if ctrl => break,
@@ -1205,6 +1272,7 @@ fn run(
                             app.cycle_kind_filter(visible_history);
                         }
                         KeyCode::Char('m') => app.toggle_mode(visible_history, visible_agents),
+                        KeyCode::Char('Q') => app.enter_queue(visible_history, visible_agents),
                         KeyCode::Char('t') => app.toggle_time(),
                         KeyCode::Char('y') => {
                             // A mouse selection in the Diff panel wins over

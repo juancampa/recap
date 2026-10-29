@@ -12,6 +12,7 @@ use recap_api::{
     Event, FileInfo, Filter, HistoryResponse, ListItem, Page, Project, RunningSession,
     SEMANTIC_SCORE_SCALE, TriageStatus,
 };
+use crate::triage_files::{AgentNotes, FollowUp, Todo, TodoList, TriageFiles};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -123,19 +124,23 @@ pub struct DiffSelection {
 ///
 /// `File` is the original layout: Projects / Files → History → Diff. `Agent`
 /// inserts an Agents panel in front of History and filters History down to the
-/// selected agent, so the panel chain gains one step.
+/// selected agent, so the panel chain gains one step. `Queue` is Agent mode
+/// with only the agents that the triage agent tracks, and the Diff panel
+/// shows the notes of the triage agent (see [`crate::triage_files`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     File,
     Agent,
+    Queue,
 }
 
 impl Mode {
-    /// The mode the `m` key switches to.
+    /// The mode that the `m` key switches to. The `Q` key opens Queue
+    /// mode.
     pub fn other(self) -> Mode {
         match self {
             Mode::File => Mode::Agent,
-            Mode::Agent => Mode::File,
+            Mode::Agent | Mode::Queue => Mode::File,
         }
     }
 
@@ -143,8 +148,52 @@ impl Mode {
         match self {
             Mode::File => "file",
             Mode::Agent => "agent",
+            Mode::Queue => "queue",
         }
     }
+
+    /// True when the Agents panel shows and History shows one agent.
+    pub fn has_agents(self) -> bool {
+        self != Mode::File
+    }
+}
+
+/// The order of the agents in the Queue panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueOrder {
+    /// The oldest agent first. A new agent goes to the end, so the other
+    /// rows do not move.
+    #[default]
+    Created,
+    /// The agent with the newest prompt first.
+    LastMessage,
+    /// Rank 1, 2 and 3 first, then the others in the order of creation.
+    Rank,
+}
+
+impl QueueOrder {
+    pub fn next(self) -> QueueOrder {
+        match self {
+            QueueOrder::Created => QueueOrder::LastMessage,
+            QueueOrder::LastMessage => QueueOrder::Rank,
+            QueueOrder::Rank => QueueOrder::Created,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueOrder::Created => "created",
+            QueueOrder::LastMessage => "last message",
+            QueueOrder::Rank => "rank",
+        }
+    }
+}
+
+/// One row of the Triage panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriageItem<'a> {
+    FollowUp(&'a FollowUp),
+    Todo(TodoList, &'a Todo),
 }
 
 /// Whether the agent session behind an entry still runs.
@@ -530,9 +579,18 @@ pub struct App {
     /// first. The server sends them. Entries without a session id (Neovim
     /// edits, unattributed Cursor saves) have no agent, so Agent mode does
     /// not reach them.
-    pub agents: Vec<Agent>,
-    /// The project filter and the store version of `agents`.
+    all_agents: Vec<Agent>,
+    /// The project filter and the store version of `all_agents`.
     agents_basis: Option<ListBasis>,
+    /// The rows of the Agents panel: `all_agents` in Agent mode, and the
+    /// agents of the queue in Queue mode (see [`Self::apply_agent_view`]).
+    pub agents: Vec<Agent>,
+    /// The files of the triage agent. `None` when the server has no triage
+    /// runner.
+    pub triage_files: Option<TriageFiles>,
+    pub queue_order: QueueOrder,
+    /// The selected row of the Triage panel (see [`Self::triage_items`]).
+    pub triage_sel: usize,
     /// Chain id of the selected agent (see `Entry::chain_id`). Stored by id
     /// (not index) so the selection survives a change of the list.
     pub selected_agent: Option<String>,
@@ -722,8 +780,12 @@ impl App {
             file_scroll: 0,
             mode: Mode::File,
             kind_filter: KindFilter::All,
-            agents: Vec::new(),
+            all_agents: Vec::new(),
             agents_basis: None,
+            agents: Vec::new(),
+            triage_files: None,
+            queue_order: QueueOrder::default(),
+            triage_sel: 0,
             selected_agent: None,
             agent_scroll: 0,
             file_mode_history: None,
@@ -786,7 +848,7 @@ impl App {
         self.pending_agent_restore = state.selected_agent.clone();
         self.search_history = SearchHistories::from_snapshot(&state.search_history);
         self.settings = state.settings;
-        if self.mode == Mode::Agent {
+        if self.mode.has_agents() {
             self.active_panel = Panel::Agents;
         }
         self.refresh_projects();
@@ -817,7 +879,7 @@ impl App {
             absolute_time: self.absolute_time,
             auto_expand: self.auto_expand,
             prompt_lines: self.prompt_lines,
-            agent_mode: self.mode == Mode::Agent,
+            agent_mode: self.mode.has_agents(),
             selected_agent,
             search_history: self.search_history.snapshot(),
             settings: self.settings,
@@ -839,7 +901,7 @@ impl App {
             Ok(status) => {
                 self.loading = status.loading;
                 self.embed = status.embed;
-                self.triage = status.triage;
+                self.set_triage(status.triage);
                 self.error = None;
             }
             Err(e) => self.fail(e),
@@ -848,6 +910,17 @@ impl App {
             Ok(sessions) => self.set_running(sessions),
             Err(e) => self.fail(e),
         }
+    }
+
+    /// Keep the state of the triage runner, and read the triage files when
+    /// the directory is new.
+    fn set_triage(&mut self, status: Option<TriageStatus>) {
+        let dir = status.as_ref().map(|s| s.dir.clone());
+        if self.triage_files.as_ref().map(|f| &f.dir) != dir.as_ref() {
+            self.triage_files = dir.map(|d| TriageFiles::read(&d));
+            self.apply_agent_view();
+        }
+        self.triage = status;
     }
 
     fn set_running(&mut self, sessions: Vec<RunningSession>) {
@@ -898,7 +971,7 @@ impl App {
             }
             Event::Embed(status) => self.embed = status,
             Event::Running { sessions } => self.set_running(sessions),
-            Event::Triage(status) => self.triage = Some(status),
+            Event::Triage(status) => self.set_triage(Some(status)),
         }
     }
 
@@ -1054,7 +1127,7 @@ impl App {
             // this. With no agent selected, Agent mode reaches no entry at
             // all: the server matches the empty id to no entry.
             agent: match self.mode {
-                Mode::Agent => Some(self.selected_agent.clone().unwrap_or_default()),
+                Mode::Agent | Mode::Queue => Some(self.selected_agent.clone().unwrap_or_default()),
                 Mode::File => None,
             },
             kind: self.kind_filter,
@@ -1128,7 +1201,7 @@ impl App {
     fn recompute_agents(&mut self) {
         let project = self.selected_project_root();
         let api = &self.api;
-        let mut agents = std::mem::take(&mut self.agents);
+        let mut agents = std::mem::take(&mut self.all_agents);
         let read = read_list(&mut agents, &mut self.agents_basis, project.clone(), |since| {
             api.agents(project.as_deref(), since)
                 .map(|r| (r.version, r.since, r.agents, r.removed))
@@ -1136,6 +1209,9 @@ impl App {
         if let Err(e) = read {
             self.fail(e);
         }
+        self.all_agents = agents;
+        self.apply_agent_view();
+        let agents = std::mem::take(&mut self.agents);
 
         // Keep the selection on an agent that still exists, and give Agent
         // mode a selection as soon as the first agent loads. A pending
@@ -2271,7 +2347,7 @@ impl App {
     pub fn panel_order(&self) -> &'static [Panel] {
         match self.mode {
             Mode::File => &[Panel::Projects, Panel::Files, Panel::History, Panel::Diff],
-            Mode::Agent => &[
+            Mode::Agent | Mode::Queue => &[
                 Panel::Projects,
                 Panel::Files,
                 Panel::Agents,
@@ -2314,11 +2390,12 @@ impl App {
         self.active_panel = order[pos];
     }
 
-    /// Switch between File mode and Agent mode. The switch keeps the History
-    /// panel active if it was active before, because the user reads the rows
-    /// there. From any other panel, Agent mode starts on the Agents panel,
-    /// because the selection there drives every panel to its right. Leaving
-    /// Agent mode drops the agent filter.
+    /// Switch between File mode and Agent mode. Queue mode switches to File
+    /// mode. The switch keeps the History panel active if it was active
+    /// before, because the user reads the rows there. From any other panel,
+    /// Agent mode starts on the Agents panel, because the selection there
+    /// drives every panel to its right. Leaving Agent mode drops the agent
+    /// filter.
     pub fn toggle_mode(&mut self, visible: usize, visible_agents: usize) {
         // The row under the cursor right now. Both directions keep the user
         // on it, so the toggle never moves them away from their work.
@@ -2344,7 +2421,7 @@ impl App {
                     None => None,
                 }
             }
-            Mode::Agent => {
+            Mode::Agent | Mode::Queue => {
                 // Return to the remembered File-mode row, unless the user
                 // moved the History cursor while in Agent mode.
                 if current == self.mode_return.agent_row {
@@ -2364,10 +2441,11 @@ impl App {
                 entries: std::mem::take(&mut self.view.entries),
             });
         }
-        self.mode = self.mode.other();
+        self.mode = if leaving_file { Mode::Agent } else { Mode::File };
+        self.apply_agent_view();
         self.active_panel = match self.mode {
-            Mode::Agent if stay_on_history => Panel::History,
-            Mode::Agent => Panel::Agents,
+            Mode::Agent | Mode::Queue if stay_on_history => Panel::History,
+            Mode::Agent | Mode::Queue => Panel::Agents,
             Mode::File => Panel::History,
         };
         // The filtered set changes, so any search result now points at rows
@@ -2389,6 +2467,262 @@ impl App {
         } else {
             ModeReturn::default()
         };
+    }
+
+    /// Switch to Queue mode, on the Agents panel. The `--queue` option and
+    /// the `Q` key call this function.
+    pub fn enter_queue(&mut self, visible: usize, visible_agents: usize) {
+        if self.mode == Mode::File {
+            self.file_mode_history = Some(KeptHistory {
+                filter: self.filter(),
+                version: self.view.version,
+                entries: std::mem::take(&mut self.view.entries),
+            });
+        }
+        self.mode = Mode::Queue;
+        self.active_panel = Panel::Agents;
+        self.agent_search.clear();
+        self.search_clear();
+        self.reapply_agent_view(visible);
+        self.refilter_history();
+        self.center_history_selection(visible);
+        self.ensure_agent_visible(visible_agents);
+    }
+
+    /// Fill `agents` from `all_agents` for the current mode. Queue mode
+    /// keeps the agents that have a triage file and that the user did not
+    /// hide for their current turn.
+    fn apply_agent_view(&mut self) {
+        if self.mode != Mode::Queue {
+            self.agents = self.all_agents.clone();
+            return;
+        }
+        let Some(files) = &self.triage_files else {
+            self.agents = Vec::new();
+            return;
+        };
+        let mut agents: Vec<Agent> = self
+            .all_agents
+            .iter()
+            .filter(|a| {
+                files
+                    .agents
+                    .get(&a.chain_id)
+                    .is_some_and(|n| n.hidden.is_none() || n.hidden != a.last_ordinal)
+            })
+            .cloned()
+            .collect();
+        let created = |a: &Agent| a.first_ts.unwrap_or(a.last_ts);
+        match self.queue_order {
+            QueueOrder::Created => agents.sort_by_key(|a| (created(a), a.chain_id.clone())),
+            QueueOrder::LastMessage => agents.sort_by(|a, b| b.last_ts.cmp(&a.last_ts)),
+            QueueOrder::Rank => agents.sort_by_key(|a| {
+                (files.rank(&a.chain_id).unwrap_or(usize::MAX), created(a), a.chain_id.clone())
+            }),
+        }
+        self.agents = agents;
+    }
+
+    /// Fill `agents` again, and keep a selection that is in the list. When
+    /// the selected agent changes, History shows the new agent.
+    fn reapply_agent_view(&mut self, visible: usize) {
+        let before = self.selected_agent.clone();
+        self.apply_agent_view();
+        let still_there = self
+            .selected_agent
+            .as_deref()
+            .is_some_and(|id| self.agents.iter().any(|a| a.chain_id == id));
+        if !still_there {
+            self.selected_agent = self.agents.first().map(|a| a.chain_id.clone());
+            self.agent_scroll = 0;
+        }
+        self.clamp_triage_sel();
+        if self.selected_agent != before {
+            self.refilter_history();
+            self.adjust_scroll(visible);
+        }
+    }
+
+    /// Read the triage files again when one of them changed. The main loop
+    /// calls this function about once a second.
+    pub fn refresh_triage_files(&mut self, visible: usize) {
+        let Some(files) = &self.triage_files else {
+            return;
+        };
+        if !files.changed() {
+            return;
+        }
+        self.triage_files = Some(TriageFiles::read(&files.dir.clone()));
+        self.reapply_agent_view(visible);
+    }
+
+    /// The notes of the triage agent for `agent`.
+    pub fn notes_of(&self, agent: &Agent) -> Option<&AgentNotes> {
+        self.triage_files.as_ref()?.agents.get(&agent.chain_id)
+    }
+
+    /// The rank of `agent` in the queue: 1, 2 or 3.
+    pub fn rank_of(&self, agent: &Agent) -> Option<usize> {
+        self.triage_files.as_ref()?.rank(&agent.chain_id)
+    }
+
+    /// True when the triage agent or the user resolved the current turn of
+    /// `agent`.
+    pub fn is_resolved(&self, agent: &Agent) -> bool {
+        self.notes_of(agent)
+            .is_some_and(|n| n.resolved.is_some() && n.resolved == agent.last_ordinal)
+    }
+
+    /// The selected agent.
+    pub fn selected_agent_row(&self) -> Option<&Agent> {
+        self.sel_agent_idx().map(|i| &self.agents[i])
+    }
+
+    /// The rows of the Triage panel for the selected agent: the follow-ups,
+    /// the agent TODO items, then the TODO items of the user.
+    pub fn triage_items(&self) -> Vec<TriageItem<'_>> {
+        let Some(notes) = self.selected_agent_row().and_then(|a| self.notes_of(a)) else {
+            return Vec::new();
+        };
+        let mut items: Vec<TriageItem> = notes.follow_ups.iter().map(TriageItem::FollowUp).collect();
+        for list in [TodoList::Agent, TodoList::Mine] {
+            items.extend(notes.todo(list).iter().map(|t| TriageItem::Todo(list, t)));
+        }
+        items
+    }
+
+    fn clamp_triage_sel(&mut self) {
+        let n = self.triage_items().len();
+        self.triage_sel = self.triage_sel.min(n.saturating_sub(1));
+    }
+
+    pub fn triage_down(&mut self) {
+        if self.triage_sel + 1 < self.triage_items().len() {
+            self.triage_sel += 1;
+        }
+    }
+
+    pub fn triage_up(&mut self) {
+        self.triage_sel = self.triage_sel.saturating_sub(1);
+    }
+
+    /// The prompt of the selected follow-up.
+    pub fn selected_follow_up(&self) -> Option<String> {
+        match self.triage_items().get(self.triage_sel)? {
+            TriageItem::FollowUp(f) => Some(f.prompt.clone()),
+            TriageItem::Todo(..) => None,
+        }
+    }
+
+    /// Toggle the check box of the selected TODO item.
+    pub fn toggle_selected_todo(&mut self, visible: usize) {
+        let Some(chain) = self.selected_agent.clone() else {
+            return;
+        };
+        let Some(TriageItem::Todo(list, todo)) = self.triage_items().get(self.triage_sel).copied() else {
+            return;
+        };
+        let number = todo.number;
+        if let Some(files) = self.triage_files.as_mut()
+            && let Err(e) = files.toggle_todo(&chain, list, number)
+        {
+            self.error = Some(format!("cannot change the triage file: {e}"));
+        }
+        self.reapply_agent_view(visible);
+    }
+
+    /// Set `key` (`resolved` or `hidden`) of each agent in `chains` to the
+    /// current turn of the agent, or clear it when `clear` is true.
+    fn set_turn_fields(&mut self, chains: &[(String, Option<usize>)], key: &str, clear: bool, visible: usize) {
+        if let Some(files) = self.triage_files.as_mut() {
+            for (chain, turn) in chains {
+                let value = if clear { None } else { *turn };
+                if let Err(e) = files.set_turn_field(chain, key, value) {
+                    self.error = Some(format!("cannot change the triage file: {e}"));
+                }
+            }
+        }
+        self.reapply_agent_view(visible);
+    }
+
+    /// Mark the current turn of the selected agent as resolved, or clear the
+    /// mark.
+    pub fn toggle_resolved(&mut self, visible: usize) {
+        let Some(agent) = self.selected_agent_row() else {
+            return;
+        };
+        let target = (agent.chain_id.clone(), agent.last_ordinal);
+        let resolved = self.is_resolved(agent);
+        self.set_turn_fields(&[target], "resolved", resolved, visible);
+    }
+
+    /// Hide the selected agent until its next turn. The selection moves to
+    /// the next agent.
+    pub fn hide_selected(&mut self, visible: usize) {
+        let Some(i) = self.sel_agent_idx() else {
+            return;
+        };
+        let agent = &self.agents[i];
+        let target = (agent.chain_id.clone(), agent.last_ordinal);
+        let next = self
+            .agents
+            .get(i + 1)
+            .or_else(|| i.checked_sub(1).and_then(|p| self.agents.get(p)))
+            .map(|a| a.chain_id.clone());
+        self.selected_agent = next;
+        self.set_turn_fields(&[target], "hidden", false, visible);
+        self.refilter_history();
+    }
+
+    /// Hide all the resolved agents until their next turn.
+    pub fn hide_resolved(&mut self, visible: usize) {
+        let targets: Vec<(String, Option<usize>)> = self
+            .agents
+            .iter()
+            .filter(|a| self.is_resolved(a))
+            .map(|a| (a.chain_id.clone(), a.last_ordinal))
+            .collect();
+        self.set_turn_fields(&targets, "hidden", false, visible);
+    }
+
+    /// Select the agent of rank `rank`.
+    pub fn select_rank(&mut self, rank: usize, visible: usize, visible_agents: usize) {
+        let Some(chain) = self.triage_files.as_ref().and_then(|f| f.top.get(rank - 1)).cloned() else {
+            return;
+        };
+        if let Some(i) = self.agents.iter().position(|a| a.chain_id == chain) {
+            self.select_agent_row(i, visible);
+            self.ensure_agent_visible(visible_agents);
+        }
+    }
+
+    /// Change the order of the Queue panel.
+    pub fn cycle_queue_order(&mut self, visible: usize, visible_agents: usize) {
+        self.queue_order = self.queue_order.next();
+        self.reapply_agent_view(visible);
+        self.ensure_agent_visible(visible_agents);
+    }
+
+    /// The newest entry of the session of the selected agent, for the
+    /// focus or the resume of the session.
+    pub fn selected_agent_entry(&self) -> Option<&Entry> {
+        let agent = self.selected_agent_row()?;
+        self.view
+            .entries
+            .iter()
+            .filter(|e| e.session_id.as_deref() == Some(agent.session_id.as_str()))
+            .max_by_key(|e| e.timestamp)
+    }
+
+    /// The time that orders the agents of the panel and gives the date rows:
+    /// the creation time in the default order of Queue mode, else the time
+    /// of the newest prompt.
+    pub fn agent_time(&self, agent: &Agent) -> DateTime<Local> {
+        if self.mode == Mode::Queue && self.queue_order != QueueOrder::LastMessage {
+            agent.first_ts.unwrap_or(agent.last_ts)
+        } else {
+            agent.last_ts
+        }
     }
 
     /// The session chain of the History row closest to the cursor that has
@@ -2449,10 +2783,10 @@ impl App {
         if !self.settings.date_separator || i >= self.agents.len() {
             return false;
         }
-        let day = self.agents[i].last_ts.date_naive();
+        let day = self.agent_time(&self.agents[i]).date_naive();
         match i.checked_sub(1) {
             None => true,
-            Some(prev) => self.agents[prev].last_ts.date_naive() != day,
+            Some(prev) => self.agent_time(&self.agents[prev]).date_naive() != day,
         }
     }
 
@@ -2490,7 +2824,7 @@ impl App {
         if !self.settings.date_separator || top >= self.agents.len() || self.agent_starts_day(top) {
             return None;
         }
-        Some(self.agents[top].last_ts.date_naive())
+        Some(self.agent_time(&self.agents[top]).date_naive())
     }
 
     /// The agent on line `line` of the Agents panel, counted from the top
