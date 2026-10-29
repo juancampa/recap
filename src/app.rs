@@ -651,6 +651,13 @@ pub struct App {
     /// rows, because a refilter changes `display_rows` between two frames.
     last_list_width: usize,
 
+    /// True when `refilter_history` put the selection on a new list and the
+    /// History panel must scroll the selection into view. The function has
+    /// no panel height, so the main loop does the scroll on the next frame
+    /// (see [`Self::reveal_pending_selection`]). In Agent mode the selection
+    /// is the newest row, at the bottom of the list.
+    history_reveal_pending: bool,
+
     /// The number of text lines that the Diff panel showed on the last frame.
     /// `reveal_diff_line` needs it to scroll a search match into view, but
     /// `refresh_diff` runs outside the draw, so the main loop stores it here.
@@ -807,6 +814,7 @@ impl App {
             hist_row_heights: Vec::new(),
             row_heights_key: None,
             last_list_width: 0,
+            history_reveal_pending: false,
             last_diff_height: 0,
             display_gen: 0,
             diff_summaries: HashMap::new(),
@@ -1051,13 +1059,24 @@ impl App {
         self.project_search.clear();
         self.file_search.clear();
 
+        // Agent mode reads like a chat: when the panel shows the last row,
+        // it keeps the last row in view as rows arrive or grow. When the
+        // cursor is on the last row, the cursor moves to the new last row.
+        // The row heights are still the heights of the last frame here, so
+        // they describe the rows that the user sees.
+        let stick = self.mode.has_agents() && self.history_rows_below(visible) == 0;
+        let follow = stick && self.sel_display_row() + 1 == self.display_rows.len();
+
         let expanded = self.current_group_ids();
-        self.regroup(selection.clone());
+        self.regroup(if follow { None } else { selection.clone() });
         let moved = self.current_entry_id() != selection;
         if moved {
             self.diff_scroll = 0;
         }
         self.adjust_scroll(visible);
+        if stick {
+            self.scroll_history_to_bottom(visible);
+        }
         // Build the diff again only when the text can be different, so a
         // change in another entry does not drop the Diff scroll or the
         // mouse selection.
@@ -1171,7 +1190,11 @@ impl App {
     }
 
     /// Build the groups from `view.entries` again, and put the selection on
-    /// the entry `selection`. The selection falls back to row 0.
+    /// the entry `selection`. The selection falls back to the newest row.
+    ///
+    /// File mode lists the newest entry first. Agent mode lists the oldest
+    /// entry first, so the turns of the agent read from top to bottom and
+    /// the newest turn is at the bottom.
     fn regroup(&mut self, selection: Option<EntryId>) {
         self.groups = recap_api::group_runs(&self.view.entries)
             .into_iter()
@@ -1180,6 +1203,20 @@ impl App {
                 expanded: false,
             })
             .collect();
+        if self.mode.has_agents() {
+            self.groups.reverse();
+            for group in &mut self.groups {
+                group.entry_indices.reverse();
+            }
+        }
+        let newest = match self.mode {
+            Mode::File => (0, 0),
+            Mode::Agent | Mode::Queue => {
+                let last = self.groups.len().saturating_sub(1);
+                let child = self.groups.get(last).map_or(0, |g| g.entry_indices.len() - 1);
+                (last, child)
+            }
+        };
         let target = selection
             .and_then(|id| self.view.index_of(&id))
             .and_then(|idx| {
@@ -1187,7 +1224,7 @@ impl App {
                     g.entry_indices.iter().position(|&ei| ei == idx).map(|ci| (gi, ci))
                 })
             });
-        let (sg, sc) = target.unwrap_or((0, 0));
+        let (sg, sc) = target.unwrap_or(newest);
         self.sel_group = sg;
         self.sel_child = sc;
         if !self.groups.is_empty() && self.effective_auto_expand() {
@@ -1331,7 +1368,7 @@ impl App {
     /// width; otherwise each row uses its own. 0 means the panel draws no
     /// project column for that row.
     pub fn project_col_width(&self, own_chars: usize) -> usize {
-        if !self.settings.show_project {
+        if !self.history_columns().show_project {
             0
         } else if self.settings.align_project {
             self.project_col_chars
@@ -1353,6 +1390,7 @@ impl App {
         self.load_history();
         self.regroup(None);
         self.history_scroll = 0;
+        self.history_reveal_pending = true;
         self.diff_scroll = 0;
         self.refresh_diff();
         // Project filter changed — search results no longer reflect the visible set.
@@ -1483,6 +1521,14 @@ impl App {
                 }
             })
             .unwrap_or(0)
+    }
+
+    /// Scroll the selection into view after `refilter_history`. The main
+    /// loop calls this on each frame, after it computed the row heights.
+    pub fn reveal_pending_selection(&mut self, visible: usize) {
+        if std::mem::take(&mut self.history_reveal_pending) {
+            self.adjust_scroll(visible);
+        }
     }
 
     /// Keep the selected display row within the `visible` lines below
@@ -1648,6 +1694,39 @@ impl App {
         }
     }
 
+    /// True if display row `idx` is a prompt in Agent mode. The History panel
+    /// then draws one empty line above the prompt, so each turn of the agent
+    /// stands apart.
+    pub fn row_gap(&self, idx: usize) -> bool {
+        self.mode.has_agents()
+            && matches!(self.display_rows.get(idx), Some(DisplayRow::Group(_)))
+            && self.view.entries[self.row_entry_idx(idx)].is_prompt()
+    }
+
+    /// The number of display rows that the History panel does not show
+    /// completely: the rows below the last complete row in `visible` lines.
+    pub fn history_rows_below(&self, visible: usize) -> usize {
+        let lines = self.row_lines(visible);
+        let mut used = 0usize;
+        for idx in self.history_scroll..self.display_rows.len() {
+            used += self.row_height(idx);
+            if used > lines {
+                return self.display_rows.len() - idx;
+            }
+        }
+        0
+    }
+
+    /// Scroll the History panel so the last row is at the bottom. The
+    /// selection stays in view.
+    fn scroll_history_to_bottom(&mut self, visible: usize) {
+        self.refresh_row_heights(visible);
+        let lines = self.row_lines(visible);
+        let last = self.display_rows.len().saturating_sub(1);
+        self.history_scroll = self.max_history_scroll(lines).min(last);
+        self.adjust_scroll(visible);
+    }
+
     /// True if display row `idx` is the first row of its day, and the user
     /// turned the date row on. The History panel then draws one extra line
     /// above the row, and [`Self::recompute_row_heights`] adds that line to
@@ -1670,14 +1749,34 @@ impl App {
         }
     }
 
-    /// Map a 0-based line offset below `history_scroll` to the display-row
-    /// index that occupies it (accounting for multi-line prompt rows). Used
-    /// to translate a mouse click into a selection.
-    pub fn history_item_at_line(&self, line_offset: usize) -> Option<usize> {
-        // The sticky date row is above the rows. A click on it selects no row.
-        let line_offset = line_offset.checked_sub(self.sticky_date().is_some() as usize)?;
-        let mut acc = 0usize;
+    /// The number of display rows, from `history_scroll` down, that the
+    /// History panel draws in `lines` lines. The count includes the last
+    /// row that fits only in part: the panel draws the lines of that row
+    /// that fit.
+    pub fn history_rows_fit(&self, lines: usize) -> usize {
+        let mut count = 0usize;
+        let mut used = 0usize;
         for idx in self.history_scroll..self.display_rows.len() {
+            if used >= lines {
+                break;
+            }
+            count += 1;
+            used += self.row_height(idx);
+        }
+        count
+    }
+
+    /// Map a 0-based line offset below `history_scroll` to the display-row
+    /// index that occupies it (accounting for multi-line prompt rows), of the
+    /// rows that the panel draws in its `visible` lines. Used to translate a
+    /// mouse click into a selection.
+    pub fn history_item_at_line(&self, line_offset: usize, visible: usize) -> Option<usize> {
+        // The sticky date row is above the rows. A click on it selects no row.
+        let sticky = self.sticky_date().is_some() as usize;
+        let line_offset = line_offset.checked_sub(sticky)?;
+        let drawn = self.history_rows_fit(visible.saturating_sub(sticky));
+        let mut acc = 0usize;
+        for idx in self.history_scroll..self.history_scroll + drawn {
             let h = self.row_height(idx);
             if line_offset < acc + h {
                 return Some(idx);
@@ -1700,6 +1799,21 @@ impl App {
         self.recompute_row_heights(self.last_list_width, list_height);
     }
 
+    /// The History column settings for the current mode. In Agent mode the
+    /// Agents panel already shows the source, the title and the project of
+    /// each agent, so the History panel does not draw these three columns.
+    pub fn history_columns(&self) -> crate::settings::Settings {
+        match self.mode {
+            Mode::File => self.settings,
+            Mode::Agent | Mode::Queue => crate::settings::Settings {
+                show_source: false,
+                show_title: false,
+                show_project: false,
+                ..self.settings
+            },
+        }
+    }
+
     pub fn recompute_row_heights(&mut self, list_width: usize, list_height: usize) {
         self.last_list_width = list_width;
         let ts_width = self.estimate_ts_width(list_height);
@@ -1708,7 +1822,7 @@ impl App {
             ts_width,
             self.prompt_lines,
             self.display_gen,
-            self.settings.cache_bits(),
+            self.history_columns().cache_bits(),
         );
         if self.row_heights_key == Some(key)
             && self.hist_row_heights.len() == self.display_rows.len()
@@ -1730,7 +1844,7 @@ impl App {
                 DisplayRow::Child { .. } => 1,
             };
             // The date row of a day sits on top of the first row of that day.
-            heights.push(h + self.row_starts_day(idx) as usize);
+            heights.push(h + self.row_starts_day(idx) as usize + self.row_gap(idx) as usize);
         }
         self.hist_row_heights = heights;
         self.row_heights_key = Some(key);
@@ -1755,7 +1869,7 @@ impl App {
             width + crate::ui::PROJECT_GAP
         };
         let ordinal = self.prompt_ordinal(entry);
-        let text_start = crate::ui::history_prefix_cols(ts_width, list_width, &self.settings)
+        let text_start = crate::ui::history_prefix_cols(ts_width, list_width, &self.history_columns())
             + chain_chars
             + crate::ui::prompt_prefix_width(ordinal, entry.subagent);
         let avail = list_width
@@ -1820,10 +1934,12 @@ impl App {
         for i in 1..self.groups.len() {
             let prev_oldest_idx = *self.groups[i - 1].entry_indices.last().unwrap();
             let cur_newest_idx = self.groups[i].entry_indices[0];
+            // Agent mode lists the oldest entry first, so the gap is
+            // negative there.
             let gap = self.view.entries[prev_oldest_idx]
                 .timestamp
                 .signed_duration_since(self.view.entries[cur_newest_idx].timestamp);
-            if gap.num_minutes() > 60 {
+            if gap.num_minutes().abs() > 60 {
                 epoch = 1 - epoch;
             }
             epochs[i] = epoch;
@@ -4509,14 +4625,56 @@ mod tests {
         assert_eq!(app.groups.len(), 4, "File mode lists every row again");
     }
 
+    /// Agent mode lists the oldest prompt first. A new agent selection puts
+    /// the cursor on the newest prompt, and the first frame scrolls it into
+    /// view at the bottom of the panel.
+    #[test]
+    fn agent_mode_lists_the_newest_prompt_at_the_bottom() {
+        let entries = (0..30).map(|i| prompt_entry(&format!("ask {i}"), "s1", 30 - i)).collect();
+        let mut app = test_app(entries);
+        app.mode = Mode::Agent;
+        app.selected_agent = Some("s1".to_string());
+        app.refilter();
+        let texts: Vec<&str> = app
+            .groups
+            .iter()
+            .map(|g| app.view.entries[g.entry_indices[0]].prompt_text().unwrap())
+            .collect();
+        assert_eq!(texts.first().copied(), Some("ask 0"), "the oldest prompt is first");
+        assert_eq!(texts.last().copied(), Some("ask 29"), "the newest prompt is last");
+        assert_eq!(selected(&app), "ask 29");
+
+        let visible = 10;
+        app.recompute_row_heights(80, visible);
+        app.reveal_pending_selection(visible);
+        let drawn = app.history_rows_fit(visible);
+        assert_eq!(
+            app.history_scroll + drawn,
+            app.display_rows.len(),
+            "the panel shows the last row"
+        );
+        // Each prompt row has an empty line above the prompt.
+        assert_eq!(app.row_height(0), 2);
+        assert_eq!(drawn, visible / 2, "the panel is full");
+        assert_eq!(app.sel_display_row(), app.display_rows.len() - 1);
+        assert_eq!(app.history_rows_below(visible), 0);
+
+        // At the top, all the rows after the first five are below the window.
+        app.history_top(visible);
+        assert_eq!(app.history_rows_below(visible), 25);
+        app.history_bottom(visible);
+        assert_eq!(app.history_rows_below(visible), 0);
+    }
+
     #[test]
     fn file_mode_follows_a_cursor_the_user_moved_in_agent_mode() {
         let mut app = interleaved_app();
         select_prompt(&mut app, "b1");
 
         app.toggle_mode(20, 20);
-        // The user reads the agent's newer prompt, then switches back.
-        app.history_up(20);
+        // The user reads the agent's newer prompt, then switches back. Agent
+        // mode lists the newer prompt below the older one.
+        app.history_down(20);
         assert_eq!(selected(&app), "b2");
         app.toggle_mode(20, 20);
 

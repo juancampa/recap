@@ -2,9 +2,10 @@ use crate::app::{App, DisplayRow, KindFilter, Mode, Panel, RunState, SearchKind,
 use crate::reltime::align_relative_times;
 use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
 use crate::search_history::SearchMode;
+use crate::markdown::MdLine;
 use crate::settings::{Settings, SETTINGS_ITEMS};
 use crate::prompt::{
-    self, HANG_INDENT, PROMPT_COLOR, RESPONSE_COLOR, WRAP_INDENT, WRAP_MARKER, WRAP_MARKER_COLOR,
+    self, PROMPT_COLOR, RESPONSE_BAR, RESPONSE_BAR_COLOR, RESPONSE_COLOR, RESPONSE_GUTTER,
 };
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use ratatui::{
@@ -105,7 +106,18 @@ pub fn compute_layout(
             .split(rest);
         (None, s[0], s[1])
     };
-    let (history, history_footer) = split_history_footer(history_full);
+    // Agent mode draws no Selected box: the Agents panel already shows the
+    // session of the selected entry.
+    let (history, history_footer) = if agent_mode {
+        let empty = Rect {
+            y: history_full.y + history_full.height,
+            height: 0,
+            ..history_full
+        };
+        (history_full, empty)
+    } else {
+        split_history_footer(history_full)
+    };
 
     LayoutRects {
         projects: if projects_active { side } else { None },
@@ -902,26 +914,25 @@ fn regex_highlight_spans(
 /// Spans for one wrapped prompt line: its indent, then the highlighted text.
 ///
 /// The History, Agents and Diff panels all render prompt text through this,
-/// so the indent rules, the soft-wrap marker and the Markdown colors stay
+/// so the indent rules, the response gutter and the Markdown colors stay
 /// identical in every panel. Each panel supplies its own gutter in front of
 /// the returned spans.
 ///
-/// A soft-wrapped line draws [`WRAP_MARKER`] in its last indent column, which
-/// tells it apart from a line that a real linebreak started.
+/// A response line starts with the response gutter: two blank columns,
+/// [`RESPONSE_BAR`] and one blank column.
 fn prompt_line_spans(
     line: &prompt::WrappedLine,
     highlight: Option<(&Regex, Style)>,
 ) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.pieces.len() + 2);
-    if line.continuation && line.indent > 0 {
-        if line.indent > 1 {
-            spans.push(Span::raw(" ".repeat(line.indent - 1)));
-        }
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.pieces.len() + 3);
+    if line.response {
+        spans.push(Span::raw(" ".repeat(RESPONSE_GUTTER - 2)));
         spans.push(Span::styled(
-            WRAP_MARKER,
-            Style::default().fg(WRAP_MARKER_COLOR),
+            format!("{RESPONSE_BAR} "),
+            Style::default().fg(RESPONSE_BAR_COLOR),
         ));
-    } else if line.indent > 0 {
+    }
+    if line.indent > 0 {
         spans.push(Span::raw(" ".repeat(line.indent)));
     }
     match highlight {
@@ -1202,6 +1213,7 @@ fn group_row_line(
     run_state: RunState,
     ordinal: Option<usize>,
     settings: &Settings,
+    running_glyph: &'static str,
     date_row: Option<Line<'static>>,
     // Width of the project column (`App::project_col_width`), 0 when the
     // panel draws no project column. `branch_last` picks the corner glyph of
@@ -1349,7 +1361,7 @@ fn group_row_line(
             wrapped.push(prompt::WrappedLine {
                 pieces: Vec::new(),
                 indent: 0,
-                continuation: false,
+                response: false,
             });
         }
 
@@ -1400,7 +1412,7 @@ fn group_row_line(
             }
             spans.extend(prompt_line_spans(seg, None));
             if i == 0 {
-                append_run_state(&mut spans, inner_width, run_state, "▶");
+                append_run_state(&mut spans, inner_width, run_state, running_glyph);
             }
             lines.push(Line::from(spans));
         }
@@ -1456,7 +1468,7 @@ fn group_row_line(
         spans.push(Span::styled(file_part.to_string(), file_base));
     }
 
-    append_run_state(&mut spans, inner_width, run_state, "▶");
+    append_run_state(&mut spans, inner_width, run_state, running_glyph);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
     lines.extend(date_row);
     lines.push(Line::from(spans));
@@ -2241,7 +2253,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
                 style: Style::default().fg(Color::Gray),
             });
             let title_width = inner_width.saturating_sub(RUNNING_RESERVE).max(1);
-            let one = prompt::wrap_line(&title_pieces, title_width, false, 1);
+            let one = prompt::wrap_line(&MdLine::Text(title_pieces), title_width, false, 1);
             let mut spans = prompt_line_spans(&one[0], highlight);
             if queue {
                 append_queue_state(&mut spans, inner_width, app.running.get(&agent.session_id));
@@ -2281,7 +2293,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
                         width = width.saturating_sub(prefix_width).max(1);
                     }
                     let hl = prompt::highlight(text, color);
-                    let empty: Vec<prompt::Piece> = Vec::new();
+                    let empty = MdLine::Text(Vec::new());
                     let one = prompt::wrap_line(hl.first().unwrap_or(&empty), width, false, 1);
                     spans.extend(prompt_line_spans(&one[0], highlight));
                     Line::from(spans).style(style)
@@ -2533,8 +2545,39 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// The label that tells the user that rows are below the History window, and
+/// its place: centered on the last line of the list. Agent mode only, where
+/// the newest row is at the bottom. A click on the label scrolls to the
+/// bottom, so the mouse handler uses this function too. `area` is the
+/// History rect with its border.
+pub fn history_jump_label(app: &App, area: Rect) -> Option<(Rect, String)> {
+    if !app.mode.has_agents() || area.height < 3 || area.width < 3 {
+        return None;
+    }
+    let visible = (area.height - 2) as usize;
+    let below = app.history_rows_below(visible);
+    if below == 0 {
+        return None;
+    }
+    let label = format!(" ↓ {below} more ");
+    let width = (label.chars().count() as u16).min(area.width - 2);
+    let rect = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height - 2,
+        width,
+        height: 1,
+    };
+    Some((rect, label))
+}
+
 fn draw_history(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active_panel == Panel::History;
+    let columns = app.history_columns();
+    // In Agent mode a running session shows the disk of the Agents panel.
+    let running_glyph = match app.mode {
+        Mode::File => "▶",
+        Mode::Agent | Mode::Queue => AGENT_RUNNING_GLYPH,
+    };
     let entry_count: usize = app.groups.iter().map(|g| g.entry_indices.len()).sum();
     // The title names the kind filter, because the count means something else
     // under each one. `all` is the default, so it needs no name.
@@ -2583,19 +2626,12 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
 
     // Rows are variable-height (a prompt can span several lines), so take as
     // many display rows as fit in `visible` terminal lines rather than a
-    // fixed count.
-    let render_count = {
-        let mut count = 0usize;
-        let mut used = 0usize;
-        for idx in app.history_scroll..app.display_rows.len() {
-            if used >= visible {
-                break;
-            }
-            count += 1;
-            used += app.row_height(idx);
-        }
-        count
-    };
+    // fixed count. The last row can fit only in part.
+    let render_count = app.history_rows_fit(visible);
+    // The lines that are still free below the rows built so far. ratatui's
+    // `List` does not draw an item that is taller than the free space, so
+    // the map below cuts the last row to the lines that fit.
+    let mut free_lines = visible;
 
     let visible_timestamps: Vec<DateTime<Local>> = app
         .display_rows
@@ -2758,7 +2794,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                 )
             });
 
-            let lines: Vec<Line> = match row {
+            let mut lines: Vec<Line> = match row {
                 DisplayRow::Group(gi) => {
                     let group = &app.groups[*gi];
                     let is_group = group.entry_indices.len() > 1;
@@ -2808,12 +2844,14 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         mask,
                         show_source,
                         inner_width,
-                        app.row_height(row_idx),
+                        // The empty line above a prompt is not part of the body.
+                        app.row_height(row_idx) - app.row_gap(row_idx) as usize,
                         app.prompt_lines,
                         session_name,
                         app.entry_run_state(entry_idx),
                         app.prompt_ordinal(entry),
-                        &app.settings,
+                        &columns,
+                        running_glyph,
                         date_row,
                         app.project_col_width(chain_chars_of(entry, &app.view.project_names)),
                         branch_last_flags.get(local_idx).copied().unwrap_or(true),
@@ -2840,18 +2878,18 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                     // so the two stay aligned when the user hides a column.
                     let mut spans = Vec::with_capacity(10);
                     spans.push(Span::raw("    "));
-                    if app.settings.show_time {
+                    if columns.show_time {
                         spans.push(Span::styled(
                             format!("{:<w$}", ts, w = ts_width),
                             Style::default().fg(time_color),
                         ));
                         spans.push(Span::raw(" "));
                     }
-                    if app.settings.show_change {
+                    if columns.show_change {
                         spans.extend(summary_spans(summary));
                         spans.push(Span::raw(" "));
                     }
-                    if app.settings.show_source {
+                    if columns.show_source {
                         spans.push(source_span_for(
                             entry,
                             show_source,
@@ -2859,7 +2897,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                         ));
                         spans.push(Span::raw(" "));
                     }
-                    let title_width = title_col_width(inner_width, &app.settings);
+                    let title_width = title_col_width(inner_width, &columns);
                     if title_width > 0 {
                         spans.push(title_span(
                             session_title(entry),
@@ -2880,13 +2918,29 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
                             .fg(if is_selected { Color::White } else { Color::Gray })
                     };
                     spans.push(Span::styled(fname.to_string(), fname_style));
-                    append_run_state(&mut spans, inner_width, app.entry_run_state(entry_idx), "▶");
+                    append_run_state(&mut spans, inner_width, app.entry_run_state(entry_idx), running_glyph);
                     let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
                     lines.extend(date_row);
                     lines.push(Line::from(spans));
                     lines
                 }
             };
+
+            // In Agent mode an empty line stands above each prompt, below
+            // the date row. It has the panel background, also for the
+            // selected row.
+            if app.row_gap(row_idx) {
+                let at = app.row_starts_day(row_idx) as usize;
+                lines.insert(
+                    at,
+                    Line::from(Span::styled(
+                        " ".repeat(inner_width),
+                        Style::default().bg(PANEL_BG),
+                    )),
+                );
+            }
+            lines.truncate(free_lines);
+            free_lines -= lines.len();
 
             // `row_bg` already folds the selection into the band.
             let mut style = Style::default().bg(row_bg);
@@ -2899,6 +2953,19 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(items);
     f.render_widget(list, inner);
+
+    if let Some((rect, label)) = history_jump_label(app, area) {
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(label).style(
+                Style::default()
+                    .fg(DATE_ROW_COLOR)
+                    .bg(DATE_ROW_BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
+    }
 
     // Scrollbar
     if app.display_rows.len() > render_count {
@@ -3025,7 +3092,9 @@ pub fn diff_selection_text(app: &App, inner_width: usize, visible: usize) -> Opt
         if row < start.0 || row > end.0 {
             continue;
         }
-        let from = if row == start.0 { start.1 } else { 0 };
+        // The copy leaves out the gutter of a response line.
+        let gutter = response_gutter_cols(line);
+        let from = if row == start.0 { start.1 } else { 0 }.max(gutter);
         let to = if row == end.0 { end.1 } else { usize::MAX };
         let text: String = line
             .spans
@@ -3038,6 +3107,18 @@ pub fn diff_selection_text(app: &App, inner_width: usize, visible: usize) -> Opt
     }
     let out = rows.join("\n");
     (!out.trim().is_empty()).then_some(out)
+}
+
+/// The columns of the response gutter at the start of `line`, as
+/// [`prompt_line_spans`] draws it. 0 for a line that has no gutter.
+fn response_gutter_cols(line: &Line<'static>) -> usize {
+    let bar = format!("{RESPONSE_BAR} ");
+    match line.spans.get(1) {
+        Some(span) if span.content == bar && span.style.fg == Some(RESPONSE_BAR_COLOR) => {
+            RESPONSE_GUTTER
+        }
+        _ => 0,
+    }
 }
 
 /// The lines the Diff panel draws for the current scroll position: one entry
@@ -3137,9 +3218,9 @@ fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line
     if is_prompt {
         // Render the prompt with the same wrapping, indent rules and Markdown
         // highlighting the History panel uses, instead of Paragraph's own
-        // wrap — that one knows nothing about the hang indent or the
-        // soft-wrap marker. `diff_lines` holds one line per source line, so
-        // `diff_scroll` steps by source line and the scroll bounds in
+        // wrap — that one knows nothing about the response gutter.
+        // `diff_lines` holds one line per source line, so `diff_scroll`
+        // steps by source line and the scroll bounds in
         // `App::diff_down` and friends stay correct.
         // `diff_lines` holds the prompt lines, then a blank line and the
         // response lines when the turn has a response. The highlighter runs
@@ -3152,20 +3233,20 @@ fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line
             .unwrap_or("");
         let hl_prompt = prompt::highlight(text, PROMPT_COLOR);
         let hl_response = prompt::highlight(response, RESPONSE_COLOR);
-        let empty: Vec<prompt::Piece> = Vec::new();
+        let empty = MdLine::Text(Vec::new());
         let overlay = content_regex.map(|re| (re, match_style));
         let mut lines: Vec<Line> = Vec::with_capacity(visible);
         let mut prompt_i = 0usize;
         let mut response_i = 0usize;
         for (i, dl) in app.diff_lines.iter().enumerate() {
-            let (src, hang) = match dl {
+            let (src, response) = match dl {
                 DiffLine::Prompt(_) => {
                     prompt_i += 1;
-                    (hl_prompt.get(prompt_i - 1), prompt_i > 1)
+                    (hl_prompt.get(prompt_i - 1), false)
                 }
                 DiffLine::Response(_) => {
                     response_i += 1;
-                    (hl_response.get(response_i - 1), response_i > 1)
+                    (hl_response.get(response_i - 1), true)
                 }
                 _ => (None, false),
             };
@@ -3176,7 +3257,7 @@ fn diff_visible_lines(app: &App, inner_width: usize, visible: usize) -> Vec<Line
                 break;
             }
             let src = src.unwrap_or(&empty);
-            for seg in prompt::wrap_line(src, inner_width, hang, visible.max(1)) {
+            for seg in prompt::wrap_line(src, inner_width, response, visible.max(1)) {
                 lines.push(Line::from(prompt_line_spans(&seg, overlay)));
             }
         }
@@ -3836,6 +3917,35 @@ mod render_tests {
         assert!(!out.contains("Page embed"), "the column is hidden\n{out}");
     }
 
+    /// In Agent mode the History panel draws no source column, no title
+    /// column, no project column and no Selected box. The Agents panel shows
+    /// this data.
+    #[test]
+    fn agent_mode_hides_the_source_the_title_and_the_selected_box() {
+        let mut store = Store::from_entries(vec![prompt("fix it", "sessionAAAA-1111")]);
+        store.extend_titles([("sessionAAAA-1111".to_string(), "Page embed".to_string())]);
+        store.commit();
+        let mut app = App::new(Arc::new(recap_server::Server::from_store(store)));
+        app.mode = crate::app::Mode::Agent;
+        let (w, h) = (190, 30);
+        let rects = compute_layout(Rect::new(0, 0, w, h - 1), false, false, true);
+        app.recompute_row_heights(rects.history.width as usize - 2, h as usize - 3);
+        let out = render(&app, w, h);
+        let (x0, x1) = (rects.history.x as usize, (rects.history.x + rects.history.width) as usize);
+        let history: String = out
+            .lines()
+            .map(|l| l.chars().skip(x0).take(x1 - x0).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(history.contains("fix it"), "the row is drawn\n{history}");
+        assert!(!history.contains("claude"), "no source column\n{history}");
+        assert!(!history.contains("Page embed"), "no title column\n{history}");
+        assert!(!history.contains("proj"), "no project column\n{history}");
+        assert!(!out.contains("Selected"), "no Selected box\n{out}");
+        assert_eq!(rects.history_footer.height, 0);
+    }
+
     /// With the date row on, the panel prints one row per day, and the row
     /// names the day both ways.
     #[test]
@@ -4152,7 +4262,7 @@ mod render_tests {
     }
 
     #[test]
-    fn a_real_linebreak_indents_without_a_marker() {
+    fn a_real_linebreak_starts_at_the_column_of_the_first_line() {
         let store = (vec![prompt(
             "alpha bravo\nsecond paragraph",
             "sessionAAAA-1111",
@@ -4164,29 +4274,11 @@ mod render_tests {
         let (first_x, first_y) = find(&out, "alpha");
         let (second_x, second_y) = find(&out, "second paragraph");
         assert_eq!(second_y, first_y + 1);
-        assert_eq!(
-            second_x,
-            first_x + HANG_INDENT,
-            "a line after a real linebreak hangs by HANG_INDENT\n{out}"
-        );
-        // The hang columns stay blank — no marker on a hard break.
-        let cells: String = out
-            .lines()
-            .nth(second_y)
-            .unwrap()
-            .chars()
-            .skip(first_x)
-            .take(HANG_INDENT)
-            .collect();
-        assert_eq!(
-            cells,
-            " ".repeat(HANG_INDENT),
-            "a hard break carries no marker\n{out}"
-        );
+        assert_eq!(second_x, first_x, "a prompt line has no hang indent\n{out}");
     }
 
     #[test]
-    fn a_soft_wrap_marks_its_indent() {
+    fn a_soft_wrap_starts_at_the_column_of_the_first_line() {
         let long = "alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo \
                     lima mike november oscar papa quebec romeo sierra tango uniform";
         let store = (vec![prompt(long, "sessionAAAA-1111")]);
@@ -4195,24 +4287,17 @@ mod render_tests {
         let out = history_half(&render(&app, 200, 20), 200);
 
         let (first_x, first_y) = find(&out, "alpha");
-        let wrapped = out.lines().nth(first_y + 1).unwrap();
-        let indent: String = wrapped.chars().skip(first_x).take(WRAP_INDENT).collect();
-        assert_eq!(
-            indent,
-            format!("{}{}", " ".repeat(WRAP_INDENT - 1), WRAP_MARKER),
-            "a soft wrap puts the marker in its last indent column\n{out}"
-        );
-        // The marker is faint gray, not the prompt color.
-        assert_eq!(
-            fg_at(&app, 200, 20, (first_x + WRAP_INDENT - 1) as u16, (first_y + 1) as u16),
-            WRAP_MARKER_COLOR
+        let wrapped: String = out.lines().nth(first_y + 1).unwrap().chars().skip(first_x).collect();
+        assert!(
+            wrapped.starts_with(|c: char| c.is_alphanumeric()),
+            "a soft wrap has no indent and no marker\n{out}"
         );
     }
 
     #[test]
-    fn a_soft_wrap_nests_under_its_own_source_line() {
-        // The list item hangs by HANG_INDENT and carries two leading spaces of
-        // its own, so its soft wrap sits WRAP_INDENT past that.
+    fn a_soft_wrap_keeps_the_indent_of_its_own_source_line() {
+        // The list item carries two leading spaces of its own. Its soft
+        // wrap has the same two spaces and no more.
         let text = "do these:\n  - keep the wrapped words nested under the item text they belong to";
         let store = (vec![prompt(text, "sessionAAAA-1111")]);
         let mut app = test_app(store);
@@ -4221,22 +4306,12 @@ mod render_tests {
         let out = history_half(&render(&app, 190, 20), 190);
 
         let (first_x, _) = find(&out, "do these:");
-        let (item_x, item_y) = find(&out, "- keep");
-        assert_eq!(
-            item_x,
-            first_x + HANG_INDENT + 2,
-            "the item keeps its own two leading spaces on top of the hang\n{out}"
-        );
-        let wrapped = out.lines().nth(item_y + 1).unwrap();
-        let indent: String = wrapped
-            .chars()
-            .skip(item_x)
-            .take(WRAP_INDENT)
-            .collect();
-        assert_eq!(
-            indent,
-            format!("{}{}", " ".repeat(WRAP_INDENT - 1), WRAP_MARKER),
-            "the soft wrap nests under the item, not under the prompt\n{out}"
+        let (item_x, item_y) = find(&out, "• keep");
+        assert_eq!(item_x, first_x + 2, "the item keeps its own two leading spaces\n{out}");
+        let wrapped: String = out.lines().nth(item_y + 1).unwrap().chars().skip(item_x).collect();
+        assert!(
+            wrapped.starts_with(|c: char| c.is_alphanumeric()),
+            "the soft wrap starts at the column of the item\n{out}"
         );
     }
 
@@ -4279,7 +4354,8 @@ mod render_tests {
         let out = render(&app, 190, 20);
 
         // History (left half) and Diff (right half) both show the response
-        // below the prompt: the prompt in white, the response in blue.
+        // below the prompt: the prompt in dim white, the response in bright
+        // white.
         let mut seen = 0;
         for (y, line) in out.lines().enumerate().skip(1) {
             if let Some(byte) = line.find("Fixed the null") {
@@ -4450,20 +4526,121 @@ mod render_tests {
             "the Diff panel must not prefix prompt lines\n{out}"
         );
         let (first_x, _) = find(&out, "run the tests");
-        let (item_x, item_y) = find(&out, "- keep");
-        assert_eq!(
-            item_x,
-            first_x + HANG_INDENT + 2,
-            "the Diff panel applies the same hang and source indent\n{out}"
+        let (item_x, item_y) = find(&out, "• keep");
+        assert_eq!(item_x, first_x + 2, "the Diff panel keeps the source indent\n{out}");
+        // The wrapped remainder of the item starts at the column of the item.
+        let wrapped: String = out.lines().nth(item_y + 1).unwrap().chars().skip(item_x).collect();
+        assert!(
+            wrapped.starts_with(|c: char| c.is_alphanumeric()),
+            "the Diff panel adds no soft-wrap indent\n{out}"
         );
-        // The wrapped remainder of the item carries the marker.
-        let wrapped = out.lines().nth(item_y + 1).unwrap();
-        let indent: String = wrapped.chars().skip(item_x).take(WRAP_INDENT).collect();
-        assert_eq!(
-            indent,
-            format!("{}{}", " ".repeat(WRAP_INDENT - 1), WRAP_MARKER),
-            "the Diff panel marks its soft wraps too\n{out}"
-        );
+    }
+
+    #[test]
+    fn a_response_line_has_the_bar_gutter_in_every_panel() {
+        let store = (vec![turn("fix the bug", "Fixed the null check.", "sessionAAAA-1111")]);
+        let mut app = test_app(store);
+        app.recompute_row_heights(90, 18);
+        let out = render(&app, 190, 20);
+
+        let mut seen = 0;
+        for (y, line) in out.lines().enumerate().skip(1) {
+            let Some(byte) = line.find("Fixed the null") else {
+                continue;
+            };
+            let x = line[..byte].chars().count();
+            // The prompt text starts RESPONSE_GUTTER columns to the left.
+            let prompt_x = out
+                .lines()
+                .take(y)
+                .flat_map(|l| l.match_indices("fix the bug").map(|(b, _)| l[..b].chars().count()))
+                .find(|px| px + RESPONSE_GUTTER == x);
+            assert!(prompt_x.is_some(), "the response is indented by the gutter\n{out}");
+            let gutter: String = line.chars().skip(x - RESPONSE_GUTTER).take(RESPONSE_GUTTER).collect();
+            assert_eq!(gutter, format!("  {RESPONSE_BAR} "), "{out}");
+            assert_eq!(fg_at(&app, 190, 20, (x - 2) as u16, y as u16), RESPONSE_BAR_COLOR);
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "History and Diff each show the response once\n{out}");
+    }
+
+    /// The History panel draws the part of a row that fits. A prompt row
+    /// with a response is two lines high, so when the panel has an odd
+    /// number of lines, the last line shows the prompt of the last row and
+    /// not its response.
+    #[test]
+    fn the_history_panel_draws_the_part_of_a_row_that_fits() {
+        let store = (0..20)
+            .map(|i| turn(&format!("ask {i:02}"), &format!("answer {i:02}"), "sessionAAAA-1111"))
+            .collect();
+        let mut app = test_app(store);
+        let mut odd_checked = false;
+        for h in 30..34u16 {
+            let w = 190;
+            let rects = compute_layout(Rect::new(0, 0, w, h - 1), false, false, false);
+            let lines = rects.history.height as usize - 2;
+            app.recompute_row_heights(rects.history.width as usize - 2, lines);
+            let out = render(&app, w, h);
+            let history: String = out
+                .lines()
+                .take((rects.history.y + rects.history.height) as usize)
+                .map(|l| l.chars().take(rects.history.width as usize).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompts = history.matches("ask ").count();
+            let answers = history.matches("answer ").count();
+            assert_eq!(prompts, lines.div_ceil(2), "the last row shows the part that fits\n{history}");
+            assert_eq!(answers, lines / 2, "{history}");
+            odd_checked |= lines % 2 == 1;
+        }
+        assert!(odd_checked, "the test must cover a panel with an odd number of lines");
+    }
+
+    /// In Agent mode, the History panel shows a label on its last line when
+    /// rows are below the window. An empty line stands above each prompt.
+    #[test]
+    fn agent_mode_shows_the_rows_below_and_a_gap_above_each_prompt() {
+        let store = (0..12)
+            .map(|i| {
+                let mut e = prompt(&format!("ask {i:02}"), "sessionAAAA-1111");
+                e.timestamp = Local::now() - chrono::Duration::minutes(60 - i);
+                e
+            })
+            .collect();
+        let mut app = test_app(store);
+        app.mode = crate::app::Mode::Agent;
+        app.selected_agent = Some("sessionAAAA-1111".to_string());
+        app.refilter();
+        let (w, h) = (190u16, 14u16);
+        let rects = compute_layout(Rect::new(0, 0, w, h - 1), false, false, true);
+        let visible = rects.history.height as usize - 2;
+        app.recompute_row_heights(rects.history.width as usize - 2, visible);
+        app.reveal_pending_selection(visible);
+
+        let out = render(&app, w, h);
+        let rows: Vec<String> = out
+            .lines()
+            .map(|l| {
+                l.chars()
+                    .skip(rects.history.x as usize)
+                    .take(rects.history.width as usize)
+                    .collect()
+            })
+            .collect();
+        // The newest prompt is on the last line, and an empty line is above it.
+        let last = rows
+            .iter()
+            .rposition(|l| l.contains("ask 11"))
+            .unwrap_or_else(|| panic!("the newest prompt is missing\n{out}"));
+        assert!(!rows[last - 1].contains("ask"), "an empty line stands above a prompt\n{out}");
+        assert!(history_jump_label(&app, rects.history).is_none(), "the panel is at the bottom");
+
+        app.history_top(visible);
+        let out = render(&app, w, h);
+        let (rect, label) = history_jump_label(&app, rects.history).expect("rows are below");
+        assert_eq!(label, format!(" ↓ {} more ", 12 - visible / 2));
+        let line: String = out.lines().nth(rect.y as usize).unwrap().chars().skip(rect.x as usize).collect();
+        assert!(line.starts_with(&label), "the label is on the last line\n{out}");
     }
 
     #[test]

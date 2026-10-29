@@ -1,15 +1,16 @@
-//! Prompt text rendering: Markdown syntax highlighting plus a word-wrap that
-//! keeps the highlight styles.
+//! Prompt text rendering: Markdown rendering plus a word-wrap that keeps the
+//! styles.
 //!
-//! A prompt is Markdown, so [`highlight`] runs it through syntect (the engine
-//! that `bat` uses) with the Markdown syntax and a dark theme. The result is
-//! one [`Piece`] list per source line. [`wrap`] then folds those lines into
-//! panel-width lines and preserves each piece's style, because the History
-//! panel must apply its own indent rules that no highlighter knows about.
+//! A prompt is Markdown, so [`highlight`] renders it with [`crate::markdown`]
+//! and colors the fenced code blocks with syntect (the engine that `bat`
+//! uses). The result is one [`MdLine`] per source line. [`wrap`] then folds
+//! those lines into panel-width lines and preserves each piece's style.
 //!
-//! The wrap step is separate from the highlight step on purpose. `bat` (and
-//! syntect) offer their own wrapping, but the History panel indents every line
-//! after the first and marks soft wraps, so the layout has to stay here.
+//! The wrap step is separate from the render step on purpose: the panels put
+//! a gutter in front of each response line, and a table row needs the width
+//! of the panel to align its columns.
+
+use crate::markdown::{self, MdLine, TableRow};
 
 use ratatui::style::{Color, Modifier, Style};
 use std::cell::RefCell;
@@ -20,33 +21,29 @@ use std::sync::LazyLock;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
-use syntect::util::LinesWithEndings;
 
 /// Color of prompt prose. The highlighter maps the theme's own default
-/// foreground onto this color, so plain text stays white and only Markdown
-/// constructs (code, headings, emphasis) take a theme color.
-pub const PROMPT_COLOR: Color = Color::White;
+/// foreground onto this color, so plain text has this color and only
+/// Markdown constructs (code, headings, emphasis) take a theme color. The
+/// prompt is a dim white, so the response below it is the brighter text.
+pub const PROMPT_COLOR: Color = Color::Rgb(170, 170, 170);
 
-/// Color of response prose: the light blue that tells the agent's final
-/// response apart from the prompt above it.
-pub const RESPONSE_COLOR: Color = Color::Rgb(135, 206, 250);
+/// Color of response prose: a bright white, brighter than [`PROMPT_COLOR`].
+pub const RESPONSE_COLOR: Color = Color::White;
 
-/// Indent given to every prompt line after the very first one, so the whole
-/// prompt reads as one block that hangs under its first line.
-pub const HANG_INDENT: usize = 2;
+/// The vertical line in the gutter of a response line. The line separates
+/// the response from the prompt above it.
+pub const RESPONSE_BAR: &str = "│";
 
-/// Extra indent a soft-wrapped line takes beyond the line it continues. The
-/// wrapped line therefore nests under its own source line, list item indent
-/// included.
-pub const WRAP_INDENT: usize = 2;
+/// Color of [`RESPONSE_BAR`]. Faint gray, quieter than the text.
+pub const RESPONSE_BAR_COLOR: Color = Color::Rgb(100, 100, 100);
 
-/// Glyph drawn in the last indent column of a soft-wrapped line, so a soft
-/// wrap stays distinct from a real linebreak in the prompt. The same arrow
-/// joins the project names in a row's project chain.
-pub const WRAP_MARKER: &str = "→";
+/// Blank columns in front of [`RESPONSE_BAR`].
+const RESPONSE_BAR_INDENT: usize = 2;
 
-/// Color of [`WRAP_MARKER`]. Faint gray, quieter than the prompt text.
-pub const WRAP_MARKER_COLOR: Color = Color::Rgb(100, 100, 100);
+/// Columns of the gutter in front of each response line: the bar indent,
+/// the bar, and one blank column.
+pub const RESPONSE_GUTTER: usize = RESPONSE_BAR_INDENT + 2;
 
 /// Columns a tab takes when the wrapper measures a line's own indent.
 const TAB_WIDTH: usize = 4;
@@ -68,15 +65,20 @@ impl Piece {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WrappedLine {
     pub pieces: Vec<Piece>,
-    /// Columns of indent the renderer draws in front of `pieces`.
+    /// Columns of indent the renderer draws in front of `pieces`: the
+    /// leading whitespace of the source line.
     pub indent: usize,
-    /// True when a soft wrap produced this line. The renderer then draws
-    /// [`WRAP_MARKER`] in the last indent column. False for the first line
-    /// and for a line that follows a real linebreak.
-    pub continuation: bool,
+    /// True for a line of the response. The renderer then draws the
+    /// response gutter (see [`RESPONSE_GUTTER`]) in front of the indent.
+    pub response: bool,
 }
 
 impl WrappedLine {
+    /// Columns in front of `pieces`: the response gutter and the indent.
+    pub fn offset(&self) -> usize {
+        self.indent + if self.response { RESPONSE_GUTTER } else { 0 }
+    }
+
     /// The line's characters without their styles.
     #[cfg(test)]
     pub fn text(&self) -> String {
@@ -96,8 +98,8 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
         .expect("syntect ships at least one default theme")
 });
 
-/// The theme's own default foreground. Text that carries this color is plain
-/// prose, so the mapper replaces it with [`PROMPT_COLOR`].
+/// The theme's own default foreground. Plain code in a code block has this
+/// color.
 static THEME_FG: LazyLock<Option<(u8, u8, u8)>> = LazyLock::new(|| {
     THEME
         .settings
@@ -105,14 +107,9 @@ static THEME_FG: LazyLock<Option<(u8, u8, u8)>> = LazyLock::new(|| {
         .map(|c| (c.r, c.g, c.b))
 });
 
-fn to_ratatui(style: syntect::highlighting::Style, prose: Color) -> Style {
+fn to_ratatui(style: syntect::highlighting::Style) -> Style {
     let fg = style.foreground;
-    let color = if *THEME_FG == Some((fg.r, fg.g, fg.b)) {
-        prose
-    } else {
-        Color::Rgb(fg.r, fg.g, fg.b)
-    };
-    let mut out = Style::default().fg(color);
+    let mut out = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
     if style.font_style.contains(FontStyle::BOLD) {
         out = out.add_modifier(Modifier::BOLD);
     }
@@ -130,7 +127,7 @@ fn to_ratatui(style: syntect::highlighting::Style, prose: Color) -> Style {
 const CACHE_CAP: usize = 512;
 
 thread_local! {
-    static CACHE: RefCell<HashMap<u64, Rc<Vec<Vec<Piece>>>>> =
+    static CACHE: RefCell<HashMap<u64, Rc<Vec<MdLine>>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -141,10 +138,10 @@ fn hash_of(text: &str, prose: Color) -> u64 {
     h.finish()
 }
 
-/// Highlight `text` as Markdown, with `prose` as the color of plain text.
-/// Returns one piece list per source line, with the trailing newline removed.
-/// The result is cached by content hash and prose color.
-pub fn highlight(text: &str, prose: Color) -> Rc<Vec<Vec<Piece>>> {
+/// Render `text` as Markdown, with `prose` as the color of plain text, and
+/// color the fenced code blocks. Returns one line per source line. The
+/// result is cached by content hash and prose color.
+pub fn highlight(text: &str, prose: Color) -> Rc<Vec<MdLine>> {
     let key = hash_of(text, prose);
     if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
@@ -160,37 +157,41 @@ pub fn highlight(text: &str, prose: Color) -> Rc<Vec<Vec<Piece>>> {
     out
 }
 
-fn highlight_uncached(text: &str, prose: Color) -> Vec<Vec<Piece>> {
-    let syntax = SYNTAXES
-        .find_syntax_by_extension("md")
-        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
-    let mut hl = HighlightLines::new(syntax, &THEME);
-    let base = Style::default().fg(prose);
-    let mut out: Vec<Vec<Piece>> = Vec::new();
-    for line in LinesWithEndings::from(text) {
-        let Ok(ranges) = hl.highlight_line(line, &SYNTAXES) else {
-            // A highlighter failure must not lose the prompt: fall back to
-            // plain prose for this line.
-            out.push(vec![Piece {
-                text: line.trim_end_matches('\n').to_string(),
-                style: base,
-            }]);
-            continue;
-        };
-        let pieces = ranges
-            .into_iter()
-            .map(|(s, t)| Piece {
-                text: t.trim_end_matches('\n').to_string(),
-                style: to_ratatui(s, prose),
-            })
-            .filter(|p| !p.text.is_empty())
-            .collect();
-        out.push(pieces);
-    }
-    if out.is_empty() {
-        out.push(Vec::new());
-    }
-    out
+fn highlight_uncached(text: &str, prose: Color) -> Vec<MdLine> {
+    // One highlighter per code block. A new language starts a new block.
+    let mut block: Option<(String, HighlightLines<'static>)> = None;
+    let mut code_style = |lang: &str, line: &str| -> Vec<Piece> {
+        if block.as_ref().is_none_or(|(l, _)| l != lang) {
+            let syntax = SYNTAXES
+                .find_syntax_by_token(lang)
+                .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
+            block = Some((lang.to_string(), HighlightLines::new(syntax, &THEME)));
+        }
+        let (_, hl) = block.as_mut().expect("the block was set above");
+        match hl.highlight_line(&format!("{line}\n"), &SYNTAXES) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(s, t)| Piece {
+                    text: t.trim_end_matches('\n').to_string(),
+                    style: to_ratatui(s),
+                })
+                .filter(|p| !p.text.is_empty())
+                .collect(),
+            // A highlighter failure must not lose the line.
+            Err(_) => plain_code(lang, line),
+        }
+    };
+    markdown::render(text, prose, &mut code_style)
+}
+
+/// One code line in one color, for the row-height math. It has the same
+/// characters as the highlighted line.
+fn plain_code(_lang: &str, line: &str) -> Vec<Piece> {
+    let fg = THEME_FG.map_or(markdown::CODE_COLOR, |(r, g, b)| Color::Rgb(r, g, b));
+    vec![Piece {
+        text: line.to_string(),
+        style: Style::default().fg(fg),
+    }]
 }
 
 // ── Wrapping ──────────────────────────────────────────────────────────────
@@ -302,43 +303,20 @@ fn leading_indent(line: &[Piece], width: usize) -> usize {
     n.min(width / 2)
 }
 
-/// Append the rendered lines of one source line to `out`.
-///
-/// The line's own indent is [`HANG_INDENT`] (unless it is the prompt's first
-/// line) plus its leading whitespace. A soft wrap of it takes
-/// [`WRAP_INDENT`] more. Whitespace inside the line collapses to single
-/// spaces, and a word longer than the line splits at the column edge.
-///
-/// Returns false when `out` grew past `max_lines`, so the caller stops: one
-/// line more than we keep is enough to know the text overflowed, and it
-/// bounds the work on a huge prompt.
-fn wrap_into(
-    out: &mut Vec<WrappedLine>,
-    src: &[Piece],
-    width: usize,
-    hang: bool,
-    max_lines: usize,
-) -> bool {
-    let base = (if hang { HANG_INDENT } else { 0 }) + leading_indent(src, width);
-    let cont_indent = base + WRAP_INDENT;
-    let words = words_of(src);
-    if words.is_empty() {
-        return true;
-    }
-
-    let line_width = |soft: bool| {
-        let indent = if soft { cont_indent } else { base };
-        width.saturating_sub(indent).max(1)
-    };
+/// Fold `src` into lines of at most `lw` columns. Whitespace collapses to
+/// single spaces, and a word longer than the line splits at the column edge.
+/// Stops after `limit` lines, so a huge prompt costs little.
+fn fill(src: &[Piece], lw: usize, limit: usize) -> Vec<Vec<Piece>> {
+    let lw = lw.max(1);
+    let mut lines: Vec<Vec<Piece>> = Vec::new();
     let mut cur: Vec<Piece> = Vec::new();
     let mut cur_len = 0usize;
-    // Whether the line under construction is a soft wrap of this source line.
-    let mut soft = false;
-
-    for word in words {
+    for word in words_of(src) {
         let mut rest = word;
         loop {
-            let lw = line_width(soft);
+            if lines.len() >= limit {
+                return lines;
+            }
             let wlen = rest.len();
             if cur_len == 0 {
                 if wlen <= lw {
@@ -348,17 +326,8 @@ fn wrap_into(
                 }
                 // The word is longer than a whole line: cut it.
                 let (head, tail) = rest.split_at_chars(lw);
-                out.push(WrappedLine {
-                    pieces: head,
-                    indent: if soft { cont_indent } else { base },
-                    continuation: soft,
-                });
-                if out.len() > max_lines {
-                    return false;
-                }
+                lines.push(head);
                 rest = tail;
-                soft = true;
-                continue;
             } else if cur_len + 1 + wlen <= lw {
                 let style = cur.last().map(|p| p.style).unwrap_or_default();
                 cur.push(Piece {
@@ -369,32 +338,139 @@ fn wrap_into(
                 cur_len += 1 + wlen;
                 break;
             } else {
-                out.push(WrappedLine {
-                    pieces: std::mem::take(&mut cur),
-                    indent: if soft { cont_indent } else { base },
-                    continuation: soft,
-                });
+                lines.push(std::mem::take(&mut cur));
                 cur_len = 0;
-                soft = true;
-                if out.len() > max_lines {
-                    return false;
-                }
-                // Place this word on the fresh line.
-                continue;
             }
         }
     }
-    if cur_len > 0 {
-        out.push(WrappedLine {
-            pieces: cur,
-            indent: if soft { cont_indent } else { base },
-            continuation: soft,
-        });
-        if out.len() > max_lines {
-            return false;
-        }
+    if cur_len > 0 && lines.len() < limit {
+        lines.push(cur);
     }
-    true
+    lines
+}
+
+/// Append the rendered lines of one source line to `out`. A response line
+/// also has the response gutter; see [`RESPONSE_GUTTER`].
+///
+/// Returns false when `out` grew past `max_lines`, so the caller stops: one
+/// line more than we keep is enough to know the text overflowed, and it
+/// bounds the work on a huge prompt.
+fn wrap_into(
+    out: &mut Vec<WrappedLine>,
+    src: &MdLine,
+    width: usize,
+    response: bool,
+    max_lines: usize,
+) -> bool {
+    let gutter = if response { RESPONSE_GUTTER } else { 0 };
+    let avail = width.saturating_sub(gutter).max(1);
+    let limit = (max_lines + 1).saturating_sub(out.len());
+    match src {
+        MdLine::Text(pieces) => {
+            // Every line of the source line, soft wraps included, has the
+            // leading whitespace of the source line as its indent.
+            let indent = leading_indent(pieces, avail);
+            for line in fill(pieces, avail.saturating_sub(indent), limit) {
+                out.push(WrappedLine {
+                    pieces: line,
+                    indent,
+                    response,
+                });
+            }
+        }
+        MdLine::Row(row) => match table_row_lines(row, avail, limit) {
+            Some(lines) => out.extend(lines.into_iter().map(|pieces| WrappedLine {
+                pieces,
+                indent: 0,
+                response,
+            })),
+            // The panel is too narrow for the columns: wrap the row as text.
+            None => return wrap_into(out, &MdLine::Text(row.pieces_joined()), width, response, max_lines),
+        },
+    }
+    out.len() <= max_lines
+}
+
+/// The columns between two table cells: a blank, the rule and a blank.
+const CELL_GAP: usize = 3;
+
+/// Color of the rules and the column separators of a table.
+const TABLE_RULE_COLOR: Color = Color::Rgb(100, 100, 100);
+
+/// The width of each column of a table in `avail` columns. A table that
+/// fits keeps the width of its widest cells. A wider table shrinks its
+/// widest columns first, so a narrow column keeps its width. `None` when
+/// the panel cannot give each column one character.
+fn column_widths(natural: &[usize], avail: usize) -> Option<Vec<usize>> {
+    let n = natural.len();
+    let gaps = CELL_GAP * n.saturating_sub(1);
+    let budget = avail.checked_sub(gaps)?;
+    if budget < n {
+        return None;
+    }
+    let natural: Vec<usize> = natural.iter().map(|w| (*w).max(1)).collect();
+    if natural.iter().sum::<usize>() <= budget {
+        return Some(natural);
+    }
+    // Give each column its fair share of the budget, narrowest first. A
+    // column that needs less than its share leaves the rest to the others.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| natural[i]);
+    let mut widths = vec![0usize; n];
+    let mut left = budget;
+    for (k, &i) in order.iter().enumerate() {
+        let share = left / (n - k);
+        widths[i] = natural[i].min(share).max(1);
+        left -= widths[i];
+    }
+    Some(widths)
+}
+
+/// The lines of one table row in `avail` columns, at most `limit` of them.
+/// Each cell wraps inside its column, so the row is as tall as its tallest
+/// cell. `None` when the panel is too narrow for the columns.
+fn table_row_lines(row: &TableRow, avail: usize, limit: usize) -> Option<Vec<Vec<Piece>>> {
+    let widths = column_widths(&row.widths, avail)?;
+    let rule_style = Style::default().fg(TABLE_RULE_COLOR);
+    if row.rule {
+        let text = widths
+            .iter()
+            .map(|w| "─".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("─┼─");
+        return Some(vec![vec![Piece { text, style: rule_style }]]);
+    }
+    let empty: Vec<Piece> = Vec::new();
+    let cells: Vec<Vec<Vec<Piece>>> = widths
+        .iter()
+        .enumerate()
+        .map(|(c, w)| fill(row.cells.get(c).unwrap_or(&empty), *w, limit))
+        .collect();
+    let height = cells.iter().map(Vec::len).max().unwrap_or(0).clamp(1, limit.max(1));
+    let mut lines = Vec::with_capacity(height);
+    for l in 0..height {
+        let mut line: Vec<Piece> = Vec::new();
+        for (c, w) in widths.iter().enumerate() {
+            if c > 0 {
+                line.push(Piece {
+                    text: " │ ".to_string(),
+                    style: rule_style,
+                });
+            }
+            let part = cells[c].get(l).cloned().unwrap_or_default();
+            let used: usize = part.iter().map(Piece::len).sum();
+            line.extend(part);
+            // The last column needs no pad.
+            if c + 1 < widths.len() && used < *w {
+                line.push(Piece {
+                    text: " ".repeat(w - used),
+                    style: Style::default(),
+                });
+            }
+        }
+        lines.push(line);
+    }
+    Some(lines)
 }
 
 /// Cap `out` at `max_lines` lines, marking the cut with a trailing `…`.
@@ -404,7 +480,7 @@ fn cap(out: &mut Vec<WrappedLine>, width: usize, max_lines: usize) {
     }
     out.truncate(max_lines);
     if let Some(last) = out.last_mut() {
-        let lw = width.saturating_sub(last.indent).max(1);
+        let lw = width.saturating_sub(last.offset()).max(1);
         truncate_with_ellipsis(&mut last.pieces, lw);
     }
 }
@@ -412,18 +488,16 @@ fn cap(out: &mut Vec<WrappedLine>, width: usize, max_lines: usize) {
 /// Word-wrap the highlighted source `lines` of one prompt into at most
 /// `max_lines` lines of `width` columns.
 ///
-/// The first rendered line starts at column 0. Every later line hangs by
-/// [`HANG_INDENT`], and each carries its own source indent on top; see
-/// [`wrap_into`]. Blank source lines drop out, because the History panel has
-/// only a few lines per row to spend. The function always returns between 1
-/// and `max_lines` lines.
-pub fn wrap(lines: &[Vec<Piece>], width: usize, max_lines: usize) -> Vec<WrappedLine> {
+/// Every line starts at the column of the first line, plus the leading
+/// whitespace of its source line; see [`wrap_into`]. Blank source lines drop
+/// out, because the History panel has only a few lines per row to spend.
+/// The function always returns between 1 and `max_lines` lines.
+pub fn wrap(lines: &[MdLine], width: usize, max_lines: usize) -> Vec<WrappedLine> {
     let width = width.max(1);
     let max_lines = max_lines.max(1);
     let mut out: Vec<WrappedLine> = Vec::new();
     for src in lines {
-        let hang = !out.is_empty();
-        if !wrap_into(&mut out, src, width, hang, max_lines) {
+        if !wrap_into(&mut out, src, width, false, max_lines) {
             break;
         }
     }
@@ -431,7 +505,7 @@ pub fn wrap(lines: &[Vec<Piece>], width: usize, max_lines: usize) -> Vec<Wrapped
         out.push(WrappedLine {
             pieces: Vec::new(),
             indent: 0,
-            continuation: false,
+            response: false,
         });
     }
     cap(&mut out, width, max_lines);
@@ -439,24 +513,25 @@ pub fn wrap(lines: &[Vec<Piece>], width: usize, max_lines: usize) -> Vec<Wrapped
 }
 
 /// Wrap one source line on its own. The Diff panel scrolls by source line, so
-/// it formats one line per step and passes `hang: false` only for the
-/// prompt's first line. A blank line yields one blank rendered line, so the
-/// paragraph break stays visible where there is room to show it.
+/// it formats one line per step, and passes `response: true` for a line of
+/// the response. A blank line yields one blank rendered line, so the
+/// paragraph break stays visible where there is room to show it. A blank
+/// response line keeps the gutter, so the bar has no gap.
 pub fn wrap_line(
-    src: &[Piece],
+    src: &MdLine,
     width: usize,
-    hang: bool,
+    response: bool,
     max_lines: usize,
 ) -> Vec<WrappedLine> {
     let width = width.max(1);
     let max_lines = max_lines.max(1);
     let mut out: Vec<WrappedLine> = Vec::new();
-    wrap_into(&mut out, src, width, hang, max_lines);
+    wrap_into(&mut out, src, width, response, max_lines);
     if out.is_empty() {
         out.push(WrappedLine {
             pieces: Vec::new(),
-            indent: if hang { HANG_INDENT } else { 0 },
-            continuation: false,
+            indent: 0,
+            response,
         });
     }
     cap(&mut out, width, max_lines);
@@ -500,10 +575,10 @@ fn truncate_with_ellipsis(pieces: &mut Vec<Piece>, lw: usize) {
 }
 
 /// Wrap the `response` lines so they continue a prompt block that [`wrap`]
-/// produced: every line hangs by [`HANG_INDENT`], the way a prompt line after
-/// the first does. The block gets its own `max_lines` cap, so a long prompt
-/// does not push the response out of the row.
-fn wrap_response(lines: &[Vec<Piece>], width: usize, max_lines: usize) -> Vec<WrappedLine> {
+/// produced: every line has the response gutter. The block gets its own
+/// `max_lines` cap, so a long prompt does not push the response out of the
+/// row.
+fn wrap_response(lines: &[MdLine], width: usize, max_lines: usize) -> Vec<WrappedLine> {
     let width = width.max(1);
     let max_lines = max_lines.max(1);
     let mut out: Vec<WrappedLine> = Vec::new();
@@ -519,8 +594,8 @@ fn wrap_response(lines: &[Vec<Piece>], width: usize, max_lines: usize) -> Vec<Wr
 /// Wrap one turn: the prompt block, then the response block when there is
 /// one. Each block takes at most `max_lines` lines.
 fn wrap_turn(
-    prompt: &[Vec<Piece>],
-    response: Option<&[Vec<Piece>]>,
+    prompt: &[MdLine],
+    response: Option<&[MdLine]>,
     width: usize,
     max_lines: usize,
 ) -> Vec<WrappedLine> {
@@ -531,24 +606,17 @@ fn wrap_turn(
     out
 }
 
-/// Split `text` into one single-piece line per source line, all in `style`.
-fn plain_lines(text: &str, style: Style) -> Vec<Vec<Piece>> {
-    text.split('\n')
-        .map(|l| {
-            vec![Piece {
-                text: l.to_string(),
-                style,
-            }]
-        })
-        .collect()
+/// Render `text` without the code colors. The History panel uses this for
+/// row-height math: the code colors never change the characters, so the
+/// line count matches what the highlighted render gives, at a lower cost.
+fn plain_render(text: &str, prose: Color) -> Vec<MdLine> {
+    markdown::render(text, prose, &mut plain_code)
 }
 
-/// Wrap plain `text` with one uniform style. The History panel uses this for
-/// row-height math: highlighting never changes the characters, so the line
-/// count matches what [`wrap`] returns for the highlighted text.
+/// Wrap plain `text`, for row-height math. The line count matches what
+/// [`wrap_highlighted`] returns for the same text.
 pub fn wrap_plain(text: &str, width: usize, max_lines: usize) -> Vec<WrappedLine> {
-    let lines = plain_lines(text, Style::default().fg(PROMPT_COLOR));
-    wrap(&lines, width, max_lines)
+    wrap(&plain_render(text, PROMPT_COLOR), width, max_lines)
 }
 
 /// Wrap a plain prompt and its plain response, for row-height math. The line
@@ -559,19 +627,18 @@ pub fn wrap_turn_plain(
     width: usize,
     max_lines: usize,
 ) -> Vec<WrappedLine> {
-    let prompt = plain_lines(prompt, Style::default().fg(PROMPT_COLOR));
-    let response = response.map(|r| plain_lines(r, Style::default().fg(RESPONSE_COLOR)));
+    let prompt = plain_render(prompt, PROMPT_COLOR);
+    let response = response.map(|r| plain_render(r, RESPONSE_COLOR));
     wrap_turn(&prompt, response.as_deref(), width, max_lines)
 }
 
-/// Wrap `text` with Markdown highlighting applied, in the prompt colors.
+/// Wrap `text` with the Markdown styles, in the prompt colors.
 pub fn wrap_highlighted(text: &str, width: usize, max_lines: usize) -> Vec<WrappedLine> {
-    let lines = highlight(text, PROMPT_COLOR);
-    wrap(&lines, width, max_lines)
+    wrap(&highlight(text, PROMPT_COLOR), width, max_lines)
 }
 
-/// Wrap a prompt and its response with Markdown highlighting applied. The
-/// prompt prose is [`PROMPT_COLOR`], the response prose [`RESPONSE_COLOR`].
+/// Wrap a prompt and its response with the Markdown styles. The prompt prose
+/// is [`PROMPT_COLOR`], the response prose [`RESPONSE_COLOR`].
 pub fn wrap_turn_highlighted(
     prompt: &str,
     response: Option<&str>,
@@ -595,26 +662,36 @@ mod tests {
     fn a_turn_caps_the_prompt_and_the_response_apart() {
         let prompt = "one two three four five six seven eight";
         let response = "alpha beta gamma delta epsilon zeta";
-        let out = wrap_turn_plain(prompt, Some(response), 12, 2);
+        let out = wrap_turn_plain(prompt, Some(response), 16, 2);
         // Two prompt lines (the second cut with an ellipsis), then two
-        // response lines that hang like a continuation.
+        // response lines in the response gutter.
         assert_eq!(out.len(), 4);
         assert!(out[1].text().ends_with('…'));
-        assert_eq!(out[0].indent, 0);
-        assert_eq!(out[2].indent, HANG_INDENT);
-        assert!(!out[2].continuation, "the response starts a fresh line");
+        assert!(!out[0].response && !out[1].response);
+        assert_eq!(out[1].indent, 0, "a prompt line has no hang indent");
+        assert!(out[2].response && out[3].response);
+        assert_eq!(out[2].indent, 0);
+        assert_eq!(out[2].offset(), RESPONSE_GUTTER);
         assert_eq!(out[2].pieces[0].style, Style::default().fg(RESPONSE_COLOR));
         // Without a response the block is the prompt alone.
-        assert_eq!(wrap_turn_plain(prompt, None, 12, 2).len(), 2);
+        assert_eq!(wrap_turn_plain(prompt, None, 16, 2).len(), 2);
         // The highlighted wrap gives the same line count.
-        assert_eq!(wrap_turn_highlighted(prompt, Some(response), 12, 2).len(), 4);
+        assert_eq!(wrap_turn_highlighted(prompt, Some(response), 16, 2).len(), 4);
+    }
+
+    #[test]
+    fn a_response_line_wraps_inside_its_gutter() {
+        // Width 10 leaves 6 columns after the gutter.
+        let out = wrap_turn_plain("p", Some("abc def ghi"), 10, 5);
+        assert_eq!(texts(&out), vec!["p", "abc", "def", "ghi"]);
+        assert!(out[1..].iter().all(|l| l.offset() == RESPONSE_GUTTER));
     }
 
     #[test]
     fn wrap_fits_single_line() {
         let out = wrap_plain("hello world", 40, 5);
         assert_eq!(texts(&out), vec!["hello world"]);
-        assert!(!out[0].continuation);
+        assert_eq!(out[0].indent, 0);
     }
 
     #[test]
@@ -622,8 +699,7 @@ mod tests {
         // Width 11 holds "hello world"; " foo" does not fit, so it wraps.
         let out = wrap_plain("hello world foo", 11, 5);
         assert_eq!(texts(&out), vec!["hello world", "foo"]);
-        assert!(!out[0].continuation);
-        assert!(out[1].continuation);
+        assert_eq!(out[1].indent, 0, "a soft wrap has no extra indent");
     }
 
     #[test]
@@ -636,35 +712,21 @@ mod tests {
     #[test]
     fn wrap_hard_splits_long_word() {
         let out = wrap_plain("abcdefgh", 3, 8);
-        // The first line uses the full width (3). Every later line loses
-        // WRAP_INDENT columns, which leaves 1 column for the rest.
-        assert_eq!(texts(&out), vec!["abc", "d", "e", "f", "g", "h"]);
-        assert!(!out[0].continuation);
-        assert!(out[1..].iter().all(|l| l.continuation));
+        // Every line uses the full width.
+        assert_eq!(texts(&out), vec!["abc", "def", "gh"]);
+        assert!(out.iter().all(|l| l.indent == 0));
     }
 
     #[test]
     fn wrap_empty_yields_one_line() {
         let out = wrap_plain("", 10, 5);
         assert_eq!(texts(&out), vec![""]);
-        assert!(!out[0].continuation);
     }
 
     #[test]
-    fn wrap_marks_real_linebreaks_as_hard() {
+    fn wrap_starts_a_line_at_a_real_linebreak() {
         let out = wrap_plain("first line\nsecond line", 40, 5);
         assert_eq!(texts(&out), vec!["first line", "second line"]);
-        assert!(!out[0].continuation);
-        assert!(!out[1].continuation, "a line after \\n is not a soft wrap");
-    }
-
-    #[test]
-    fn wrap_narrows_every_line_after_the_first() {
-        // Width 6: the first line takes 6 columns, later lines take 4.
-        let out = wrap_plain("aaaaaa\nbbbbbb", 6, 5);
-        assert_eq!(texts(&out), vec!["aaaaaa", "bbbb", "bb"]);
-        assert!(!out[1].continuation, "the hard break keeps its own line");
-        assert!(out[2].continuation, "the overflow of that line is a soft wrap");
     }
 
     #[test]
@@ -677,37 +739,30 @@ mod tests {
     fn wrap_mixes_linebreaks_and_wrapping() {
         let out = wrap_plain("hello world foo\nbye", 11, 5);
         assert_eq!(texts(&out), vec!["hello world", "foo", "bye"]);
-        assert!(!out[0].continuation);
-        assert!(out[1].continuation, "soft wrap of the first line");
-        assert!(!out[2].continuation, "real linebreak");
+        assert!(out.iter().all(|l| l.indent == 0));
     }
 
     #[test]
-    fn indents_hang_after_the_first_line() {
+    fn every_prompt_line_starts_at_the_first_column() {
         let out = wrap_plain("one\ntwo\nthree", 40, 5);
-        assert_eq!(out[0].indent, 0, "the first line starts at column 0");
-        assert_eq!(out[1].indent, HANG_INDENT);
-        assert_eq!(out[2].indent, HANG_INDENT);
-        assert!(out.iter().all(|l| !l.continuation));
+        assert!(out.iter().all(|l| l.indent == 0 && !l.response));
     }
 
     #[test]
-    fn a_soft_wrap_nests_under_its_own_line() {
-        // The list item hangs by HANG_INDENT and carries two spaces of its
-        // own, so its soft wrap indents WRAP_INDENT past that.
-        let out = wrap_plain("head\n  - alpha bravo charlie", 18, 6);
-        assert_eq!(texts(&out), vec!["head", "- alpha bravo", "charlie"]);
+    fn a_soft_wrap_keeps_the_indent_of_its_own_line() {
+        // The list item carries two spaces of its own. Its soft wrap has
+        // the same indent and no more.
+        let out = wrap_plain("head\n  - alpha bravo charlie", 16, 6);
+        assert_eq!(texts(&out), vec!["head", "• alpha bravo", "charlie"]);
         assert_eq!(out[0].indent, 0);
-        assert_eq!(out[1].indent, HANG_INDENT + 2, "the item keeps its own indent");
-        assert!(!out[1].continuation);
-        assert_eq!(out[2].indent, HANG_INDENT + 2 + WRAP_INDENT);
-        assert!(out[2].continuation);
+        assert_eq!(out[1].indent, 2, "the item keeps its own indent");
+        assert_eq!(out[2].indent, 2);
     }
 
     #[test]
     fn leading_indent_counts_a_tab_as_four_columns() {
         let out = wrap_plain("head\n\tindented", 40, 5);
-        assert_eq!(out[1].indent, HANG_INDENT + TAB_WIDTH);
+        assert_eq!(out[1].indent, TAB_WIDTH);
     }
 
     #[test]
@@ -717,11 +772,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_line_keeps_a_blank_line() {
-        let out = wrap_line(&[], 40, true, 5);
+    fn wrap_line_keeps_a_blank_response_line_in_the_gutter() {
+        let out = wrap_line(&MdLine::Text(Vec::new()), 40, true, 5);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text(), "");
-        assert_eq!(out[0].indent, HANG_INDENT);
+        assert!(out[0].response);
     }
 
     #[test]
@@ -731,27 +786,58 @@ mod tests {
         let hl = highlight(text, PROMPT_COLOR);
         let one = wrap_line(&hl[0], 20, false, 20);
         assert_eq!(
-            whole.iter().map(|l| (l.text(), l.indent, l.continuation)).collect::<Vec<_>>(),
-            one.iter().map(|l| (l.text(), l.indent, l.continuation)).collect::<Vec<_>>(),
+            whole.iter().map(|l| (l.text(), l.offset())).collect::<Vec<_>>(),
+            one.iter().map(|l| (l.text(), l.offset())).collect::<Vec<_>>(),
         );
     }
 
     #[test]
-    fn highlight_keeps_every_character() {
+    fn highlight_renders_the_markdown() {
         let text = "Fix `main.rs`\n\n- **bold** item\n";
         let lines = highlight(text, PROMPT_COLOR);
         let joined: String = lines
             .iter()
-            .map(|l| l.iter().map(|p| p.text.as_str()).collect::<String>())
+            .map(|l| l.pieces().iter().map(|p| p.text.as_str()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(joined.trim_end(), text.trim_end());
+        assert_eq!(joined, "Fix main.rs\n\n• bold item");
+    }
+
+    #[test]
+    fn a_table_aligns_its_columns() {
+        let out = wrap_plain("| a | b |\n|---|---|\n| long cell | x |", 40, 5);
+        assert_eq!(texts(&out), vec!["a         │ b", "──────────┼──", "long cell │ x"]);
+    }
+
+    #[test]
+    fn a_wide_table_wraps_its_cells() {
+        let md = "| key | value |\n|---|---|\n| k | alpha bravo charlie delta |";
+        let out = wrap_plain(md, 16, 10);
+        // 16 columns: the gap takes 3, `key` keeps 3, `value` gets 10.
+        assert_eq!(
+            texts(&out),
+            vec!["key │ value", "────┼───────────", "k   │ alpha", "    │ bravo", "    │ charlie", "    │ delta"],
+        );
+        assert!(out.iter().all(|l| l.text().chars().count() <= 16));
+    }
+
+    #[test]
+    fn a_code_block_counts_the_same_lines_plain_and_highlighted() {
+        let text = "look:\n```rust\nfn main() { let x = 1; println!(\"{x}\"); }\n```";
+        for width in [10usize, 25, 80] {
+            assert_eq!(
+                wrap_plain(text, width, 20).len(),
+                wrap_highlighted(text, width, 20).len(),
+                "line counts diverged at width {width}"
+            );
+        }
     }
 
     #[test]
     fn highlight_colors_code_apart_from_prose() {
         let lines = highlight("run `cargo test` now", PROMPT_COLOR);
         let styles: Vec<Color> = lines[0]
+            .pieces()
             .iter()
             .filter_map(|p| p.style.fg)
             .collect();
