@@ -499,7 +499,7 @@ fn allowed_tools(port: u16, repo_dirs: &BTreeSet<PathBuf>) -> String {
 /// The PATH of a triage run. launchd gives the server a short PATH, so the
 /// runner adds the directory of this binary (for `recap`) and the usual
 /// directories of `git`, `curl` and `hs`.
-fn child_path() -> String {
+pub(crate) fn child_path() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut dirs: Vec<String> = Vec::new();
     if let Some(dir) = std::env::current_exe()

@@ -339,7 +339,9 @@ impl Checker {
             run.spec.command_line(),
         );
         *slot = Some(run);
-        if before == Some(after) {
+        // Only the user can approve a script, so an unapproved script gives
+        // no notice. The status of the runner lists the scripts that wait.
+        if before == Some(after) || after == Outcome::Unapproved {
             return Vec::new();
         }
         let important = item.impact <= Impact::High;
@@ -566,7 +568,9 @@ pub fn notify(title: &str, text: &str) {
     };
     let lua = format!("recapNotify(\"{}\", \"{}\")", clean(title), clean(text));
     log::info!("checks: notify {title}: {text}");
+    // launchd gives the server a short PATH without `hs`.
     match Command::new("hs")
+        .env("PATH", crate::triage::child_path())
         .args(["-t", "5", "-c", &lua])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -638,8 +642,9 @@ mod tests {
         std::fs::write(dir.join("checks/ok"), "#!/bin/sh\necho \"arg $1\"\nexit 0\n").unwrap();
         write_items(&dir, vec![item("a", "ok", Impact::High)]);
         let mut checker = Checker::new(dir.clone(), std::env::var("PATH").unwrap(), String::new());
-        settle(&mut checker);
+        let notices = settle(&mut checker);
         assert_eq!(checker.results["a"].check.as_ref().unwrap().outcome, Outcome::Unapproved);
+        assert!(notices.iter().all(|n| n.item.is_empty()), "{notices:?}");
         assert_eq!(checker.unapproved(), ["ok".to_string()]);
 
         approve(&dir, "ok").unwrap();
