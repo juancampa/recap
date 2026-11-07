@@ -19,6 +19,7 @@
 //! one when the triage directory has no agent file, and when a client asks
 //! for one (`POST /v1/triage/review`).
 
+use crate::checks::{Checker, Notice};
 use crate::session::RunningSessions;
 use chrono::{DateTime, Local};
 use recap_api::{RunningSession, TriageRun, TriageStatus};
@@ -142,6 +143,11 @@ pub struct Triage {
     last: Option<TriageRun>,
     /// The time that the `next-run` file gave at the end of the last run.
     next_run: Option<SystemTime>,
+    /// The runner of the item checks.
+    checker: Checker,
+    /// The check notices that wait for the next run. An urgent notice
+    /// starts a run.
+    notices: Vec<Notice>,
 }
 
 impl Triage {
@@ -155,7 +161,14 @@ impl Triage {
         let review = !std::fs::read_dir(&agents)?
             .filter_map(Result::ok)
             .any(|e| e.path().extension().is_some_and(|x| x == "md"));
+        let checker = Checker::new(
+            dir.clone(),
+            child_path(),
+            format!("http://127.0.0.1:{}", config.port),
+        );
         Ok(Triage {
+            checker,
+            notices: Vec::new(),
             config: TriageConfig { dir, ..config },
             pending: Vec::new(),
             review,
@@ -172,6 +185,7 @@ impl Triage {
             review: self.review,
             next_run: self.next_run.map(DateTime::<Local>::from),
             run: self.run.as_ref().map(Run::info).or_else(|| self.last.clone()),
+            unapproved: self.checker.unapproved().to_vec(),
         }
     }
 
@@ -221,15 +235,25 @@ impl Triage {
         running: &RunningSessions,
         recent_dirs: impl FnOnce() -> Vec<PathBuf>,
     ) -> bool {
+        // An empty notice only tells that the status changed.
+        let mut changed = false;
+        for notice in self.checker.tick() {
+            if notice.item.is_empty() {
+                changed = true;
+            } else if !self.notices.contains(&notice) {
+                log::info!("triage: check notice: {}", notice.text);
+                self.notices.push(notice);
+            }
+        }
         if let Some(run) = self.run.as_mut() {
             let limit = if run.info.review { MAX_REVIEW_RUN } else { MAX_RUN };
             let success = match run.child.try_wait() {
                 Ok(None) if run.started.elapsed() < limit => {
                     // A new action changes the status.
                     let activity = run.info().activity;
-                    let changed = activity != run.info.activity;
+                    let activity_changed = activity != run.info.activity;
                     run.info.activity = activity;
-                    return changed;
+                    return changed || activity_changed;
                 }
                 Ok(None) => {
                     log::warn!("triage run: stopped after {}", crate::logger::ms(limit));
@@ -256,16 +280,18 @@ impl Triage {
             return true;
         }
         let scheduled = self.next_run.is_some_and(|t| SystemTime::now() >= t);
-        if self.pending.is_empty() && !scheduled && !self.review {
-            return false;
+        let urgent = self.notices.iter().any(|n| n.urgent);
+        if self.pending.is_empty() && !scheduled && !self.review && !urgent {
+            return changed;
         }
         let stops = std::mem::take(&mut self.pending);
+        let notices = std::mem::take(&mut self.notices);
         let review = std::mem::take(&mut self.review);
         // A scheduled run uses its time. Without a new `next-run` file, the
         // next run waits for a stop.
         self.next_run = None;
         let dirs = repo_dirs(&self.config, &stops, running, recent_dirs());
-        let prompt = run_prompt(&self.config, &stops, review, running, &dirs);
+        let prompt = run_prompt(&self.config, &stops, &notices, review, running, &dirs);
         let info = |session_id: String| TriageRun {
             session_id,
             started: Local::now(),
@@ -316,6 +342,8 @@ impl Triage {
             // One JSON event for each message and tool call, so the runner
             // can show the newest action. `-p` needs `--verbose` for it.
             .args(["--output-format", "stream-json", "--verbose"])
+            // Only the check runner writes the results.
+            .args(["--disallowedTools", "Edit(./results.json)"])
             .arg("--allowedTools")
             .arg(allowed_tools(self.config.port, repo_dirs))
             .env("PATH", child_path())
@@ -495,6 +523,7 @@ fn child_path() -> String {
 fn run_prompt(
     config: &TriageConfig,
     stops: &[Stop],
+    notices: &[Notice],
     review: bool,
     running: &RunningSessions,
     repo_dirs: &BTreeSet<PathBuf>,
@@ -511,7 +540,13 @@ fn run_prompt(
             "Reason: a review of all the agents of the last 24 hours (see \"Review runs\")."
         );
     }
-    if stops.is_empty() && !review {
+    if !notices.is_empty() {
+        let _ = writeln!(s, "Reason: the check runner reports these changes (see results.json).");
+        for n in notices {
+            let _ = writeln!(s, "- {}{}", n.text, if n.urgent { " [urgent]" } else { "" });
+        }
+    }
+    if stops.is_empty() && !review && notices.iter().all(|n| !n.urgent) {
         let _ = writeln!(
             s,
             "Reason: the scheduled run. No session stopped since the last run."

@@ -127,14 +127,42 @@ The triage directory contains these files:
 | `memory.md` | The notes of the triage agent that apply to many runs. |
 | `top.md` | The chain ids of rank 1, 2 and 3, one on each line. |
 | `next-run` | The delay to the next scheduled run (`90s`, `30m`, `2h`, `1d`), and the reason. |
-| `agents/<chain-id>.md` | The follow-ups, the agent TODO list and your TODO list for one session. |
+| `agents/<chain-id>.md` | The follow-ups for one session. |
+| `items.json` | The work items of all sessions. The triage agent writes them, and you confirm them. |
+| `checks/<script>` | The check scripts that the triage agent writes. |
+| `results.json` | The result of the last run of each check. Only the server writes this file. |
 
-The server stores none of these data.
+The server stores none of these data, except `results.json`.
 `crates/recap-server/src/triage_prompt.md` contains the instructions and the file formats of the triage agent.
+
+### Items and checks
+
+Each item has an owner (the agent or you), an impact (`critical`, `high`, `normal` or `low`), the reason for a critical or a high impact, and a done condition.
+It can also have a due time, and an event that the item must come before, such as the next prod deploy.
+The triage agent writes a check script for each done condition that a script can test.
+The server runs the check of each open item: every 10 minutes for a critical item, 30 minutes for a high item, 2 hours for a normal item, and 6 hours for a low item.
+A check exits with 0 when the item is done, 1 when it is not done, and another code when it cannot decide.
+The Triage panel shows an item as verified (`[✓]`) only when its check exits with 0.
+An item that an agent says is done, but that no check confirms, shows as claimed (`[~]`).
+
+The server starts a triage run without a session stop in these cases:
+the check outcome of a critical or high item changes, the event of an item occurs before the item is done, or the due time of a critical or high item comes near.
+For a critical item, the server also sends a notification through Hammerspoon.
+
+The server runs a check script only after you approve it:
+
+```sh
+recap triage approve
+```
+
+The command shows each new or changed script, as the full text or as a diff, and asks for a yes.
+It copies each approved script to `<triage dir>.approved/`, next to the triage directory, where the triage agent cannot write.
+The server runs the approved copy. A script that changed after the approval gives the outcome `unapproved` until you approve it again.
 
 `recap --queue`, or `Q` in the TUI, shows Queue mode.
 Queue mode has three panels: Queue, History and Triage.
-The Queue panel shows the sessions that have notes.
+The Queue panel shows the sessions that have notes or open items.
+A session with an open critical item stays in the panel, also when you hid it.
 A badge marks the sessions of rank 1, 2 and 3, and a resolved session is dim.
 The Triage panel shows the notes of the selected session.
 
@@ -147,12 +175,13 @@ The Triage panel shows the notes of the selected session.
 | `x` | Queue | Mark the current turn as resolved, or clear the mark. |
 | `d` | Queue | Hide the session until its next turn. |
 | `D` | Queue | Hide all the resolved sessions. |
-| `j` / `k` | Triage | Move between the follow-ups and the TODO items. |
+| `j` / `k` | Triage | Move between the follow-ups and the items. |
 | `Enter` | Triage | Copy the follow-up, then go to the session. |
-| `Space` | Triage | Mark a TODO item as done, or clear the mark. |
+| `Space` | Triage | Confirm that an item is done, or clear the confirmation. |
 
 A new turn in a session clears the resolved mark and the hidden mark.
-In the Triage panel, a click selects an item, a click on a check box toggles the item, and the mouse wheel moves the selection.
+In the Triage panel, a click selects an item, a click on a check box confirms the item, and the mouse wheel moves the selection.
+The selected item, and each open critical item, show the reason, the done condition, the due time, the event, and the last check result.
 
 The first row of the Queue panel is the current or last run of the triage agent.
 For that row, the Triage panel shows the state of the runner, the current action of the run, the end of the last run, and the next scheduled run.

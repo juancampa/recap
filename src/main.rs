@@ -6,6 +6,7 @@ mod reltime;
 mod search_history;
 mod service;
 mod settings;
+mod triage_cmd;
 mod triage_files;
 mod ui;
 
@@ -577,6 +578,7 @@ Usage:
   recap serve [options]              Run the server in the foreground.
   recap service <command>            Manage the prod server as a launchd agent.
   recap logs [-f] [-n <lines>]       Print the end of the prod server log.
+  recap triage approve [<script>...] Review and approve the check scripts of the triage agent.
 
 TUI options:
   -a, --absolute       Show absolute times instead of relative times.
@@ -616,6 +618,11 @@ service commands:
   restart              Stop the server and start it again.
   status               Print the state of the agent and of the server.
 
+triage options:
+      --triage-dir <dir>
+                       Use this triage directory. The default is the directory of
+                       the installed server.
+
 logs options:
   -f, --follow         Print the new lines until you press Ctrl-C.
   -n, --lines <count>  Print this number of lines first. The default is 50.
@@ -647,6 +654,9 @@ fn main() -> Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("service") {
         return service::run(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("triage") {
+        return triage_cmd::run(&args[2..]);
     }
     let index_only = args.iter().any(|a| a == "--index");
     let blame_cmd = args.get(1).map(String::as_str) == Some("blame");
@@ -1051,7 +1061,7 @@ fn handle_queue_key(
         (app::Panel::Agents, KeyCode::Char('D')) => app.hide_resolved(visible_history),
         (app::Panel::Diff, KeyCode::Char('j') | KeyCode::Down) => app.triage_down(),
         (app::Panel::Diff, KeyCode::Char('k') | KeyCode::Up) => app.triage_up(),
-        (app::Panel::Diff, KeyCode::Char(' ')) => app.toggle_selected_todo(visible_history),
+        (app::Panel::Diff, KeyCode::Char(' ')) => app.toggle_selected_item(visible_history),
         (app::Panel::Diff, KeyCode::Enter) => {
             // A follow-up goes to the clipboard, because a running session
             // takes its input only from its own terminal.
@@ -1061,7 +1071,7 @@ fn handle_queue_key(
                     focus_or_resume_session(&entry, &app.running);
                 }
             } else {
-                app.toggle_selected_todo(visible_history);
+                app.toggle_selected_item(visible_history);
             }
         }
         _ => return false,

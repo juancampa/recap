@@ -135,6 +135,12 @@ fn plist_triage_dir(text: &str) -> Option<String> {
     Some(unxml(&rest[start..end]))
 }
 
+/// The triage directory of the installed agent file, if it has one.
+pub fn installed_triage_dir() -> Option<std::path::PathBuf> {
+    let text = fs::read_to_string(plist_path().ok()?).ok()?;
+    plist_triage_dir(&text).map(std::path::PathBuf::from)
+}
+
 /// The triage directory of the new agent file. `--triage-dir <dir>` sets
 /// it, `--no-triage` removes it. Else the directory of the agent file that
 /// exists stays.

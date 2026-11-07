@@ -17,6 +17,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 pub mod routes;
+pub mod triage;
 
 // ── Entries ──────────────────────────────────────────────────────────────────
 
@@ -789,6 +790,10 @@ pub struct TriageStatus {
     /// the first run after the start of the server.
     #[serde(default)]
     pub run: Option<TriageRun>,
+    /// The check scripts that the user must approve before the runner runs
+    /// them (`recap triage approve`).
+    #[serde(default)]
+    pub unapproved: Vec<String>,
 }
 
 impl TriageStatus {
@@ -1104,6 +1109,7 @@ mod tests {
                     success: None,
                     activity: Some("Read memory.md".to_string()),
                 }),
+                unapproved: vec!["pr-merged".to_string()],
             }),
         });
         round_trip(&Filter {

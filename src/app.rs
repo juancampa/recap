@@ -12,7 +12,8 @@ use recap_api::{
     Event, FileInfo, Filter, HistoryResponse, ListItem, Page, Project, RunningSession,
     SEMANTIC_SCORE_SCALE, TriageStatus,
 };
-use crate::triage_files::{AgentNotes, FollowUp, Todo, TodoList, TriageFiles};
+use crate::triage_files::{AgentNotes, FollowUp, TriageFiles};
+use recap_api::triage::Item;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -193,7 +194,7 @@ impl QueueOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TriageItem<'a> {
     FollowUp(&'a FollowUp),
-    Todo(TodoList, &'a Todo),
+    Item(&'a Item),
 }
 
 /// Whether the agent session behind an entry still runs.
@@ -2623,8 +2624,9 @@ impl App {
     }
 
     /// Fill `agents` from `all_agents` for the current mode. Queue mode
-    /// keeps the agents that have a triage file and that the user did not
-    /// hide for their current turn. The first row of Queue mode is the
+    /// keeps the agents that have a triage file or an open item, and that
+    /// the user did not hide for their current turn. An agent with an open
+    /// critical item always shows. The first row of Queue mode is the
     /// current or last run of the triage agent.
     fn apply_agent_view(&mut self) {
         if self.mode != Mode::Queue {
@@ -2639,10 +2641,10 @@ impl App {
             .all_agents
             .iter()
             .filter(|a| {
-                files
-                    .agents
-                    .get(&a.chain_id)
-                    .is_some_and(|n| n.hidden.is_none() || n.hidden != a.last_ordinal)
+                let notes = files.agents.get(&a.chain_id);
+                let tracked = notes.is_some() || files.has_open_item(&a.chain_id, false);
+                let hidden = notes.is_some_and(|n| n.hidden.is_some() && n.hidden == a.last_ordinal);
+                tracked && (!hidden || files.has_open_item(&a.chain_id, true))
             })
             .cloned()
             .collect();
@@ -2671,12 +2673,12 @@ impl App {
     }
 
     /// Select the item `index` of the Triage panel. A click on the check box
-    /// of a TODO item also toggles the item.
+    /// of an item also confirms the item.
     pub fn click_triage_item(&mut self, index: usize, on_box: bool, visible: usize) {
         self.triage_sel = index;
         self.clamp_triage_sel();
         if on_box {
-            self.toggle_selected_todo(visible);
+            self.toggle_selected_item(visible);
         }
     }
 
@@ -2736,16 +2738,17 @@ impl App {
     }
 
     /// The rows of the Triage panel for the selected agent: the follow-ups,
-    /// the agent TODO items, then the TODO items of the user.
+    /// then the items (see [`TriageFiles::items_of`]).
     pub fn triage_items(&self) -> Vec<TriageItem<'_>> {
-        let Some(notes) = self.selected_agent_row().and_then(|a| self.notes_of(a)) else {
+        let (Some(agent), Some(files)) = (self.selected_agent_row(), self.triage_files.as_ref()) else {
             return Vec::new();
         };
-        let mut items: Vec<TriageItem> = notes.follow_ups.iter().map(TriageItem::FollowUp).collect();
-        for list in [TodoList::Agent, TodoList::Mine] {
-            items.extend(notes.todo(list).iter().map(|t| TriageItem::Todo(list, t)));
-        }
-        items
+        let mut rows: Vec<TriageItem> = self
+            .notes_of(agent)
+            .map(|n| n.follow_ups.iter().map(TriageItem::FollowUp).collect())
+            .unwrap_or_default();
+        rows.extend(files.items_of(&agent.chain_id).into_iter().map(TriageItem::Item));
+        rows
     }
 
     fn clamp_triage_sel(&mut self) {
@@ -2767,21 +2770,18 @@ impl App {
     pub fn selected_follow_up(&self) -> Option<String> {
         match self.triage_items().get(self.triage_sel)? {
             TriageItem::FollowUp(f) => Some(f.prompt.clone()),
-            TriageItem::Todo(..) => None,
+            TriageItem::Item(_) => None,
         }
     }
 
-    /// Toggle the check box of the selected TODO item.
-    pub fn toggle_selected_todo(&mut self, visible: usize) {
-        let Some(chain) = self.selected_agent.clone() else {
+    /// Confirm the selected item as done, or open it again.
+    pub fn toggle_selected_item(&mut self, visible: usize) {
+        let Some(TriageItem::Item(item)) = self.triage_items().get(self.triage_sel).copied() else {
             return;
         };
-        let Some(TriageItem::Todo(list, todo)) = self.triage_items().get(self.triage_sel).copied() else {
-            return;
-        };
-        let number = todo.number;
+        let id = item.id.clone();
         if let Some(files) = self.triage_files.as_mut()
-            && let Err(e) = files.toggle_todo(&chain, list, number)
+            && let Err(e) = files.toggle_confirmed(&id)
         {
             self.error = Some(format!("cannot change the triage file: {e}"));
         }

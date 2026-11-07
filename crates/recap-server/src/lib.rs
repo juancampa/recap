@@ -3,6 +3,7 @@
 
 pub mod blame;
 pub mod cache;
+pub mod checks;
 pub mod claude;
 pub mod colorize;
 pub mod cursor_sessions;

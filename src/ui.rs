@@ -2390,7 +2390,6 @@ fn triage_heading(text: &str) -> Line<'static> {
 /// or a message has no item.
 fn triage_lines(app: &App, width: usize, active: bool) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
     use crate::app::TriageItem;
-    use crate::triage_files::TodoList;
 
     if let Some(agent) = app.selected_agent_row().filter(|a| app.is_triage_run(a)) {
         let lines = triage_run_lines(app, agent, width);
@@ -2407,12 +2406,14 @@ fn triage_lines(app: &App, width: usize, active: bool) -> (Vec<Line<'static>>, V
     } else if items.is_empty() {
         out.push((Line::from("The triage agent wrote no notes for this agent."), None));
     }
+    if let Some(error) = app.triage_files.as_ref().and_then(|f| f.items_error.as_ref()) {
+        out.push((Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))), None));
+    }
     let mut last_section = "";
     for (i, item) in items.iter().enumerate() {
         let section = match item {
             TriageItem::FollowUp(_) => "Follow-ups",
-            TriageItem::Todo(TodoList::Agent, _) => "Agent TODO",
-            TriageItem::Todo(TodoList::Mine, _) => "My TODO",
+            TriageItem::Item(_) => "Items",
         };
         if section != last_section {
             if !last_section.is_empty() {
@@ -2457,34 +2458,133 @@ fn triage_lines(app: &App, width: usize, active: bool) -> (Vec<Line<'static>>, V
                     }
                 }
             }
-            TriageItem::Todo(_, todo) => {
-                let (mark, color) = if todo.done {
-                    (TODO_DONE_MARK, TIME_COLOR_OLD)
-                } else {
-                    (TODO_OPEN_MARK, Color::White)
-                };
-                let mut text_style = Style::default().fg(color);
-                if todo.done {
-                    text_style = text_style.add_modifier(Modifier::CROSSED_OUT);
+            TriageItem::Item(item) => {
+                let files = app.triage_files.as_ref().expect("an item comes from the files");
+                let state = files.state(item);
+                for line in item_lines(item, state, &files.results, width, selected) {
+                    out.push((line.style(row_style), Some(i)));
                 }
-                out.push((
-                    Line::from(vec![
-                        Span::styled(format!("{} ", todo.number), Style::default().fg(ORDINAL_COLOR)),
-                        Span::styled(format!("{mark} "), Style::default().fg(color)),
-                        Span::styled(todo.text.clone(), text_style),
-                    ])
-                    .style(row_style),
-                    Some(i),
-                ));
             }
         }
     }
     out.into_iter().unzip()
 }
 
-/// The check box of an open and of a complete TODO item.
-const TODO_OPEN_MARK: &str = "[ ]";
-const TODO_DONE_MARK: &str = "[x]";
+/// The check box of an item in each state, and its color.
+fn item_mark(state: recap_api::triage::State) -> (&'static str, Color) {
+    use recap_api::triage::State;
+    match state {
+        State::Open => ("[ ]", Color::White),
+        State::Verified => ("[✓]", RUNNING_COLOR),
+        State::Claimed => ("[~]", Color::Yellow),
+        State::Confirmed => ("[x]", TIME_COLOR_OLD),
+        State::Dropped => ("[-]", TIME_COLOR_OLD),
+        State::Unknown => ("[?]", ORANGE),
+    }
+}
+
+/// True when `text` is the check box of an item.
+fn is_item_mark(text: &str) -> bool {
+    use recap_api::triage::State;
+    [State::Open, State::Verified, State::Claimed, State::Confirmed, State::Dropped, State::Unknown]
+        .into_iter()
+        .any(|s| item_mark(s).0 == text)
+}
+
+/// The lines of one item. The first line has the check box, the impact and
+/// the text. The selected item, and a critical item that is not closed,
+/// also show the reason, the done condition, the due time and the check
+/// result.
+fn item_lines(
+    item: &recap_api::triage::Item,
+    state: recap_api::triage::State,
+    results: &recap_api::triage::Results,
+    width: usize,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    use recap_api::triage::{Impact, Owner};
+    let (mark, color) = item_mark(state);
+    let closed = state.closed();
+    let mut text_style = Style::default().fg(if closed { TIME_COLOR_OLD } else { Color::White });
+    if closed {
+        text_style = text_style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    let impact = match item.impact {
+        Impact::Critical => Span::styled("CRIT ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Impact::High => Span::styled("high ", Style::default().fg(ORANGE)),
+        Impact::Normal => Span::raw(""),
+        Impact::Low => Span::styled("low ", Style::default().fg(TIME_COLOR_OLD)),
+    };
+    let owner = match item.owner {
+        Owner::User => Span::styled("you: ", Style::default().fg(Color::Cyan)),
+        Owner::Agent => Span::raw(""),
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{mark} "), Style::default().fg(color)),
+        if closed { Span::raw("") } else { impact },
+        owner,
+        Span::styled(item.text.clone(), text_style),
+    ])];
+    let critical_open = item.impact == Impact::Critical && !closed;
+    if !selected && !critical_open {
+        return lines;
+    }
+    let label = Style::default().fg(TIME_COLOR_RECENT);
+    let indent = 4;
+    let field_width = 6;
+    let mut field = |name: &str, text: &str, style: Style| {
+        let mut first = true;
+        for part in wrap_text(text, width.saturating_sub(indent + field_width).max(1)) {
+            let name = if first { name } else { "" };
+            first = false;
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::styled(format!("{name:<field_width$}"), label),
+                Span::styled(part, style),
+            ]));
+        }
+    };
+    let white = Style::default().fg(Color::White);
+    let missing = Style::default().fg(ORANGE);
+    match (item.why.is_empty(), item.impact <= Impact::High) {
+        (false, _) => field("why", &item.why, white),
+        (true, true) => field("why", "(the triage agent wrote no reason)", missing),
+        (true, false) => {}
+    }
+    if item.done_when.is_empty() {
+        field("done", "(no done condition)", missing);
+    } else {
+        field("done", &item.done_when, white);
+    }
+    if let Some(due) = item.due {
+        field("due", &due.format("%Y-%m-%d %H:%M").to_string(), white);
+    }
+    if let Some(before) = &item.before {
+        let occurred = item.event_occurred(results);
+        let text = if occurred { format!("{} (it occurred)", before.event) } else { before.event.clone() };
+        let style = if occurred && !closed { Style::default().fg(Color::Red) } else { white };
+        field("before", &text, style);
+    }
+    match (&item.check, item.check_run(results)) {
+        (None, _) => field("check", "(no check)", if closed { white } else { missing }),
+        (Some(spec), None) => field("check", &format!("{} (no result yet)", spec.command_line()), white),
+        (Some(spec), Some(run)) => {
+            let age = duration_text(Local::now() - run.at);
+            let outcome = serde_json::to_value(run.outcome)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            field("check", &format!("{} → {outcome}, {age} ago", spec.command_line()), white);
+            if let Some(last) = run.output.lines().rev().find(|l| !l.trim().is_empty()) {
+                field("", last.trim(), Style::default().fg(TIME_COLOR_RECENT));
+            }
+        }
+    }
+    if !item.note.is_empty() {
+        field("note", &item.note, white);
+    }
+    lines
+}
 
 /// The lines of the Triage panel for the row of the triage agent: the state
 /// of the runner, the current or last run, and the newest response of the
@@ -2552,6 +2652,15 @@ fn triage_run_lines(app: &App, agent: &Agent, width: usize) -> Vec<Line<'static>
             text.push_str(&format!(" — {reason}"));
         }
         lines.push(field("next run", text));
+    }
+    if !status.unapproved.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<10}", "approve"), label),
+            Span::styled(
+                format!("{} — run `recap triage approve`", status.unapproved.join(", ")),
+                Style::default().fg(ORANGE),
+            ),
+        ]));
     }
     lines.push(field("directory", status.dir.display().to_string()));
     lines.push(Line::default());
@@ -2683,7 +2792,7 @@ pub fn triage_click(app: &App, area: Rect, row: usize, col: usize) -> Option<(us
         let w = span.content.chars().count();
         if col >= x && col < x + w {
             let text = span.content.trim_end();
-            on_box = text == TODO_OPEN_MARK || text == TODO_DONE_MARK;
+            on_box = is_item_mark(text);
             break;
         }
         x += w;
@@ -2714,6 +2823,12 @@ fn triage_status_line(app: &App) -> Line<'static> {
     }
     if status.review {
         spans.push(Span::styled(" · a review waits", dim));
+    }
+    if !status.unapproved.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {} scripts wait for recap triage approve", status.unapproved.len()),
+            Style::default().fg(ORANGE),
+        ));
     }
     if let Some(next) = status.next_run {
         spans.push(Span::styled(format!(" · next {}", next.format("%H:%M")), dim));
