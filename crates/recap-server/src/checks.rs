@@ -213,11 +213,18 @@ impl Checker {
         self.next_eval = Instant::now() + EVAL_INTERVAL;
         let items = self.read_items();
         let unapproved = unapproved_scripts(&self.dir);
-        for name in &unapproved {
-            let version = std::fs::read(self.dir.join(CHECKS_DIR).join(name)).ok().map(|b| sha256_hex(&b));
-            if self.notified.insert((name.clone(), version)) {
-                notify("Triage check", &format!("Script {name} waits for recap triage approve"));
-            }
+        // One notification for all the new script versions.
+        let new: Vec<&String> = unapproved
+            .iter()
+            .filter(|name| {
+                let version = std::fs::read(self.dir.join(CHECKS_DIR).join(name)).ok().map(|b| sha256_hex(&b));
+                self.notified.insert(((*name).clone(), version))
+            })
+            .collect();
+        match new.as_slice() {
+            [] => {}
+            [name] => notify("Triage check", &format!("Script {name} waits for recap triage approve")),
+            names => notify("Triage checks", &format!("{} scripts wait for recap triage approve", names.len())),
         }
         if unapproved != self.unapproved {
             self.unapproved = unapproved;
