@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Longest text that recap sends for one embedding.
@@ -164,6 +166,8 @@ fn which(bin: &Path) -> Option<PathBuf> {
 /// never leaves an orphan that holds the GPU.
 pub struct EmbedServer {
     child: Child,
+    /// True when recap stops the process itself.
+    stopping: Arc<AtomicBool>,
 }
 
 impl EmbedServer {
@@ -185,15 +189,41 @@ impl EmbedServer {
             .args(["--host", "127.0.0.1", "--port", &cfg.port.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("cannot start llama-server")?;
-        Ok(EmbedServer { child })
+        let mut child = child;
+        let stopping = Arc::new(AtomicBool::new(false));
+        if let Some(stderr) = child.stderr.take() {
+            let stopping = stopping.clone();
+            std::thread::spawn(move || log_exit_output(stderr, &stopping));
+        }
+        Ok(EmbedServer { child, stopping })
+    }
+}
+
+/// Read the stderr of llama-server until the process exits. If recap did not
+/// stop the process, write the last lines to the log: they tell why the
+/// process stopped.
+fn log_exit_output(stderr: std::process::ChildStderr, stopping: &AtomicBool) {
+    use std::io::BufRead;
+    const KEEP: usize = 30;
+    let mut last = std::collections::VecDeque::with_capacity(KEEP);
+    for line in std::io::BufReader::new(stderr).split(b'\n').map_while(|l| l.ok()) {
+        if last.len() == KEEP {
+            last.pop_front();
+        }
+        last.push_back(String::from_utf8_lossy(&line).into_owned());
+    }
+    if !stopping.load(Ordering::Relaxed) {
+        let lines: Vec<String> = last.into_iter().collect();
+        log::error!("embedding: llama-server exited. Its last output:\n{}", lines.join("\n"));
     }
 }
 
 impl Drop for EmbedServer {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
