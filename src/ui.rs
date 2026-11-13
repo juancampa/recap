@@ -1,6 +1,6 @@
 use crate::app::{App, DisplayRow, KindFilter, Mode, Panel, RunState, SearchKind, SearchPhase};
 use crate::reltime::align_relative_times;
-use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields, TriageStatus};
+use recap_api::{Agent, DiffLine, DiffSummary, EditSource, EmbedStatus, Entry, EntryFields};
 use crate::search_history::SearchMode;
 use crate::markdown::MdLine;
 use crate::settings::{Settings, SETTINGS_ITEMS};
@@ -538,11 +538,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_history(f, app, rects.history);
     draw_history_footer(f, app, rects.history_footer);
     if let Some(diff_area) = rects.diff {
-        if app.mode == Mode::Queue {
-            draw_triage(f, app, diff_area);
-        } else {
-            draw_diff(f, app, diff_area);
-        }
+        draw_diff(f, app, diff_area);
     }
     draw_help(f, app, help_area);
     if app.settings_menu.open {
@@ -2102,12 +2098,7 @@ pub fn agent_content(agent: &Agent) -> [(&str, Color); AGENT_ROW_LINES] {
 /// History panel does.
 fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active_panel == Panel::Agents;
-    let queue = app.mode == Mode::Queue;
-    let title = if queue {
-        format!(" Queue ({}) · {} ", app.agents.len(), app.queue_order.label())
-    } else {
-        format!(" Agents ({}) ", app.agents.len())
-    };
+    let title = format!(" Agents ({}) ", app.agents.len());
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -2140,7 +2131,7 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     let sel = app.sel_agent_idx();
 
     let timestamps: Vec<DateTime<Local>> =
-        app.agents[first..last].iter().map(|a| app.agent_time(a)).collect();
+        app.agents[first..last].iter().map(|a| a.last_ts).collect();
     let formatted_ts = format_panel_timestamps(&timestamps, app.absolute_time);
 
     let meta_width = (inner_width / 3).min(AGENT_META_MAX_WIDTH);
@@ -2217,70 +2208,27 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
                 // in the Projects and Files panels.
                 style = style.add_modifier(Modifier::DIM);
             }
-            // A resolved agent needs nothing from the user, so it is dim.
-            if queue && app.is_resolved(agent) {
-                style = style.add_modifier(Modifier::DIM);
-            }
             let mut lines: Vec<Line> = Vec::with_capacity(AGENT_ROW_HEIGHT + 1);
             if app.agent_starts_day(i) {
-                lines.push(date_row_line(app.agent_time(agent).date_naive(), today, inner_width));
+                lines.push(date_row_line(agent.last_ts.date_naive(), today, inner_width));
             }
             // The title line: the session title and the project chain, cut
             // with an ellipsis at the run state marker.
             let mut title_pieces = Vec::with_capacity(3);
-            let rank = if queue { app.rank_of(agent) } else { None };
-            if queue && app.is_triage_run(agent) {
+            if !title.is_empty() {
                 title_pieces.push(prompt::Piece {
-                    text: "triage agent ".to_string(),
-                    style: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                });
-                let mut state = app.triage.as_ref().map(triage_state_text).unwrap_or_default();
-                if let Some(activity) = app
-                    .triage
-                    .as_ref()
-                    .filter(|t| t.running())
-                    .and_then(|t| t.run.as_ref())
-                    .and_then(|r| r.activity.as_deref())
-                {
-                    state.push_str(&format!(" · {activity}"));
-                }
-                title_pieces.push(prompt::Piece {
-                    text: state,
-                    style: Style::default().fg(Color::Gray),
-                });
-            } else if let Some(rank) = rank {
-                title_pieces.push(prompt::Piece {
-                    text: format!(" {rank} "),
-                    style: Style::default()
-                        .fg(Color::Black)
-                        .bg(RANK_COLORS[rank - 1])
-                        .add_modifier(Modifier::BOLD),
-                });
-                title_pieces.push(prompt::Piece {
-                    text: " ".to_string(),
-                    style: Style::default(),
+                    text: format!("{title} "),
+                    style: Style::default().fg(title_color),
                 });
             }
-            if !(queue && app.is_triage_run(agent)) {
-                if !title.is_empty() {
-                    title_pieces.push(prompt::Piece {
-                        text: format!("{title} "),
-                        style: Style::default().fg(title_color),
-                    });
-                }
-                title_pieces.push(prompt::Piece {
-                    text: chain,
-                    style: Style::default().fg(Color::Gray),
-                });
-            }
+            title_pieces.push(prompt::Piece {
+                text: chain,
+                style: Style::default().fg(Color::Gray),
+            });
             let title_width = inner_width.saturating_sub(RUNNING_RESERVE).max(1);
             let one = prompt::wrap_line(&MdLine::Text(title_pieces), title_width, false, 1);
             let mut spans = prompt_line_spans(&one[0], highlight);
-            if queue {
-                append_queue_state(&mut spans, inner_width, app.running.get(&agent.session_id));
-            } else {
-                append_run_state(&mut spans, inner_width, state, AGENT_RUNNING_GLYPH);
-            }
+            append_run_state(&mut spans, inner_width, state, AGENT_RUNNING_GLYPH);
             lines.push(Line::from(spans).style(style));
 
             lines.extend(meta
@@ -2338,527 +2286,6 @@ fn draw_agents(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The badge colors of rank 1, 2 and 3 in the Queue panel.
-const RANK_COLORS: [Color; 3] = [
-    Color::Rgb(255, 214, 10),
-    Color::Rgb(255, 140, 66),
-    Color::Rgb(120, 200, 255),
-];
-/// The color of a session that waits for a permission or an answer.
-const WAITING_COLOR: Color = Color::Rgb(255, 214, 10);
-
-/// Append the status of the session at the right edge of a Queue row: a
-/// yellow `?` when the session waits for the user, a green dot when it is
-/// busy, a gray circle when it is idle. A session that does not run shows
-/// nothing.
-fn append_queue_state(
-    spans: &mut Vec<Span<'static>>,
-    inner_width: usize,
-    running: Option<&recap_api::RunningSession>,
-) {
-    let Some(running) = running else {
-        return;
-    };
-    let glyph = match running.status.as_deref() {
-        Some("waiting") => Span::styled(
-            "?",
-            Style::default().fg(WAITING_COLOR).add_modifier(Modifier::BOLD),
-        ),
-        Some("busy") => Span::styled(
-            AGENT_RUNNING_GLYPH,
-            Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD),
-        ),
-        _ => Span::styled("○", Style::default().fg(Color::Gray)),
-    };
-    let used = spans_width(spans);
-    let target = inner_width.saturating_sub(1);
-    let pad = if target > used { target - used } else { 1 };
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(glyph);
-}
-
-/// A heading line of the Triage panel.
-fn triage_heading(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    ))
-}
-
-/// The lines of the Triage panel above its status line, and for each line
-/// the index of its item in [`App::triage_items`]. A heading, an empty line
-/// or a message has no item.
-fn triage_lines(app: &App, width: usize, active: bool) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
-    use crate::app::TriageItem;
-
-    if let Some(agent) = app.selected_agent_row().filter(|a| app.is_triage_run(a)) {
-        let lines = triage_run_lines(app, agent, width);
-        let items_of = vec![None; lines.len()];
-        return (lines, items_of);
-    }
-
-    let mut out: Vec<(Line<'static>, Option<usize>)> = Vec::new();
-    let items = app.triage_items();
-    if app.triage_files.is_none() {
-        out.push((Line::from("The server runs without --triage-dir."), None));
-    } else if app.selected_agent_row().is_none() {
-        out.push((Line::from("No agent waits for you."), None));
-    } else if items.is_empty() {
-        out.push((Line::from("The triage agent wrote no notes for this agent."), None));
-    }
-    if let Some(error) = app.triage_files.as_ref().and_then(|f| f.items_error.as_ref()) {
-        out.push((Line::from(Span::styled(error.clone(), Style::default().fg(Color::Red))), None));
-    }
-    let mut last_section = "";
-    for (i, item) in items.iter().enumerate() {
-        let section = match item {
-            TriageItem::FollowUp(_) => "Follow-ups",
-            TriageItem::Item(_) => "Items",
-        };
-        if section != last_section {
-            if !last_section.is_empty() {
-                out.push((Line::default(), None));
-            }
-            out.push((triage_heading(section), None));
-            last_section = section;
-        }
-        let selected = active && i == app.triage_sel;
-        let row_style = if selected {
-            Style::default().bg(SELECTED_BG)
-        } else {
-            Style::default()
-        };
-        match item {
-            TriageItem::FollowUp(follow_up) => {
-                let number = format!("{} ", follow_up.number);
-                let pad = " ".repeat(number.chars().count());
-                let mut first = true;
-                for line in wrap_text(&follow_up.description, width.saturating_sub(pad.len()).max(1)) {
-                    let lead = if first { number.clone() } else { pad.clone() };
-                    first = false;
-                    out.push((
-                        Line::from(vec![
-                            Span::styled(lead, Style::default().fg(ORDINAL_COLOR)),
-                            Span::styled(line, Style::default().fg(Color::White)),
-                        ])
-                        .style(row_style),
-                        Some(i),
-                    ));
-                }
-                for line in follow_up.prompt.lines() {
-                    for part in wrap_text(line, width.saturating_sub(pad.len() + 2).max(1)) {
-                        out.push((
-                            Line::from(vec![
-                                Span::raw(format!("{pad}› ")),
-                                Span::styled(part, Style::default().fg(PROMPT_COLOR)),
-                            ])
-                            .style(row_style),
-                            Some(i),
-                        ));
-                    }
-                }
-            }
-            TriageItem::Item(item) => {
-                let files = app.triage_files.as_ref().expect("an item comes from the files");
-                let state = files.state(item);
-                for line in item_lines(item, state, &files.results, width, selected) {
-                    out.push((line.style(row_style), Some(i)));
-                }
-            }
-        }
-    }
-    out.into_iter().unzip()
-}
-
-/// The check box of an item in each state, and its color.
-fn item_mark(state: recap_api::triage::State) -> (&'static str, Color) {
-    use recap_api::triage::State;
-    match state {
-        State::Open => ("[ ]", Color::White),
-        State::Verified => ("[✓]", RUNNING_COLOR),
-        State::Claimed => ("[~]", Color::Yellow),
-        State::Confirmed => ("[x]", TIME_COLOR_OLD),
-        State::Dropped => ("[-]", TIME_COLOR_OLD),
-        State::Unknown => ("[?]", ORANGE),
-    }
-}
-
-/// True when `text` is the check box of an item.
-fn is_item_mark(text: &str) -> bool {
-    use recap_api::triage::State;
-    [State::Open, State::Verified, State::Claimed, State::Confirmed, State::Dropped, State::Unknown]
-        .into_iter()
-        .any(|s| item_mark(s).0 == text)
-}
-
-/// The lines of one item. The first line has the check box, the impact and
-/// the text. The selected item, and a critical item that is not closed,
-/// also show the reason, the done condition, the due time and the check
-/// result.
-fn item_lines(
-    item: &recap_api::triage::Item,
-    state: recap_api::triage::State,
-    results: &recap_api::triage::Results,
-    width: usize,
-    selected: bool,
-) -> Vec<Line<'static>> {
-    use recap_api::triage::{Impact, Owner};
-    let (mark, color) = item_mark(state);
-    let closed = state.closed();
-    let mut text_style = Style::default().fg(if closed { TIME_COLOR_OLD } else { Color::White });
-    if closed {
-        text_style = text_style.add_modifier(Modifier::CROSSED_OUT);
-    }
-    let impact = match item.impact {
-        Impact::Critical => Span::styled("CRIT ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Impact::High => Span::styled("high ", Style::default().fg(ORANGE)),
-        Impact::Normal => Span::raw(""),
-        Impact::Low => Span::styled("low ", Style::default().fg(TIME_COLOR_OLD)),
-    };
-    let owner = match item.owner {
-        Owner::User => Span::styled("you: ", Style::default().fg(Color::Cyan)),
-        Owner::Agent => Span::raw(""),
-    };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{mark} "), Style::default().fg(color)),
-        if closed { Span::raw("") } else { impact },
-        owner,
-        Span::styled(item.text.clone(), text_style),
-    ])];
-    let critical_open = item.impact == Impact::Critical && !closed;
-    if !selected && !critical_open {
-        return lines;
-    }
-    let label = Style::default().fg(TIME_COLOR_RECENT);
-    let indent = 4;
-    let field_width = 6;
-    let mut field = |name: &str, text: &str, style: Style| {
-        let mut first = true;
-        for part in wrap_text(text, width.saturating_sub(indent + field_width).max(1)) {
-            let name = if first { name } else { "" };
-            first = false;
-            lines.push(Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(format!("{name:<field_width$}"), label),
-                Span::styled(part, style),
-            ]));
-        }
-    };
-    let white = Style::default().fg(Color::White);
-    let missing = Style::default().fg(ORANGE);
-    match (item.why.is_empty(), item.impact <= Impact::High) {
-        (false, _) => field("why", &item.why, white),
-        (true, true) => field("why", "(the triage agent wrote no reason)", missing),
-        (true, false) => {}
-    }
-    if item.done_when.is_empty() {
-        field("done", "(no done condition)", missing);
-    } else {
-        field("done", &item.done_when, white);
-    }
-    if let Some(due) = item.due {
-        field("due", &due.format("%Y-%m-%d %H:%M").to_string(), white);
-    }
-    if let Some(before) = &item.before {
-        let occurred = item.event_occurred(results);
-        let text = if occurred { format!("{} (it occurred)", before.event) } else { before.event.clone() };
-        let style = if occurred && !closed { Style::default().fg(Color::Red) } else { white };
-        field("before", &text, style);
-    }
-    match (&item.check, item.check_run(results)) {
-        (None, _) => field("check", "(no check)", if closed { white } else { missing }),
-        (Some(spec), None) => field("check", &format!("{} (no result yet)", spec.command_line()), white),
-        (Some(spec), Some(run)) => {
-            let age = duration_text(Local::now() - run.at);
-            let outcome = serde_json::to_value(run.outcome)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default();
-            field("check", &format!("{} → {outcome}, {age} ago", spec.command_line()), white);
-            if let Some(last) = run.output.lines().rev().find(|l| !l.trim().is_empty()) {
-                field("", last.trim(), Style::default().fg(TIME_COLOR_RECENT));
-            }
-        }
-    }
-    if !item.note.is_empty() {
-        field("note", &item.note, white);
-    }
-    lines
-}
-
-/// The lines of the Triage panel for the row of the triage agent: the state
-/// of the runner, the current or last run, and the newest response of the
-/// run. History shows the full transcript of the run.
-fn triage_run_lines(app: &App, agent: &Agent, width: usize) -> Vec<Line<'static>> {
-    let Some(status) = &app.triage else {
-        return Vec::new();
-    };
-    let label = Style::default().fg(TIME_COLOR_RECENT);
-    let field = |name: &str, text: String| {
-        Line::from(vec![
-            Span::styled(format!("{name:<10}"), label),
-            Span::styled(text, Style::default().fg(Color::White)),
-        ])
-    };
-    let mut lines = vec![triage_heading("Triage runner")];
-    lines.push(field("state", triage_state_text(status)));
-    if let Some(run) = &status.run {
-        lines.push(field(
-            "run",
-            format!("started {} · {}", run.started.format("%H:%M:%S"), triage_run_reason(run)),
-        ));
-        // The last action of an ended run is its result, which the last
-        // response shows.
-        if let Some(activity) = run.activity.as_ref().filter(|_| run.ended.is_none()) {
-            let mut first = true;
-            for line in wrap_text(activity, width.saturating_sub(10).max(1)) {
-                lines.push(field(if first { "now" } else { "" }, line));
-                first = false;
-            }
-        }
-        if let (Some(ended), Some(success)) = (run.ended, run.success) {
-            lines.push(field(
-                "ended",
-                format!(
-                    "{} after {} · {}",
-                    ended.format("%H:%M:%S"),
-                    duration_text(ended - run.started),
-                    if success { "success" } else { "failed" }
-                ),
-            ));
-        }
-    }
-    let mut waiting = Vec::new();
-    if status.pending > 0 {
-        waiting.push(format!(
-            "{} {}",
-            status.pending,
-            if status.pending == 1 { "stop" } else { "stops" }
-        ));
-    }
-    if status.review {
-        waiting.push("a review".to_string());
-    }
-    if !waiting.is_empty() {
-        lines.push(field("waiting", waiting.join(", ")));
-    }
-    if let Some(next) = status.next_run {
-        let mut text = format!(
-            "{} (in {})",
-            next.format("%H:%M"),
-            duration_text(next - Local::now())
-        );
-        if let Some(reason) = app.triage_files.as_ref().and_then(|f| f.next_run_reason.as_deref()) {
-            text.push_str(&format!(" — {reason}"));
-        }
-        lines.push(field("next run", text));
-    }
-    if !status.unapproved.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:<10}", "approve"), label),
-            Span::styled(
-                format!("{} — run `recap triage approve`", status.unapproved.join(", ")),
-                Style::default().fg(ORANGE),
-            ),
-        ]));
-    }
-    lines.push(field("directory", status.dir.display().to_string()));
-    lines.push(Line::default());
-    lines.push(triage_heading(if status.running() {
-        "Newest response"
-    } else {
-        "Last response"
-    }));
-    let response = agent.last_response.as_deref().unwrap_or("No response yet.");
-    for line in wrap_text(response, width.max(1)) {
-        lines.push(Line::from(Span::styled(line, Style::default().fg(RESPONSE_COLOR))));
-    }
-    lines.push(Line::default());
-    for line in wrap_text(
-        "History shows the transcript of the run. R asks for a review of the agents of the last 24 hours.",
-        width.max(1),
-    ) {
-        lines.push(Line::from(Span::styled(line, label)));
-    }
-    lines
-}
-
-/// "running for 1m 20s" or "idle".
-fn triage_state_text(status: &TriageStatus) -> String {
-    match &status.run {
-        Some(run) if run.ended.is_none() => {
-            format!("running for {}", duration_text(Local::now() - run.started))
-        }
-        _ => "idle".to_string(),
-    }
-}
-
-/// The reason of a run: its stops and the review.
-fn triage_run_reason(run: &recap_api::TriageRun) -> String {
-    let mut parts = Vec::new();
-    if run.stops > 0 {
-        parts.push(format!("{} {}", run.stops, if run.stops == 1 { "stop" } else { "stops" }));
-    }
-    if run.review {
-        parts.push("review of 24 hours".to_string());
-    }
-    if parts.is_empty() {
-        parts.push("scheduled".to_string());
-    }
-    parts.join(", ")
-}
-
-/// A duration as "45s", "3m 20s" or "2h 5m".
-fn duration_text(d: chrono::TimeDelta) -> String {
-    let secs = d.num_seconds().max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
-    }
-}
-
-/// The first line that the Triage panel shows. When the panel has the
-/// focus, it scrolls so that the first line of the selected item shows.
-fn triage_skip(items_of: &[Option<usize>], sel: usize, height: usize, active: bool) -> usize {
-    if !active {
-        return 0;
-    }
-    let first = items_of.iter().position(|i| *i == Some(sel)).unwrap_or(0);
-    first.saturating_sub(height.saturating_sub(3))
-}
-
-/// Render the Triage panel of Queue mode: the follow-ups, the agent TODO
-/// items and the TODO items of the user for the selected agent, or the
-/// state of the runner for the row of the triage agent. The last line shows
-/// the state of the triage runner.
-fn draw_triage(f: &mut Frame, app: &App, area: Rect) {
-    let active = app.active_panel == Panel::Diff;
-    let block = Block::default()
-        .title(" Triage ")
-        .borders(Borders::ALL)
-        .border_type(if active {
-            BorderType::Thick
-        } else {
-            BorderType::Plain
-        })
-        .border_style(border_style(active))
-        .style(Style::default().bg(PANEL_BG));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.height == 0 {
-        return;
-    }
-    // The state of the runner takes the last line.
-    let status_area = Rect {
-        y: inner.y + inner.height - 1,
-        height: 1,
-        ..inner
-    };
-    let list_area = Rect {
-        height: inner.height - 1,
-        ..inner
-    };
-    let (lines, items_of) = triage_lines(app, inner.width as usize, active);
-    let skip = triage_skip(&items_of, app.triage_sel, list_area.height as usize, active);
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
-        list_area,
-    );
-    f.render_widget(Paragraph::new(triage_status_line(app)), status_area);
-}
-
-/// What a click at `(row, col)` of the inner area of the Triage panel hits:
-/// the index of an item, and true when the click hits the check box of a
-/// TODO item. `area` is the panel with its border. The function uses the
-/// layout of the last frame, so it runs before the click changes the focus.
-pub fn triage_click(app: &App, area: Rect, row: usize, col: usize) -> Option<(usize, bool)> {
-    let width = area.width.saturating_sub(2) as usize;
-    // The status line takes the last line of the inner area.
-    let height = (area.height.saturating_sub(2) as usize).saturating_sub(1);
-    if row >= height {
-        return None;
-    }
-    let active = app.active_panel == Panel::Diff;
-    let (lines, items_of) = triage_lines(app, width, active);
-    let skip = triage_skip(&items_of, app.triage_sel, height, active);
-    let item = items_of.get(skip + row).copied().flatten()?;
-    let line = &lines[skip + row];
-    let mut x = 0;
-    let mut on_box = false;
-    for span in &line.spans {
-        let w = span.content.chars().count();
-        if col >= x && col < x + w {
-            let text = span.content.trim_end();
-            on_box = is_item_mark(text);
-            break;
-        }
-        x += w;
-    }
-    Some((item, on_box))
-}
-
-/// The state of the triage runner, on one line.
-fn triage_status_line(app: &App) -> Line<'static> {
-    let Some(status) = &app.triage else {
-        return Line::default();
-    };
-    let dim = Style::default().fg(TIME_COLOR_RECENT);
-    let mut spans = vec![Span::styled("triage ", dim)];
-    if status.running() {
-        spans.push(Span::styled(
-            triage_state_text(status),
-            Style::default().fg(RUNNING_COLOR).add_modifier(Modifier::BOLD),
-        ));
-        if let Some(activity) = status.run.as_ref().and_then(|r| r.activity.as_deref()) {
-            spans.push(Span::styled(format!(" · {activity}"), dim));
-        }
-    } else {
-        spans.push(Span::styled("idle", dim));
-    }
-    if status.pending > 0 {
-        spans.push(Span::styled(format!(" · {} stops wait", status.pending), dim));
-    }
-    if status.review {
-        spans.push(Span::styled(" · a review waits", dim));
-    }
-    if !status.unapproved.is_empty() {
-        spans.push(Span::styled(
-            format!(" · {} scripts wait for recap triage approve", status.unapproved.len()),
-            Style::default().fg(ORANGE),
-        ));
-    }
-    if let Some(next) = status.next_run {
-        spans.push(Span::styled(format!(" · next {}", next.format("%H:%M")), dim));
-        if let Some(reason) = app.triage_files.as_ref().and_then(|f| f.next_run_reason.as_deref()) {
-            spans.push(Span::styled(format!(" — {reason}"), dim));
-        }
-    }
-    Line::from(spans)
-}
-
-/// Split `text` into lines of at most `width` chars, at spaces.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let len = line.chars().count();
-        if len > 0 && len + 1 + word.chars().count() > width {
-            out.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() || out.is_empty() {
-        out.push(line);
-    }
-    out
-}
-
 /// The label that tells the user that rows are below the History window, and
 /// its place: centered on the last line of the list. Agent mode only, where
 /// the newest row is at the bottom. A click on the label scrolls to the
@@ -2890,7 +2317,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
     // In Agent mode a running session shows the disk of the Agents panel.
     let running_glyph = match app.mode {
         Mode::File => "▶",
-        Mode::Agent | Mode::Queue => AGENT_RUNNING_GLYPH,
+        Mode::Agent => AGENT_RUNNING_GLYPH,
     };
     let entry_count: usize = app.groups.iter().map(|g| g.entry_indices.len()).sum();
     // The title names the kind filter, because the count means something else
@@ -3918,28 +3345,6 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                 ]
             };
             match (app.mode, app.active_panel) {
-                (Mode::Queue, Panel::Agents) => {
-                    for (k, label) in [
-                        ("1-3", "rank"),
-                        ("enter", "go to session"),
-                        ("x", "resolve"),
-                        ("d", "hide"),
-                        ("D", "hide resolved"),
-                        ("s", "order"),
-                        ("R", "review 24h"),
-                    ] {
-                        spans.extend(key(k, label));
-                    }
-                }
-                (Mode::Queue, Panel::Diff) => {
-                    for (k, label) in [
-                        ("enter", "copy follow-up and go"),
-                        ("space", "toggle TODO"),
-                        ("R", "review 24h"),
-                    ] {
-                        spans.extend(key(k, label));
-                    }
-                }
                 (_, Panel::History) => {
                     spans.push(Span::styled("/", Style::default().fg(Color::White)));
                     spans.push(Span::styled(":path  ", Style::default().fg(Color::DarkGray)));
@@ -3980,9 +3385,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                     spans.push(Span::styled(":find  ", Style::default().fg(Color::DarkGray)));
                 }
             }
-            if app.mode != Mode::Queue {
-                spans.extend(key("Q", "queue"));
-            }
+            spans.extend(key("Q", "triage web UI"));
             spans.extend([
                 Span::styled("m", Style::default().fg(Color::White)),
                 Span::styled(

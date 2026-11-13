@@ -857,6 +857,10 @@ pub enum Event {
     Running { sessions: Vec<RunningSession> },
     /// The triage runner changed its state.
     Triage(TriageStatus),
+    /// The triage data changed. Fetch `GET /v1/triage/state` again.
+    TriageData { version: u64 },
+    /// A message of a chat with the triage agent changed.
+    TriageChat { message: triage::ChatMessage },
 }
 
 // ── Blame ────────────────────────────────────────────────────────────────────

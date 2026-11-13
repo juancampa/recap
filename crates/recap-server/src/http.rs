@@ -9,6 +9,7 @@
 //! line instead, which `curl -N | jq` reads directly. Both formats send a
 //! keep-alive every 15 seconds: an SSE comment, or an empty line.
 
+use crate::http_triage::WebDir;
 use crate::server::Server;
 use axum::body::Body;
 use axum::body::HttpBody;
@@ -16,7 +17,7 @@ use axum::extract::{Path as UrlPath, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use recap_api::{
@@ -31,9 +32,6 @@ use tokio_stream::{Stream, StreamExt};
 
 /// The interval between two keep-alive messages on the event stream.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
-
-/// The minimal web client. See `examples/web/`.
-const WEB_EXAMPLE: &str = include_str!("../../../examples/web/index.html");
 
 /// An error response: the message as plain text.
 struct HttpError(StatusCode, String);
@@ -91,10 +89,10 @@ struct EventsQuery {
     format: Option<String>,
 }
 
-/// All routes of the API, and the web example at `/`.
-pub fn router(server: Server) -> Router {
+/// All routes of the API, and the web UI at `/`.
+pub fn router(server: Server, web_dir: WebDir) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(WEB_EXAMPLE) }))
+        .merge(crate::http_triage::router(server.clone(), web_dir))
         .route(routes::STATUS, get(status))
         .route(routes::PROJECTS, get(projects))
         .route(routes::FILES, get(files))
@@ -350,7 +348,7 @@ async fn events(State(s): State<Server>, Query(q): Query<EventsQuery>) -> Respon
 
 /// Serve the API on 127.0.0.1:`port` until the process gets SIGINT or
 /// SIGTERM. The function builds its own tokio runtime and blocks.
-pub fn run(server: Server, port: u16) -> anyhow::Result<()> {
+pub fn run(server: Server, port: u16, web_dir: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -360,7 +358,7 @@ pub fn run(server: Server, port: u16) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("cannot listen on 127.0.0.1:{port}: {e}"))?;
         log::info!("serving on http://127.0.0.1:{port}");
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let serve = axum::serve(listener, router(server)).with_graceful_shutdown(async move {
+        let serve = axum::serve(listener, router(server, WebDir(web_dir))).with_graceful_shutdown(async move {
             shutdown().await;
             let _ = stop_tx.send(true);
         });
@@ -421,7 +419,7 @@ mod tests {
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 tx.send(listener.local_addr().unwrap().port()).unwrap();
-                axum::serve(listener, router(server)).await.unwrap();
+                axum::serve(listener, router(server, WebDir(None))).await.unwrap();
             });
         });
         Client::new(recap_client::local_url(rx.recv().unwrap()))

@@ -1,9 +1,10 @@
 //! The triage runner. It starts a triage agent when a Claude Code session
 //! stops its turn.
 //!
-//! The runner keeps no triage data. The triage agent keeps all its data as
-//! text files in the triage directory (see `triage_prompt.md`). The runner
-//! only detects the stops and starts the runs of `claude -p`.
+//! The triage agent keeps its data in the triage store, through the HTTP
+//! API, and its notes and check scripts as files in the triage directory
+//! (see `triage_prompt.md`). The runner detects the stops and starts the
+//! runs of `claude -p`.
 //!
 //! A stop is a change of the status of a running session from `busy` to
 //! `idle`, or a change to `waiting`. The manager thread compares two scans
@@ -16,11 +17,12 @@
 //! time if no stop starts one first.
 //!
 //! A review run reads all the agents of the last 24 hours. The runner starts
-//! one when the triage directory has no agent file, and when a client asks
+//! one when the triage store has no session note, and when a client asks
 //! for one (`POST /v1/triage/review`).
 
 use crate::checks::{Checker, Notice};
 use crate::session::RunningSessions;
+use crate::triage_store::TriageStore;
 use chrono::{DateTime, Local};
 use recap_api::{RunningSession, TriageRun, TriageStatus};
 use std::collections::BTreeSet;
@@ -48,13 +50,17 @@ const MAX_REVIEW_RUN: Duration = Duration::from_secs(40 * 60);
 /// The settings of the triage runner.
 #[derive(Debug, Clone)]
 pub struct TriageConfig {
-    /// The directory of the text files of the triage agent.
+    /// The directory of the notes and the check scripts of the triage
+    /// agent. The runs of the agent have it as their cwd.
     pub dir: PathBuf,
     /// The `claude` binary.
     pub claude: PathBuf,
     /// The port of this server. The triage agent reads the sessions through
     /// the API on this port.
     pub port: u16,
+    /// True when the runner starts no triage run. The store, the checks
+    /// and the chat work as usual.
+    pub paused: bool,
 }
 
 /// One stop of a Claude Code session.
@@ -143,6 +149,7 @@ pub struct Triage {
     last: Option<TriageRun>,
     /// The time that the `next-run` file gave at the end of the last run.
     next_run: Option<SystemTime>,
+    store: Arc<TriageStore>,
     /// The runner of the item checks.
     checker: Checker,
     /// The check notices that wait for the next run. An urgent notice
@@ -152,21 +159,22 @@ pub struct Triage {
 
 impl Triage {
     /// A runner for `config`. It makes the triage directory if it does not
-    /// exist. A directory without agent files gets a review run.
+    /// exist. A store without session notes gets a review run.
     pub fn new(config: TriageConfig) -> anyhow::Result<Triage> {
-        let agents = config.dir.join("agents");
-        std::fs::create_dir_all(&agents)?;
+        std::fs::create_dir_all(config.dir.join(recap_api::triage::CHECKS_DIR))?;
         let dir = config.dir.canonicalize()?;
         let next_run = read_next_run(&dir);
-        let review = !std::fs::read_dir(&agents)?
-            .filter_map(Result::ok)
-            .any(|e| e.path().extension().is_some_and(|x| x == "md"));
+        let store = Arc::new(TriageStore::open(&dir)?);
+        store.end_open_messages()?;
+        let review = store.sessions().is_empty();
         let checker = Checker::new(
             dir.clone(),
+            Arc::clone(&store),
             child_path(),
             format!("http://127.0.0.1:{}", config.port),
         );
         Ok(Triage {
+            store,
             checker,
             notices: Vec::new(),
             config: TriageConfig { dir, ..config },
@@ -176,6 +184,16 @@ impl Triage {
             last: None,
             next_run,
         })
+    }
+
+    /// The triage store of the runner.
+    pub fn store(&self) -> Arc<TriageStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The settings of the runner, with the absolute triage directory.
+    pub fn config(&self) -> &TriageConfig {
+        &self.config
     }
 
     pub fn status(&self) -> TriageStatus {
@@ -284,6 +302,13 @@ impl Triage {
         if self.pending.is_empty() && !scheduled && !self.review && !urgent {
             return changed;
         }
+        if self.config.paused {
+            self.pending.clear();
+            self.notices.clear();
+            self.review = false;
+            self.next_run = None;
+            return changed;
+        }
         let stops = std::mem::take(&mut self.pending);
         let notices = std::mem::take(&mut self.notices);
         let review = std::mem::take(&mut self.review);
@@ -325,32 +350,9 @@ impl Triage {
     }
 
     fn start(&self, prompt: &str, repo_dirs: &BTreeSet<PathBuf>, info: TriageRun) -> anyhow::Result<Run> {
-        let mut child = Command::new(&self.config.claude)
-            .current_dir(&self.config.dir)
-            .args([
-                "-p",
-                "--model",
-                "opus",
-                "--append-system-prompt",
-                INSTRUCTIONS,
-            ])
-            // The sandbox of Claude Code refuses the connections to the
-            // recap server. The allowed tools limit the run instead.
-            .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])
-            // The TUI finds the transcript of the run by this id.
+        let mut child = agent_command(&self.config, repo_dirs)
+            // The clients find the transcript of the run by this id.
             .args(["--session-id", &info.session_id])
-            // One JSON event for each message and tool call, so the runner
-            // can show the newest action. `-p` needs `--verbose` for it.
-            .args(["--output-format", "stream-json", "--verbose"])
-            // Only the check runner writes the results.
-            .args(["--disallowedTools", "Edit(./results.json)"])
-            .arg("--allowedTools")
-            .arg(allowed_tools(self.config.port, repo_dirs))
-            .env("PATH", child_path())
-            .env(
-                "RECAP_URL",
-                format!("http://127.0.0.1:{}", self.config.port),
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -392,6 +394,29 @@ impl Triage {
     }
 }
 
+/// The `claude -p` command of the triage agent, for a run and for a chat
+/// reply. The caller adds the session option, and writes the prompt to
+/// stdin: `--allowedTools` takes all the arguments that follow it, so the
+/// prompt cannot be an argument.
+pub(crate) fn agent_command(config: &TriageConfig, repo_dirs: &BTreeSet<PathBuf>) -> Command {
+    let mut command = Command::new(&config.claude);
+    command
+        .current_dir(&config.dir)
+        .args(["-p", "--model", "opus", "--append-system-prompt", INSTRUCTIONS])
+        // The sandbox of Claude Code refuses the connections to the recap
+        // server. The allowed tools limit the run instead.
+        .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])
+        // One JSON event for each message and tool call, so the server can
+        // show the newest action. `-p` needs `--verbose` for it.
+        .args(["--output-format", "stream-json", "--verbose"])
+        // The `=` form keeps the options that the caller adds out of the
+        // list of tools.
+        .arg(format!("--allowedTools={}", allowed_tools(config.port, repo_dirs)))
+        .env("PATH", child_path())
+        .env("RECAP_URL", format!("http://127.0.0.1:{}", config.port));
+    command
+}
+
 fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
 }
@@ -416,7 +441,7 @@ fn repo_dirs(
 
 /// The actions in one line of `--output-format stream-json`, each on one
 /// line: the tool calls and the texts of the agent, and the final result.
-fn stream_actions(line: &str) -> Vec<String> {
+pub(crate) fn stream_actions(line: &str) -> Vec<String> {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
     };
@@ -428,15 +453,7 @@ fn stream_actions(line: &str) -> Vec<String> {
             .flatten()
             .filter_map(|part| match part["type"].as_str() {
                 Some("text") => part["text"].as_str().map(one_line),
-                Some("tool_use") => {
-                    let input = &part["input"];
-                    let detail = ["description", "file_path", "pattern", "command"]
-                        .iter()
-                        .find_map(|k| input[k].as_str())
-                        .map(one_line)
-                        .unwrap_or_default();
-                    Some(format!("{} {detail}", part["name"].as_str().unwrap_or("tool")))
-                }
+                Some("tool_use") => tool_action(part),
                 _ => None,
             })
             .filter(|s| !s.trim().is_empty())
@@ -449,8 +466,20 @@ fn stream_actions(line: &str) -> Vec<String> {
     }
 }
 
+/// One `tool_use` part of an assistant message on one line: the name of
+/// the tool and what it does.
+pub(crate) fn tool_action(part: &serde_json::Value) -> Option<String> {
+    let input = &part["input"];
+    let detail = ["description", "file_path", "pattern", "command"]
+        .iter()
+        .find_map(|k| input[k].as_str())
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    Some(format!("{} {detail}", part["name"].as_str().unwrap_or("tool")))
+}
+
 /// A random version 4 UUID, for the session id of a run.
-fn new_session_id() -> std::io::Result<String> {
+pub(crate) fn new_session_id() -> std::io::Result<String> {
     use std::io::Read;
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
@@ -541,7 +570,7 @@ fn run_prompt(
         );
     }
     if !notices.is_empty() {
-        let _ = writeln!(s, "Reason: the check runner reports these changes (see results.json).");
+        let _ = writeln!(s, "Reason: the check runner reports these changes.");
         for n in notices {
             let _ = writeln!(s, "- {}{}", n.text, if n.urgent { " [urgent]" } else { "" });
         }
@@ -704,6 +733,7 @@ mod tests {
             dir: dir.clone(),
             claude: PathBuf::from("/nonexistent/claude"),
             port: 1,
+            paused: false,
         })
         .unwrap();
         let stop = |cwd: &Path| Stop {
@@ -719,20 +749,26 @@ mod tests {
         triage.add(vec![stop(Path::new("/elsewhere"))]);
         assert_eq!(triage.status().pending, 1);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::triage_store::db_path(&dir));
     }
 
     #[test]
-    fn a_directory_without_agent_files_gets_a_review() {
+    fn a_store_without_session_notes_gets_a_review() {
         let dir = std::env::temp_dir().join(format!("recap-triage-review-{}", std::process::id()));
         let config = TriageConfig {
             dir: dir.clone(),
             claude: PathBuf::from("/nonexistent/claude"),
             port: 1,
+            paused: false,
         };
-        assert!(Triage::new(config.clone()).unwrap().status().review);
-        std::fs::write(dir.join("agents/a.md"), "").unwrap();
+        let first = Triage::new(config.clone()).unwrap();
+        assert!(first.status().review);
+        let batch = serde_json::from_str(r#"{"ops":[{"op":"session","chain":"a","set":{"turn":1}}]}"#).unwrap();
+        first.store().apply(recap_api::triage::Actor::Agent, &batch);
+        drop(first);
         assert!(!Triage::new(config).unwrap().status().review);
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(crate::triage_store::db_path(&dir));
     }
 
     #[test]

@@ -130,6 +130,11 @@ struct Inner {
     /// The last state of the triage runner, for `GET /v1/status`. The
     /// manager thread owns the runner.
     triage: RwLock<Option<TriageStatus>>,
+    /// The triage store and settings, for the API calls. Empty when the
+    /// server runs without a triage directory.
+    triage_handle: std::sync::OnceLock<Arc<crate::triage_api::TriageHandle>>,
+    /// The secret of the routes that only the web UI of the user can call.
+    ui_token: String,
     loading: AtomicBool,
     events: broadcast::Sender<Event>,
     files: ListCache<FileInfo>,
@@ -180,6 +185,8 @@ impl Server {
                 embed: Mutex::new(Embedder::default()),
                 running: RwLock::new(RunningSessions::default()),
                 triage: RwLock::new(None),
+                triage_handle: std::sync::OnceLock::new(),
+                ui_token: crate::triage::new_session_id().unwrap_or_default().replace('-', ""),
                 // A server with a manager thread starts with a load. Until
                 // the first load starts, the store is empty but not complete.
                 loading: AtomicBool::new(commands.is_some()),
@@ -219,6 +226,8 @@ impl Server {
         if let Some(t) = &triage {
             log::info!("triage: the runner uses {}", t.status().dir.display());
             *write(&server.inner.triage) = Some(t.status());
+            let handle = crate::triage_api::TriageHandle::new(t.store(), t.config().clone());
+            let _ = server.inner.triage_handle.set(Arc::new(handle));
         }
         let manager = server.clone();
         std::thread::Builder::new()
@@ -226,6 +235,41 @@ impl Server {
             .spawn(move || manager.manage(Sources::detect(), rx, poll, triage))
             .expect("cannot start the manager thread");
         server
+    }
+
+    /// The triage store and settings. None when the server runs without a
+    /// triage directory.
+    pub(crate) fn triage_handle(&self) -> Option<&Arc<crate::triage_api::TriageHandle>> {
+        self.inner.triage_handle.get()
+    }
+
+    /// The secret that a request to a `/ui/` route must send.
+    pub fn ui_token(&self) -> &str {
+        &self.inner.ui_token
+    }
+
+    /// The agents by chain id, and the running session of each chain. For a
+    /// chain with more than one running session, a session that waits comes
+    /// before a busy session, and a busy session before an idle session.
+    pub(crate) fn chain_data(&self) -> (HashMap<String, Agent>, HashMap<String, RunningSession>) {
+        let store = read(&self.inner.store);
+        let agents = store.agents(None).into_iter().map(|a| (a.chain_id.clone(), a)).collect();
+        let order = |r: &RunningSession| match r.status.as_deref() {
+            Some("waiting") => 0,
+            Some("busy") => 1,
+            _ => 2,
+        };
+        let mut running: HashMap<String, RunningSession> = HashMap::new();
+        for session in read(&self.inner.running).list() {
+            let chain = store.chain_id(&session.session_id).to_string();
+            match running.get(&chain) {
+                Some(old) if order(old) <= order(&session) => {}
+                _ => {
+                    running.insert(chain, session);
+                }
+            }
+        }
+        (agents, running)
     }
 
     /// A receiver of the change events.
@@ -260,6 +304,8 @@ impl Server {
         let mut indexed_version = 0u64;
         let mut stats = LoadStats::default();
         let mut first_load = true;
+        // The version of the triage data that the clients know.
+        let mut triage_version = self.triage_handle().map(|h| h.store.version());
         loop {
             match commands.recv_timeout(TICK) {
                 Ok(Command::Reload) => next_load = Instant::now(),
@@ -312,6 +358,13 @@ impl Server {
                     t.add(stops);
                 }
             }
+            if let Some(handle) = self.triage_handle() {
+                let version = handle.store.version();
+                if triage_version != Some(version) {
+                    triage_version = Some(version);
+                    self.send(Event::TriageData { version });
+                }
+            }
             // A run reads the agents through the API, so it waits for the
             // first load.
             if let Some(t) = triage.as_mut().filter(|_| !first_load) {
@@ -334,7 +387,7 @@ impl Server {
     /// because the manager starts one load every poll interval.
     /// The project directories of the agents with activity in the last 24
     /// hours.
-    fn recent_project_dirs(&self) -> Vec<PathBuf> {
+    pub(crate) fn recent_project_dirs(&self) -> Vec<PathBuf> {
         let since = chrono::Local::now() - chrono::Duration::hours(24);
         read(&self.inner.store)
             .agents(None)

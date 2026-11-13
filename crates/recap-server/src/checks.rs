@@ -1,13 +1,13 @@
 //! The check runner of the triage items.
 //!
-//! The triage agent writes the items in `items.json`, and the check scripts
-//! in the `checks` directory (see `triage_prompt.md`). The runner runs the
-//! check of each open item at an interval that depends on the impact of the
-//! item, and writes the outcome to `results.json`. Only the runner writes
-//! that file.
+//! The triage agent writes the items to the triage store, and the check
+//! scripts in the `checks` directory (see `triage_prompt.md`). The runner
+//! runs the check of each open item at an interval that depends on the
+//! impact of the item, and writes the outcome to the store. Only the runner
+//! writes the check results.
 //!
-//! The runner runs a script only after the user approves it with
-//! `recap triage approve`. The approval copies the script to the approved
+//! The runner runs a script only after the user approves it, in the web UI
+//! or with `recap triage approve`. The approval copies the script to the approved
 //! directory, next to the triage directory and outside the files that the
 //! triage agent can change. The runner runs the approved copy, so a change
 //! of the script after the approval has no effect until the user approves
@@ -20,15 +20,14 @@
 //! the triage run can fail or schedule nothing.
 
 use chrono::{DateTime, Local, TimeDelta};
-use recap_api::triage::{
-    CHECKS_DIR, CheckRun, CheckSpec, ITEMS_FILE, Impact, Item, ItemResults, Items, Outcome,
-    RESULTS_FILE, Results,
-};
+use crate::triage_store::TriageStore;
+use recap_api::triage::{CHECKS_DIR, CheckRun, CheckSpec, Impact, Item, ItemResults, Outcome, Results};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -154,10 +153,12 @@ struct Job {
 /// The check runner. The triage runner owns it.
 pub struct Checker {
     dir: PathBuf,
+    store: Arc<TriageStore>,
     /// The PATH of the scripts.
     path_env: String,
     /// The recap server URL, for the scripts.
     recap_url: String,
+    /// The check results of the store, at the last read.
     results: Results,
     batch: Option<JoinHandle<Vec<(Job, CheckRun)>>>,
     next_eval: Instant,
@@ -168,13 +169,11 @@ pub struct Checker {
 }
 
 impl Checker {
-    pub fn new(dir: PathBuf, path_env: String, recap_url: String) -> Checker {
-        let results = std::fs::read(dir.join(RESULTS_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+    pub fn new(dir: PathBuf, store: Arc<TriageStore>, path_env: String, recap_url: String) -> Checker {
+        let results = store.results();
         Checker {
             dir,
+            store,
             path_env,
             recap_url,
             results,
@@ -200,9 +199,10 @@ impl Checker {
                 Ok(done) => {
                     let items = self.read_items();
                     for (job, run) in done {
+                        let id = job.item.clone();
                         notices.extend(self.record(&items, job, run));
+                        self.save(&id);
                     }
-                    self.save();
                 }
                 Err(_) => log::error!("checks: the batch thread panicked"),
             }
@@ -223,8 +223,8 @@ impl Checker {
             .collect();
         match new.as_slice() {
             [] => {}
-            [name] => notify("Triage check", &format!("Script {name} waits for recap triage approve")),
-            names => notify("Triage checks", &format!("{} scripts wait for recap triage approve", names.len())),
+            [name] => notify("Triage check", &format!("Script {name} waits for your approval")),
+            names => notify("Triage checks", &format!("{} scripts wait for your approval", names.len())),
         }
         if unapproved != self.unapproved {
             self.unapproved = unapproved;
@@ -232,11 +232,7 @@ impl Checker {
             notices.push(Notice { item: String::new(), text: String::new(), urgent: false });
         }
         let now = Local::now();
-        let (alerts, changed) = self.alerts(&items, now);
-        notices.extend(alerts);
-        if changed {
-            self.save();
-        }
+        notices.extend(self.alerts(&items, now));
         let jobs = self.due_jobs(&items, now);
         if !jobs.is_empty() {
             let dir = self.dir.clone();
@@ -256,27 +252,19 @@ impl Checker {
         notices
     }
 
-    fn read_items(&self) -> Vec<Item> {
-        let path = self.dir.join(ITEMS_FILE);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Vec::new();
-        };
-        match serde_json::from_slice::<Items>(&bytes) {
-            Ok(items) => items.items,
-            Err(e) => {
-                log::warn!("checks: cannot read {}: {e}", path.display());
-                Vec::new()
-            }
-        }
+    /// Read the items and the check results of the store.
+    fn read_items(&mut self) -> Vec<Item> {
+        self.results = self.store.results();
+        self.store.items()
     }
 
-    fn save(&self) {
-        let path = self.dir.join(RESULTS_FILE);
-        let result = serde_json::to_vec_pretty(&self.results)
-            .map_err(std::io::Error::other)
-            .and_then(|b| write_atomic(&path, &b));
-        if let Err(e) = result {
-            log::error!("checks: cannot write {}: {e}", path.display());
+    /// Write the check results of the item `id` to the store.
+    fn save(&self, id: &str) {
+        let Some(results) = self.results.get(id) else {
+            return;
+        };
+        if let Err(e) = self.store.put_results(id, results) {
+            log::error!("checks: cannot write the results of {id}: {e}");
         }
     }
 
@@ -400,11 +388,10 @@ impl Checker {
         notices
     }
 
-    /// The `due` alerts of the items that are not done. It returns the
-    /// notices, and true when it added an alert to the results.
-    fn alerts(&mut self, items: &[Item], now: DateTime<Local>) -> (Vec<Notice>, bool) {
+    /// The `due` alerts of the items that are not done. It records each
+    /// alert in the results, so an alert comes one time.
+    fn alerts(&mut self, items: &[Item], now: DateTime<Local>) -> Vec<Notice> {
         let mut notices = Vec::new();
-        let mut changed = false;
         for item in items {
             let (Some(due), Some(warning)) = (item.due, item.impact.due_warning_secs()) else {
                 continue;
@@ -426,7 +413,7 @@ impl Checker {
                 continue;
             }
             alerts.insert(key, now);
-            changed = true;
+            self.save(&item.id);
             let when = due.format("%Y-%m-%d %H:%M");
             let text = if kind == "due-passed" {
                 format!("item {} ({:?}) is not done, and its due time {when} passed", item.id, item.impact)
@@ -438,7 +425,7 @@ impl Checker {
             }
             notices.push(Notice { item: item.id.clone(), text, urgent: true });
         }
-        (notices, changed)
+        notices
     }
 }
 
@@ -469,7 +456,7 @@ fn run_job(dir: &Path, approved: &Path, env: &[(String, String)], job: &Job) -> 
         return result(
             Outcome::Unapproved,
             None,
-            format!("the user must approve {CHECKS_DIR}/{} (recap triage approve)", job.spec.script),
+            format!("the user must approve {CHECKS_DIR}/{}", job.spec.script),
         );
     }
     let script = approved.join(&job.spec.script);
@@ -611,6 +598,7 @@ mod tests {
         Item {
             id: id.to_string(),
             chain: None,
+            topic: None,
             owner: Owner::Agent,
             text: "Fix it".to_string(),
             impact,
@@ -621,12 +609,29 @@ mod tests {
             before: None,
             status: Status::Open,
             note: String::new(),
+            prompt: String::new(),
+            refs: Vec::new(),
             created: None,
         }
     }
 
-    fn write_items(dir: &Path, items: Vec<Item>) {
-        std::fs::write(dir.join(ITEMS_FILE), serde_json::to_vec(&Items { items }).unwrap()).unwrap();
+    /// A checker for `dir` with a store that holds `items`.
+    fn checker(dir: &Path, items: Vec<Item>) -> Checker {
+        let store = Arc::new(TriageStore::in_memory().unwrap());
+        let ops = items
+            .iter()
+            .map(|item| {
+                let mut set = serde_json::to_value(item).unwrap();
+                let set = set.as_object_mut().unwrap();
+                set.remove("id");
+                // The store asks for `why` on a high item.
+                set.insert("why".to_string(), "It breaks.".into());
+                recap_api::triage::Op::Item { id: item.id.clone(), set: set.clone() }
+            })
+            .collect();
+        let result = store.apply(recap_api::triage::Actor::Agent, &recap_api::triage::Batch { ops });
+        assert!(result.errors.iter().all(Option::is_none), "{:?}", result.errors);
+        Checker::new(dir.to_path_buf(), store, std::env::var("PATH").unwrap(), String::new())
     }
 
     /// Tick until the batch ends and the results contain `id`.
@@ -635,7 +640,8 @@ mod tests {
         for _ in 0..200 {
             checker.next_eval = Instant::now();
             all.extend(checker.tick());
-            if checker.batch.is_none() && !checker.due_jobs(&checker.read_items(), Local::now()).iter().any(|j| j.sha256.is_some()) {
+            let items = checker.read_items();
+            if checker.batch.is_none() && !checker.due_jobs(&items, Local::now()).iter().any(|j| j.sha256.is_some()) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -647,8 +653,7 @@ mod tests {
     fn the_runner_runs_only_the_approved_version() {
         let dir = temp_dir("approve");
         std::fs::write(dir.join("checks/ok"), "#!/bin/sh\necho \"arg $1\"\nexit 0\n").unwrap();
-        write_items(&dir, vec![item("a", "ok", Impact::High)]);
-        let mut checker = Checker::new(dir.clone(), std::env::var("PATH").unwrap(), String::new());
+        let mut checker = checker(&dir, vec![item("a", "ok", Impact::High)]);
         let notices = settle(&mut checker);
         assert_eq!(checker.results["a"].check.as_ref().unwrap().outcome, Outcome::Unapproved);
         assert!(notices.iter().all(|n| n.item.is_empty()), "{notices:?}");
@@ -665,7 +670,7 @@ mod tests {
         // A change after the approval stops the runs of the script.
         std::fs::write(dir.join("checks/ok"), "#!/bin/sh\nexit 1\n").unwrap();
         assert!(approved_sha(&dir, "ok").is_none());
-        let saved: Results = serde_json::from_slice(&std::fs::read(dir.join(RESULTS_FILE)).unwrap()).unwrap();
+        let saved = checker.store.results();
         assert_eq!(saved["a"].check.as_ref().unwrap().outcome, Outcome::Done);
     }
 
@@ -681,8 +686,7 @@ mod tests {
             event: "prod deploy".to_string(),
             check: Some(CheckSpec { script: "yes".to_string(), args: Vec::new() }),
         });
-        write_items(&dir, vec![it]);
-        let mut checker = Checker::new(dir.clone(), std::env::var("PATH").unwrap(), String::new());
+        let mut checker = checker(&dir, vec![it]);
         let notices = settle(&mut checker);
         assert!(notices.iter().any(|n| n.urgent && n.text.contains("prod deploy")), "{notices:?}");
         // The first `not-done` of the item check gives no notice.
@@ -695,15 +699,16 @@ mod tests {
         let mut it = item("c", "none", Impact::Critical);
         it.check = None;
         it.due = Some(Local::now() + TimeDelta::hours(1));
-        write_items(&dir, vec![it]);
-        let mut checker = Checker::new(dir.clone(), String::new(), String::new());
+        let mut checker = checker(&dir, vec![it]);
         let items = checker.read_items();
-        let (first, changed) = checker.alerts(&items, Local::now());
+        let first = checker.alerts(&items, Local::now());
         assert_eq!(first.len(), 1);
-        assert!(changed && first[0].urgent);
-        let (second, _) = checker.alerts(&items, Local::now());
+        assert!(first[0].urgent);
+        // The store holds the alert, so a new read does not repeat it.
+        let items = checker.read_items();
+        let second = checker.alerts(&items, Local::now());
         assert!(second.is_empty());
-        let (passed, _) = checker.alerts(&items, Local::now() + TimeDelta::hours(2));
+        let passed = checker.alerts(&items, Local::now() + TimeDelta::hours(2));
         assert_eq!(passed.len(), 1);
         assert!(passed[0].text.contains("passed"));
     }

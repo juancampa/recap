@@ -7,7 +7,6 @@ mod search_history;
 mod service;
 mod settings;
 mod triage_cmd;
-mod triage_files;
 mod ui;
 
 use anyhow::Result;
@@ -116,118 +115,45 @@ fn open_entry(
     Ok(())
 }
 
-/// Absolute path to the `claude` binary. The `-e` command Ghostty runs does
-/// not go through a login shell, so `~/.local/bin` may not be on PATH; prefer
-/// the well-known install location and fall back to the bare name.
-fn claude_bin() -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        let p = format!("{home}/.local/bin/claude");
-        if Path::new(&p).exists() {
-            return p;
-        }
-    }
-    "claude".to_string()
-}
-
-/// Path to the `findterm` window-focus helper (`~/bin/findterm`).
-fn findterm_bin() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(home).join("bin/findterm");
-    p.exists().then_some(p)
-}
-
-/// `o` action: jump to the Claude Code session an entry came from. If the
-/// session is still running, focus its terminal window via `findterm --pid`.
-/// Otherwise open a fresh Ghostty window resuming it (`claude --resume <id>`)
-/// in the session's working directory (see [`open_resume_window`]). No-op for
-/// entries without a session id
-/// (Cursor / Neovim) — there is no session to resume.
+/// The `o` action: show the Claude Code session of `entry`. When the
+/// session runs, the function focuses its terminal window. If not, it opens
+/// a new Ghostty window that resumes the session (see
+/// [`recap_server::focus::focus_or_resume`]). The function does nothing for
+/// an entry without a Claude Code session.
 fn focus_or_resume_session(entry: &Entry, running: &HashMap<String, RunningSession>) {
-    // Only Claude Code sessions are resumable via `claude --resume`. Cursor
-    // entries also carry a session id (their composerId) for grouping, but it
-    // is not a Claude session — never feed it to the resume path.
+    // A Cursor entry also has a session id (its composerId), but
+    // `claude --resume` cannot resume it.
     if entry.source != EditSource::ClaudeCode {
         return;
     }
-    let Some(session_id) = entry.session_id.clone() else {
+    let Some(session_id) = entry.session_id.as_deref() else {
         return;
     };
-
     // The server scans the running sessions every 2 seconds, so this list is
     // at most 2 seconds old.
-    if let Some(rs) = running.get(&session_id) {
-        if let Some(findterm) = findterm_bin() {
-            let _ = Command::new(findterm)
-                .arg("--pid")
-                .arg(rs.pid.to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-        }
-        return;
-    }
-
-    // Not running — resume in a new Ghostty window. Preferred working
-    // directory: the session's own recorded cwd (most accurate), then the
-    // entry's innermost project root, then the file's parent. Filter empties
-    // (prompt entries have a synthetic, parent-less `file_path`).
+    let pid = running.get(session_id).map(|rs| rs.pid);
+    // The working directory for a resume: the cwd of the session, then the
+    // innermost project root of the entry, then the parent of the file. A
+    // prompt entry has a `file_path` without a parent, so the filter removes
+    // an empty path.
     let cwd = entry
         .session_cwd
         .clone()
         .or_else(|| entry.project_root().map(Path::to_path_buf))
         .or_else(|| entry.file_path.parent().map(Path::to_path_buf))
         .filter(|dir| !dir.as_os_str().is_empty());
-
-    open_resume_window(&session_id, cwd.as_deref());
+    recap_server::focus::focus_or_resume(session_id, pid, cwd.as_deref());
 }
 
-/// Open a fresh Ghostty window running `claude --resume <id>` in `cwd`.
-///
-/// Driven through Ghostty's AppleScript interface rather than
-/// `open -na Ghostty.app --args -e …`. The `open` route is unusable here:
-/// macOS ignores `--args` for an already-running app, so it requires `-n` (a
-/// second app *instance*) to deliver the command, which then restores the
-/// user's saved windows (recap's included) as extra tabs and pops a
-/// per-command "Allow Ghostty to execute" security prompt. `new window with
-/// configuration` instead opens a single window in the *existing* instance,
-/// honors an explicit working directory, and is a trusted automation path (no
-/// prompt). If Ghostty isn't running, the `tell` block launches it.
-fn open_resume_window(session_id: &str, cwd: Option<&Path>) {
-    // Build `claude --resume <id>`. Ghostty's `command` runs via `/bin/sh -c`,
-    // so quote the binary path and the (UUID) session id defensively.
-    let command = format!("{} --resume {}", shell_quote(&claude_bin()), shell_quote(session_id));
-    let workdir = cwd.map(|d| d.to_string_lossy().into_owned());
-
-    let mut script = String::from("tell application \"Ghostty\"\n");
-    script.push_str("  set cfg to new surface configuration\n");
-    script.push_str(&format!("  set command of cfg to {}\n", applescript_quote(&command)));
-    if let Some(dir) = &workdir {
-        script.push_str(&format!(
-            "  set initial working directory of cfg to {}\n",
-            applescript_quote(dir)
-        ));
-    }
-    script.push_str("  new window with configuration cfg\n");
-    script.push_str("end tell\n");
-
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
+/// Open the triage web UI of the server at `server_url` in the default
+/// browser. The function does not wait for the `open` command.
+fn open_web_ui(server_url: &str) {
+    let _ = Command::new("open")
+        .arg(format!("{server_url}/"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-/// Wrap a value in single quotes for `/bin/sh`, escaping embedded quotes.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// Quote a string as an AppleScript string literal (escaping `\` and `"`).
-fn applescript_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
 /// Suspend the current process (Ctrl-Z behavior). Crossterm's raw mode
@@ -513,7 +439,8 @@ fn run_list_cli(
     Ok(())
 }
 
-/// `recap serve [--port <n>] [--test] [--poll <seconds>] [--triage-dir <dir>]`: run the server
+/// `recap serve [--port <n>] [--test] [--poll <seconds>] [--triage-dir <dir>] [--triage-paused]
+/// [--web-dir <dir>]`: run the server
 /// until SIGINT or SIGTERM. The prod server uses port 7717 and the prod
 /// cache. `--test` uses port 7718 and a fresh copy of the prod cache (see
 /// [`recap_server::cache::prepare_test_cache`]).
@@ -556,11 +483,12 @@ fn run_serve(args: &[String]) -> Result<()> {
     // it runs only when the user names a triage directory.
     let triage = value("--triage-dir").map(|dir| recap_server::triage::TriageConfig {
         dir: PathBuf::from(dir),
-        claude: PathBuf::from(claude_bin()),
+        claude: PathBuf::from(recap_server::focus::claude_bin()),
         port,
+        paused: args.iter().any(|a| a == "--triage-paused"),
     });
     let server = recap_server::Server::start(poll, triage);
-    recap_server::http::run(server, port)
+    recap_server::http::run(server, port, value("--web-dir").map(PathBuf::from))
 }
 
 /// The interval between two loads of the sources.
@@ -582,7 +510,7 @@ Usage:
 
 TUI options:
   -a, --absolute       Show absolute times instead of relative times.
-      --queue          Start in Queue mode: the agents that the triage agent tracks.
+      --queue          Open the triage web UI in the browser, then open the TUI.
       --index          Build the semantic search index, then stop.
       --query <text>   With --index, run a search and print the results.
                        You can give this option more than one time.
@@ -606,7 +534,11 @@ serve options:
       --poll <seconds> The interval between two loads of the sources. The default is 5.
       --triage-dir <dir>
                        Start a triage agent when a Claude Code session stops its turn.
-                       The triage agent keeps its text files in this directory.
+                       The triage agent keeps its notes and check scripts in this
+                       directory. The triage data is in <dir>.db.
+      --triage-paused  Start no triage run. The checks and the chat work as usual.
+      --web-dir <dir>  Read the files of the web UI from this directory at each
+                       request, and not from the binary.
 
 service commands:
   install              Copy this binary, write the agent file and start the server.
@@ -723,6 +655,12 @@ fn main() -> Result<()> {
         return run_list_cli(&client, list_limit, list_window, list_filter);
     }
 
+    // The web UI is on the server that the TUI uses.
+    let server_url = client.base().to_string();
+    if args.iter().any(|a| a == "--queue") {
+        open_web_ui(&server_url);
+    }
+
     let (tx, rx) = mpsc::channel();
     recap_client::watch(client.clone(), tx);
     let mut app = App::new(Arc::new(client));
@@ -730,24 +668,14 @@ fn main() -> Result<()> {
     app.apply_persisted(&persisted);
     // CLI flag forces absolute time on; otherwise honor the persisted toggle.
     app.absolute_time = absolute_time || persisted.absolute_time;
-    // The queue window starts in Queue mode. The panel heights are not
-    // known yet; the main loop scrolls the selection into view.
-    let queue = args.iter().any(|a| a == "--queue");
-    if queue {
-        app.enter_queue(0, 0);
-    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    // The Hammerspoon module finds the queue window by this title.
-    if queue {
-        execute!(stdout, crossterm::terminal::SetTitle(QUEUE_WINDOW_TITLE))?;
-    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut app, &rx);
+    let result = run(&mut terminal, &mut app, &rx, &server_url);
 
     app.persisted_state().save();
 
@@ -862,22 +790,9 @@ fn handle_mouse(
             } else if let Some(diff) = rects.diff
                 && rect_contains(diff, me.column, me.row)
             {
-                if app.mode == app::Mode::Queue {
-                    // The click uses the layout of the last frame, so it
-                    // runs before the focus changes.
-                    let hit = click_to_row(diff, me.column, me.row).and_then(|row| {
-                        let col = (me.column - diff.x).saturating_sub(1) as usize;
-                        ui::triage_click(app, diff, row, col)
-                    });
-                    app.active_panel = app::Panel::Diff;
-                    if let Some((item, on_box)) = hit {
-                        app.click_triage_item(item, on_box, visible_history);
-                    }
-                } else {
-                    app.active_panel = app::Panel::Diff;
-                    let (row, col) = click_to_cell(diff, me.column, me.row);
-                    app.diff_select_start(row, col);
-                }
+                app.active_panel = app::Panel::Diff;
+                let (row, col) = click_to_cell(diff, me.column, me.row);
+                app.diff_select_start(row, col);
             }
             // A click outside the Diff panel drops the selection it held.
             if app.active_panel != app::Panel::Diff {
@@ -885,9 +800,7 @@ fn handle_mouse(
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(diff) = rects.diff
-                && app.mode != app::Mode::Queue
-            {
+            if let Some(diff) = rects.diff {
                 let (row, col) = click_to_cell(diff, me.column, me.row);
                 app.diff_select_to(row, col);
             }
@@ -895,9 +808,7 @@ fn handle_mouse(
         MouseEventKind::Up(MouseButton::Left) => {
             // The drag ended. Put the selected text on the clipboard, so the
             // user needs no second key to copy it.
-            if let Some(diff) = rects.diff
-                && app.mode != app::Mode::Queue
-            {
+            if let Some(diff) = rects.diff {
                 let inner_width = (diff.width as usize).saturating_sub(2);
                 if let Some(text) = ui::diff_selection_text(app, inner_width, visible_diff) {
                     copy_to_clipboard(&text);
@@ -912,7 +823,6 @@ fn handle_mouse(
                     Some(app::Panel::Files) => app.file_down(visible_files),
                     Some(app::Panel::Agents) => app.agent_down(visible_agents),
                     Some(app::Panel::History) => app.history_down(visible_history),
-                    Some(app::Panel::Diff) if app.mode == app::Mode::Queue => app.triage_down(),
                     Some(app::Panel::Diff) => app.diff_down(),
                     None => {}
                 }
@@ -927,7 +837,6 @@ fn handle_mouse(
                     Some(app::Panel::Files) => app.file_up(visible_files),
                     Some(app::Panel::Agents) => app.agent_up(visible_agents),
                     Some(app::Panel::History) => app.history_up(visible_history),
-                    Some(app::Panel::Diff) if app.mode == app::Mode::Queue => app.triage_up(),
                     Some(app::Panel::Diff) => app.diff_up(),
                     None => {}
                 }
@@ -1026,65 +935,12 @@ fn select_history_row(app: &mut App, target: usize, visible: usize) {
     app.rebuild_display_after_external_mutation(visible);
 }
 
-/// The terminal title of the TUI with `--queue`.
-const QUEUE_WINDOW_TITLE: &str = "recap queue";
-
-/// The interval between two checks of the triage files.
-const TRIAGE_FILES_CHECK: Duration = Duration::from_secs(1);
-
-/// The keys of Queue mode. In Queue mode the Diff panel shows the notes of
-/// the triage agent (the Triage panel). It returns false for a key that the
-/// general key handler must take.
-fn handle_queue_key(
-    app: &mut App,
-    code: KeyCode,
-    ctrl: bool,
-    visible_history: usize,
-    visible_agents: usize,
-) -> bool {
-    if ctrl {
-        return false;
-    }
-    match (app.active_panel, code) {
-        (_, KeyCode::Char(c @ '1'..='3')) => {
-            app.select_rank(c as usize - '0' as usize, visible_history, visible_agents);
-        }
-        (_, KeyCode::Char('s')) => app.cycle_queue_order(visible_history, visible_agents),
-        (_, KeyCode::Char('R')) => app.request_triage_review(),
-        (app::Panel::Agents, KeyCode::Enter) => {
-            if let Some(entry) = app.selected_agent_entry().cloned() {
-                focus_or_resume_session(&entry, &app.running);
-            }
-        }
-        (app::Panel::Agents, KeyCode::Char('x')) => app.toggle_resolved(visible_history),
-        (app::Panel::Agents, KeyCode::Char('d')) => app.hide_selected(visible_history),
-        (app::Panel::Agents, KeyCode::Char('D')) => app.hide_resolved(visible_history),
-        (app::Panel::Diff, KeyCode::Char('j') | KeyCode::Down) => app.triage_down(),
-        (app::Panel::Diff, KeyCode::Char('k') | KeyCode::Up) => app.triage_up(),
-        (app::Panel::Diff, KeyCode::Char(' ')) => app.toggle_selected_item(visible_history),
-        (app::Panel::Diff, KeyCode::Enter) => {
-            // A follow-up goes to the clipboard, because a running session
-            // takes its input only from its own terminal.
-            if let Some(prompt) = app.selected_follow_up() {
-                copy_to_clipboard(&prompt);
-                if let Some(entry) = app.selected_agent_entry().cloned() {
-                    focus_or_resume_session(&entry, &app.running);
-                }
-            } else {
-                app.toggle_selected_item(visible_history);
-            }
-        }
-        _ => return false,
-    }
-    true
-}
-
 fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     messages: &mpsc::Receiver<recap_client::Message>,
+    server_url: &str,
 ) -> Result<()> {
-    let mut next_triage_check = std::time::Instant::now();
     loop {
         let size = terminal.size()?;
         let area = Rect {
@@ -1131,10 +987,6 @@ fn run(
                 recap_client::Message::Event(event) => app.on_event(event, visible_history),
                 recap_client::Message::Disconnected(error) => app.on_disconnect(error),
             }
-        }
-        if std::time::Instant::now() >= next_triage_check {
-            next_triage_check = std::time::Instant::now() + TRIAGE_FILES_CHECK;
-            app.refresh_triage_files(visible_history);
         }
         app.maybe_run_pending_search(visible_history);
         app.ensure_summaries_visible(visible_history);
@@ -1267,12 +1119,6 @@ fn run(
                         continue;
                     }
 
-                    if app.mode == app::Mode::Queue
-                        && handle_queue_key(app, key.code, ctrl, visible_history, visible_agents)
-                    {
-                        continue;
-                    }
-
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if ctrl => break,
@@ -1320,7 +1166,7 @@ fn run(
                             app.cycle_kind_filter(visible_history);
                         }
                         KeyCode::Char('m') => app.toggle_mode(visible_history, visible_agents),
-                        KeyCode::Char('Q') => app.enter_queue(visible_history, visible_agents),
+                        KeyCode::Char('Q') => open_web_ui(server_url),
                         KeyCode::Char('t') => app.toggle_time(),
                         KeyCode::Char('y') => {
                             // A mouse selection in the Diff panel wins over

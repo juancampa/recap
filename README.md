@@ -87,7 +87,7 @@ The TUI has five panels: Projects, Files, Agents, History and Diff.
 | `p` | Show all the entries, only the prompts, or only the changes (History panel). |
 | `<` / `>` | Show fewer or more lines of each prompt (History panel). |
 | `m` | Change the mode of the panels. |
-| `Q` | Go to Queue mode (see [The follow-up queue](#the-follow-up-queue)). |
+| `Q` | Open the triage web UI in the browser (see [Triage](#triage)). |
 | `t` | Show relative times or absolute times. |
 | `y` | Copy the entry, or the text that you selected with the mouse. |
 | `Y` | Copy the response of the agent. |
@@ -100,10 +100,10 @@ The TUI has five panels: Projects, Files, Agents, History and Diff.
 If the session of the entry runs, `o` focuses its terminal window.
 If the session does not run, `o` opens a new Ghostty window with `claude --resume <id>`.
 
-### The follow-up queue
+### Triage
 
-The follow-up queue shows the Claude Code sessions that wait for you.
-A triage agent (`claude -p --model opus`) keeps notes about each session in a directory of text files.
+A triage agent (`claude -p --model opus`) reads your Claude Code sessions and keeps a list of the work that you and the agents must still do.
+The triage web UI shows that list. Open it at `http://127.0.0.1:7717/`, with `recap --queue`, or with `Q` in the TUI.
 
 The server starts a triage run when a session stops its turn.
 A stop is a change of the session from `busy` to `idle`, or a change to `waiting`.
@@ -119,78 +119,95 @@ recap serve --triage-dir ~/.local/share/recap/triage
 ```
 
 A later `recap service install` keeps the triage directory. `recap service install --no-triage` removes it.
+`recap serve --triage-paused` serves the triage data and the web UI, but starts no triage run and no check.
 
-The triage directory contains these files:
+#### The triage data
+
+The server keeps the triage data in the SQLite file `<triage dir>.db`, next to the triage directory.
+The triage agent cannot write this file. It changes the data with `POST /v1/triage/apply`, and the server refuses the changes that only you can make.
+
+| Object | Content |
+|---|---|
+| Topic | The goal that one or more sessions work on, for example "Worker memory management". It has a title and a summary of its state. |
+| Session | The topic of the session, one sentence about what the session needs, and the last turn that the triage agent read. You can mute a session until its next turn. |
+| Item | One piece of work. See [Items and checks](#items-and-checks). |
+
+The triage directory contains the files that the triage agent writes:
 
 | File | Content |
 |---|---|
 | `memory.md` | The notes of the triage agent that apply to many runs. |
-| `top.md` | The chain ids of rank 1, 2 and 3, one on each line. |
 | `next-run` | The delay to the next scheduled run (`90s`, `30m`, `2h`, `1d`), and the reason. |
-| `agents/<chain-id>.md` | The follow-ups for one session. |
-| `items.json` | The work items of all sessions. The triage agent writes them, and you confirm them. |
 | `checks/<script>` | The check scripts that the triage agent writes. |
-| `results.json` | The result of the last run of each check. Only the server writes this file. |
 
-The server stores none of these data, except `results.json`.
-`crates/recap-server/src/triage_prompt.md` contains the instructions and the file formats of the triage agent.
+`crates/recap-server/src/triage_prompt.md` contains the instructions of the triage agent.
 
-### Items and checks
+When the server finds a triage directory of an earlier version (`items.json`, `agents/`), it imports the data into the database and moves the old files to `<triage dir>.legacy/`.
+
+#### Items and checks
 
 Each item has an owner (the agent or you), an impact (`critical`, `high`, `normal` or `low`), the reason for a critical or a high impact, and a done condition.
-It can also have a due time, and an event that the item must come before, such as the next prod deploy.
+It can also have a due time, an event that the item must come before (such as the next prod deploy), a prompt that you can send to the session, and references to the turns that the item came from.
 The triage agent writes a check script for each done condition that a script can test.
 The server runs the check of each open item: every 10 minutes for a critical item, 30 minutes for a high item, 2 hours for a normal item, and 6 hours for a low item.
 A check exits with 0 when the item is done, 1 when it is not done, and another code when it cannot decide.
-The Triage panel shows an item as verified (`[✓]`) only when its check exits with 0.
-An item that an agent says is done, but that no check confirms, shows as claimed (`[~]`).
+An item is verified only when its check exits with 0.
+An item that an agent says is done, but that no check confirms, is claimed.
+
+The server calculates the priority order of the open items. No ranking is stored.
+A late item comes first: its event occurred, or its due time passed.
+Then the order is the impact, then an item whose session waits for you now, then the due time, then the age.
 
 The server starts a triage run without a session stop in these cases:
 the check outcome of a critical or high item changes, the event of an item occurs before the item is done, or the due time of a critical or high item comes near.
 For a critical item, the server also sends a notification through Hammerspoon.
 
-The server runs a check script only after you approve it:
+The server runs a check script only after you approve it, in the Checks view of the web UI or with this command:
 
 ```sh
 recap triage approve
 ```
 
-The command shows each new or changed script, as the full text or as a diff, and asks for a yes.
-It copies each approved script to `<triage dir>.approved/`, next to the triage directory, where the triage agent cannot write.
+Each of them shows a new or changed script, as the full text or as a diff.
+The approval copies the script to `<triage dir>.approved/`, next to the triage directory, where the triage agent cannot write.
 The server runs the approved copy. A script that changed after the approval gives the outcome `unapproved` until you approve it again.
 
-`recap --queue`, or `Q` in the TUI, shows Queue mode.
-Queue mode has three panels: Queue, History and Triage.
-The Queue panel shows the sessions that have notes or open items.
-A session with an open critical item stays in the panel, also when you hid it.
-A badge marks the sessions of rank 1, 2 and 3, and a resolved session is dim.
-The Triage panel shows the notes of the selected session.
+#### The web UI
 
-| Key | Panel | Action |
-|---|---|---|
-| `1`, `2`, `3` | All | Select the session of that rank. |
-| `s` | All | Change the order: creation time, last message, rank. |
-| `R` | All | Start a review of the agents of the last 24 hours. |
-| `Enter` | Queue | Go to the session (the same action as `o`). |
-| `x` | Queue | Mark the current turn as resolved, or clear the mark. |
-| `d` | Queue | Hide the session until its next turn. |
-| `D` | Queue | Hide all the resolved sessions. |
-| `j` / `k` | Triage | Move between the follow-ups and the items. |
-| `Enter` | Triage | Copy the follow-up, then go to the session. |
-| `Space` | Triage | Confirm that an item is done, or clear the confirmation. |
+| View | Content |
+|---|---|
+| Now | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic. The sessions that wait for you now are at the top. |
+| Topics | One block for each topic: its summary, its sessions with their current status, and its first open items. |
+| Checks | The check scripts. A script that waits for your approval shows its text or its diff, and an Approve button. |
+| Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 
-A new turn in a session clears the resolved mark and the hidden mark.
-In the Triage panel, a click selects an item, a click on a check box confirms the item, and the mouse wheel moves the selection.
-The selected item, and each open critical item, show the reason, the done condition, the due time, the event, and the last check result.
+A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the turns that the item refers to.
+From the details you can confirm, reopen, drop or delete the item, change its impact or its owner, copy its prompt, and go to its session.
+A click on a session opens a panel with all the turns of the session, as the prompt and the final response of each turn. The list stays in place behind the panel.
+A closed item is dim and has a check mark. The closed items are in a group at the end of the Now view.
 
-The first row of the Queue panel is the current or last run of the triage agent.
-For that row, the Triage panel shows the state of the runner, the current action of the run, the end of the last run, and the next scheduled run.
-The History panel shows the prompt of the run.
+The chat on the right side sends a message to the triage agent.
+Type `@` to name an item, a session or a topic, or use an "Ask triage" button. The server adds the current data of each named object to the message.
+Each conversation is one Claude Code session, so the agent knows the earlier messages of the conversation.
+A reply lists the changes that the agent made to the triage data.
 
-A review run reads all the agents of the last 24 hours, and writes notes for the agents that need you.
-The server starts a review when the triage directory has no agent files, and when you press `R`.
+| Key | Action |
+|---|---|
+| `1` to `4` | Show the Now, Topics, Checks or Activity view. |
+| `j` / `k` | Move the selection. |
+| `Enter` | Show or hide the details of the selected item. |
+| `a` | Add the selected item to the chat message. |
+| `c` | Go to the chat. |
+| `/` | Go to the filter. |
+| `Esc` | Close the session panel, or leave a text field. |
 
-`examples/hammerspoon/recap.lua` adds a global hotkey that focuses the queue window, and the `recapNotify` function that the triage agent uses for notifications.
+The routes under `/ui/` do the actions that only you can do, such as the approval of a script. Each request needs a token that the server writes into the page.
+The server listens only on `127.0.0.1`.
+
+A review run reads all the agents of the last 24 hours, and gives a topic to each session that has none.
+The server starts a review when the triage data has no session, and when you press "Review" in the web UI.
+
+`examples/hammerspoon/recap.lua` has the `recapNotify` function that the triage agent uses for notifications.
 The comment at the start of the file tells how to install it.
 
 ### `recap list`
@@ -232,7 +249,7 @@ To build the index without the TUI, run `recap --index`.
 ## HTTP API
 
 The server serves the API under `/v1/`.
-The server also serves a web page at its root URL, for example `http://127.0.0.1:7717/`.
+The server also serves the triage web UI at its root URL, for example `http://127.0.0.1:7717/` (see [Triage](#triage)).
 [`examples/cli/README.md`](examples/cli/README.md) lists all the routes.
 The `examples` directory has shell scripts and a web page that use the API.
 

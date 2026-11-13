@@ -8,6 +8,4 @@ description = "The wire types of the recap HTTP API, shared by the server and th
 serde.workspace = true
 chrono.workspace = true
 regex.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

@@ -11,8 +11,10 @@ pub mod cursor_workspace;
 pub mod diff;
 pub mod embed;
 pub mod embedder;
+pub mod focus;
 pub mod history;
 pub mod http;
+pub mod http_triage;
 pub mod logger;
 pub mod nvim;
 pub mod paths;
@@ -22,5 +24,7 @@ pub mod session;
 pub mod sources;
 pub mod store;
 pub mod triage;
+pub mod triage_api;
+pub mod triage_store;
 
 pub use server::Server;
