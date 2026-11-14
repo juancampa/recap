@@ -8,22 +8,23 @@ export const escapeHtml = (s) =>
   String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 // Give each topic of `state` its color, as a CSS text in `style`. A color
-// is one of 12 hues in one of 2 forms: a filled background, or an outline.
-// The id of the topic gives the color. A topic whose color is in use gets
-// a free color, so two topics have different colors while a free color
-// exists.
-const HUES = 12;
+// is one of 18 hues. All the colors have the same lightness, so the topics
+// look like one kind of object. The id of the topic gives the hue. A topic
+// whose hue is in use gets a free hue, so two topics have different hues
+// while a free hue exists.
+const HUES = 18;
 export function setTopicColors(state) {
   const used = new Set();
   for (const topic of [...state.topics].sort((x, y) => x.id.localeCompare(y.id))) {
     let hash = 2166136261;
     for (let i = 0; i < topic.id.length; i++) hash = Math.imul(hash ^ topic.id.charCodeAt(i), 16777619);
-    let slot = (hash >>> 0) % (2 * HUES);
-    // A step of 7 goes through all the 24 colors.
-    for (let n = 0; n < 2 * HUES && used.has(slot); n++) slot = (slot + 7) % (2 * HUES);
+    let slot = (hash >>> 0) % HUES;
+    // A step of 7 goes through all the 18 hues, and the next hue is far
+    // from the hue before.
+    for (let n = 0; n < HUES && used.has(slot); n++) slot = (slot + 7) % HUES;
+    if (used.size === HUES) used.clear();
     used.add(slot);
-    const hue = (slot % HUES) * (360 / HUES);
-    topic.style = slot < HUES ? `--h:${hue}` : `--h:${hue};--tc-fill:0;--tc-line:1px`;
+    topic.style = `--h:${slot * (360 / HUES)}`;
   }
   return state;
 }

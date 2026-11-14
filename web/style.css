@@ -22,7 +22,9 @@
   --mono: ui-monospace, "SF Mono", Menlo, monospace;
   /* The lightness and the chroma of the color of a topic. The topic gives the hue. */
   --tc-fg: 0.46 0.15;
-  --tc-bg: 0.94 0.045;
+  --tc-bg: 0.96 0.03;
+  --run: #17a341;
+  --dot-line: rgba(0, 0, 0, 0.55);
   --hl-c: #8a8a80;
   --hl-s: #1a7f37;
   --hl-v: #8250df;
@@ -51,8 +53,10 @@
     --warn-bg: #3a3317;
     --sel: #232b3b;
     --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
-    --tc-fg: 0.84 0.11;
-    --tc-bg: 0.33 0.07;
+    --tc-fg: 0.82 0.12;
+    --tc-bg: 0.23 0.035;
+    --run: #2fdc62;
+    --dot-line: #050506;
     --hl-c: #7d7d76;
     --hl-s: #7ee787;
     --hl-v: #d2a8ff;
@@ -219,7 +223,7 @@ button.icon:hover { color: var(--text); }
   align-items: baseline;
 }
 .group > h3 .title { color: var(--text); font-size: 13px; }
-.group > h3 .sum { font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group > h3 .sum { flex: 1; min-width: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .list { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .row {
   display: grid;
@@ -271,22 +275,23 @@ button.icon:hover { color: var(--text); }
   color: var(--dim);
   border: none;
 }
-/* The color of a topic. The element sets the hue in `--h`. For the outline
-   form, it also sets `--tc-fill` to 0 and `--tc-line` to the line width. */
+/* The color of a topic. The element sets the hue in `--h`. The text and
+   the line have the same color, and the background is a dark form of it. */
 .tc, a.ref.tc, .chip.tc {
   color: oklch(var(--tc-fg) var(--h));
-  background: oklch(var(--tc-bg) var(--h) / var(--tc-fill, 1));
-  box-shadow: inset 0 0 0 var(--tc-line, 0) oklch(var(--tc-fg) var(--h) / 0.65);
+  background: oklch(var(--tc-bg) var(--h));
+  box-shadow: inset 0 0 0 1px oklch(var(--tc-fg) var(--h) / 0.75);
 }
 h2.tc { border-radius: 5px; padding: 0 7px; }
 a.chip { text-decoration: none; }
 .chip.late { background: var(--crit-bg); color: var(--crit); font-weight: 650; }
 .chip.done { background: var(--ok-bg); color: var(--ok); }
 .chip.bad { background: var(--warn-bg); color: var(--warn); }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; display: inline-block; }
+/* The status of a session. The line is a part of the size. */
+.dot { width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--dot-line); background: var(--faint); flex: none; display: inline-block; }
 .dot.busy { background: var(--accent); }
 .dot.waiting { background: var(--high); }
-.dot.idle { background: var(--ok); }
+.dot.idle { background: var(--run); }
 .age { color: var(--faint); font-size: 11px; width: 34px; text-align: right; }
 
 /* The details of an item */

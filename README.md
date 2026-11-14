@@ -176,7 +176,7 @@ The server runs the approved copy. A script that changed after the approval give
 
 | View | Content |
 |---|---|
-| Items | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic or by session. The sessions that wait for you now are at the top. |
+| Items | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic or by session, and sort them by priority or by date (the newest item first). The sessions that wait for you now are at the top. |
 | Checks | The check scripts, with the colors of their syntax. A script that waits for your approval shows its text or its diff, and an Approve button. The tab shows the number of scripts that wait. |
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 

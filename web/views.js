@@ -385,6 +385,7 @@ export function ItemsView({ ctx }) {
   const { state, index, route, go } = ctx;
   const [owner, setOwner] = useStored('items-owner', 'user');
   const group = route.group;
+  const [sort, setSort] = useStored('items-sort', 'priority');
   const groupRefs = useRef(new Map());
   const [showMuted, setShowMuted] = useStored('items-muted', false);
   // The address holds the text filter.
@@ -415,7 +416,10 @@ export function ItemsView({ ctx }) {
     const session = item.chain ? index.sessions.get(item.chain) : null;
     return session && session.muted && item.impact !== 'critical';
   };
+  // The server gives the items in the priority order. The date order
+  // shows the newest item first.
   const all = state.items.filter(matches);
+  if (sort === 'date') all.sort((a, b) => (Date.parse(b.created) || 0) - (Date.parse(a.created) || 0));
   const openAll = all.filter((i) => !closed(i));
   const mutedCount = openAll.filter(isMuted).length;
   const open = showMuted ? openAll : openAll.filter((i) => !isMuted(i));
@@ -522,6 +526,14 @@ export function ItemsView({ ctx }) {
       <div class="seg">
         ${GROUPS.map(([id, label]) => html`<button class=${group === id ? 'on' : ''} onClick=${() => go({ group: id }, true)}>${label}</button>`)}
       </div>
+      <span class="label">Sort</span>
+      <div class="seg">
+        ${[
+          ['priority', 'Priority'],
+          ['date', 'Date'],
+        ].map(([id, label]) => html`<button class=${sort === id ? 'on' : ''} onClick=${() => setSort(id)}
+          title=${id === 'date' ? 'The newest item first' : 'The item that you must do first at the top'}>${label}</button>`)}
+      </div>
       ${(mutedCount > 0 || showMuted) &&
       html`<label title="The items of the sessions that you muted">
         <input type="checkbox" checked=${showMuted} onChange=${(e) => setShowMuted(e.target.checked)} /> Muted (${mutedCount})
@@ -561,10 +573,10 @@ export function ItemsView({ ctx }) {
               </button>`}
               ${!topic && !session && html`<span class="title">${group === 'topic' ? 'No topic' : key ? short(key) : 'No session'}</span>`}
               <span>${items.length}</span>
-              ${sessionTopic && html`<${TopicRef} topic=${sessionTopic} />`}
               <span class="sum">${topic ? topic.summary : session ? `${session.status === 'waiting' ? `Waits for ${session.waiting_for || 'you'}. ` : ''}${session.summary || ''}` : ''}</span>
               ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triagent</button>`}
               ${session && html`<button class="plain" onClick=${() => ctx.ask(`@session:${short(key)}`)}>Ask triagent</button>`}
+              ${sessionTopic && html`<${TopicRef} topic=${sessionTopic} />`}
             </h3>
             <${ItemList} ...${listProps} items=${items} group=${group} />
           </div>`;
