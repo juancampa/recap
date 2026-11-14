@@ -8,6 +8,7 @@
   --faint: #9a9a92;
   --accent: #2f6fde;
   --accent-bg: #e6eefc;
+  --action: #1d4a9f;
   --crit: #c8261b;
   --crit-bg: #fde9e7;
   --high: #b8650a;
@@ -39,6 +40,7 @@
     --faint: #73736e;
     --accent: #6ea0f5;
     --accent-bg: #1e2c47;
+    --action: #2553ad;
     --crit: #ff7b6e;
     --crit-bg: #47201c;
     --high: #f0a653;
@@ -75,7 +77,7 @@ button {
   white-space: nowrap;
 }
 button:hover { border-color: var(--faint); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary { background: var(--action); border-color: var(--action); color: #fff; }
 button.plain { border-color: transparent; background: transparent; color: var(--dim); }
 button.plain:hover { color: var(--text); background: var(--panel-2); }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -216,7 +218,17 @@ button.pill { border: none; }
 .impact.high { color: var(--high); }
 .owner { font-size: 11px; color: var(--dim); }
 .owner.user { color: var(--accent); font-weight: 650; }
-.row .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The Items view has a column for the topic. All the rows of a list have
+   the same columns, so the topics and the sessions start at the same place. */
+.list.cols { display: grid; grid-template-columns: 18px 44px 46px minmax(0, 1fr) 140px auto; column-gap: 8px; }
+.list.cols > .item, .list.cols > .item > .row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; }
+.list.cols > .item > .detail { grid-column: 1 / -1; }
+.list.cols .row .meta { justify-content: space-between; }
+.row .topic { display: flex; min-width: 0; }
+.row .topic .chip { max-width: 100%; display: block; }
+.row .what { display: flex; gap: 5px; align-items: center; min-width: 0; }
+.row .what .chip { flex: none; }
+.row .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row .text .id { color: var(--faint); font-family: var(--mono); font-size: 11px; margin-left: 6px; }
 .row .meta { display: flex; gap: 5px; align-items: center; min-width: 0; }
 .item.closed .row .text, .item.closed .impact, .item.closed .owner { color: var(--faint); }
@@ -274,9 +286,7 @@ a.chip { text-decoration: none; }
   white-space: pre-wrap;
   word-break: break-word;
 }
-.turn-ref { border: 1px solid var(--line); border-radius: 5px; margin-top: 3px; }
-.turn-ref > summary { cursor: pointer; padding: 2px 8px; color: var(--dim); }
-.turn-ref > div { padding: 2px 10px 6px; }
+.turn-ref { color: var(--dim); }
 .turn-ref .kind { color: var(--text); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-right: 4px; }
 .turn-ref .quote { font-style: italic; }
 ::highlight(quote) { background-color: #f5c84c; color: #1b1b1b; }
@@ -347,22 +357,21 @@ a.ref {
 .topic-card .list { border: none; border-top: 1px solid var(--line); border-radius: 0 0 7px 7px; }
 .more { padding: 3px 12px 6px 36px; color: var(--dim); }
 
-/* The session panel */
+/* The session panel. It is between the main view and the chat. The page
+   sets its width, and the user changes the width with the line `.resizer`. */
 .drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(760px, 92vw);
+  flex: none;
+  min-width: 320px;
+  max-width: calc(100vw - 320px);
   background: var(--panel);
-  border-left: 1px solid var(--line);
-  box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
-  z-index: 20;
+  min-height: 0;
 }
-/* The panel does not cover the chat. */
-.shell.chat-open .drawer { right: 400px; width: min(760px, calc(92vw - 400px)); }
+.shell.chat-open .drawer { max-width: max(320px, calc(100vw - 720px)); }
+.resizer { flex: none; width: 5px; cursor: col-resize; background: var(--line); background-clip: content-box; padding: 0 2px; }
+.resizer:hover, body.resizing .resizer { background-color: var(--accent); }
+body.resizing { user-select: none; cursor: col-resize; }
 .drawer > header { padding: 9px 14px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
 .drawer > header h2 { font-size: 14px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drawer > .sub { padding: 5px 14px; border-bottom: 1px solid var(--line); color: var(--dim); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -458,6 +467,10 @@ a.ref {
   z-index: 50;
   box-shadow: var(--shadow);
 }
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; z-index: 60; }
+.modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; box-shadow: var(--shadow); padding: 16px 20px; width: min(440px, 90vw); }
+.modal h2 { font-size: 15px; margin: 0 0 6px; }
+.modal p { margin: 6px 0; color: var(--dim); }
 .toast.error { background: var(--crit); color: #fff; }
 kbd {
   font-family: var(--mono);

@@ -128,34 +128,20 @@ function Turn({ ctx, chain, entry, hit, quote, scroll }) {
 }
 
 // The reference `index` of `item`, in the details of the item: the kind,
-// the turn and the quote. A click on the quote opens the turn in the
-// session panel. The element loads the turn when the user opens it.
+// the turn and the quote. A click opens the turn in the session panel.
 function TurnRef({ ctx, item, index }) {
   const turnRef = item.refs[index];
-  const [open, setOpen] = useState(false);
   const session = ctx.index.sessions.get(turnRef.chain);
   return html`
-    <details class="turn-ref" onToggle=${(e) => setOpen(e.target.open)}>
-      <summary>
-        <span class="kind">${REF_KIND[turnRef.kind || 'context']}</span>
-        turn ${turnRef.turn}${turnRef.chain !== item.chain ? ` of ${sessionTitle(session) || short(turnRef.chain)}` : ''}
-        ${' '}
-        <a class="quote" href=${refHref(item, index)} onClick=${openRef(ctx, item, index)} title="Show the sentence in the session">
-          ${turnRef.quote ? `“${turnRef.quote}”` : 'Open in the session'}
-        </a>
-      </summary>
-      ${open && html`<${TurnRefBody} ctx=${ctx} turnRef=${turnRef} />`}
-    </details>
+    <div class="turn-ref">
+      <span class="kind">${REF_KIND[turnRef.kind || 'context']}</span>
+      turn ${turnRef.turn}${turnRef.chain !== item.chain ? ` of ${sessionTitle(session) || short(turnRef.chain)}` : ''}
+      ${' '}
+      <a class="quote" href=${refHref(item, index)} onClick=${openRef(ctx, item, index)} title="Show the sentence in the session">
+        ${turnRef.quote ? `“${turnRef.quote}”` : 'Open in the session'}
+      </a>
+    </div>
   `;
-}
-
-function TurnRefBody({ ctx, turnRef }) {
-  const [turns, error] = useTurns(ctx, turnRef.chain);
-  if (error) return html`<div class="note">${error}</div>`;
-  if (!turns) return html`<div class="note">Loading…</div>`;
-  const entry = turns.find((t) => t.ordinal === turnRef.turn);
-  if (!entry) return html`<div class="note">The history has no turn ${turnRef.turn} for this session.</div>`;
-  return html`<div><${Turn} ctx=${ctx} chain=${turnRef.chain} entry=${entry} quote=${turnRef.quote} /></div>`;
 }
 
 // ── One item ──────────────────────────────────────────────────────────────
@@ -234,7 +220,11 @@ function ItemDetail({ ctx, item }) {
             <div class="prompt">${linked(item.prompt)}</div>
             <div class="actions" style="margin-top:4px">
               <button onClick=${() => ctx.copy(item.prompt)}>Copy</button>
-              ${item.chain && html`<button class="primary" onClick=${copyAndGo}>Copy and go to the session</button>`}
+              ${item.chain && html`<button onClick=${copyAndGo}>Copy and go to the session</button>`}
+              ${item.chain &&
+              html`<button onClick=${() => ctx.writePrompt(item.chain, item.prompt)} title="Write the prompt in the session panel. You can change it there and send it to the session.">
+                Edit and send
+              </button>`}
             </div>
           </div>`}
         ${item.refs &&
@@ -285,20 +275,24 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
         <span class=${`mark ${item.state}`} title=${STATE_TEXT[item.state]}>${MARKS[item.state]}</span>
         <span class=${`impact ${item.impact}`}>${IMPACT_LABEL[item.impact]}</span>
         <span class=${`owner ${item.owner}`}>${item.owner === 'user' ? 'you' : 'agent'}</span>
-        <span class="text" title=${item.text}>
-          <${Linked} key=${item.text} ctx=${ctx} text=${item.text} repo=${session ? session.repo : undefined} /><span class="id">${item.id}</span>
-        </span>
-        <span class="meta">
+        <span class="what">
+          <span class="text" title=${item.text}>
+            <${Linked} key=${item.text} ctx=${ctx} text=${item.text} repo=${session ? session.repo : undefined} /><span class="id">${item.id}</span>
+          </span>
           ${item.late && html`<span class="chip late">late</span>`}
           ${!item.late && item.due && !closed(item) && html`<span class="chip">due ${until(item.due)}</span>`}
           ${!item.late && item.before && !closed(item) && html`<span class="chip" title=${`Before: ${item.before.event}`}>before ${item.before.event}</span>`}
           ${run && run.outcome !== 'not-done' && html`<span class=${`chip ${OUTCOME_CLASS[run.outcome]}`} title="The outcome of the check">${run.outcome}</span>`}
-          ${showTopic &&
-          topic &&
+        </span>
+        ${showTopic &&
+        html`<span class="topic">
+          ${topic &&
           html`<a class="chip tc" style=${topic.style} href=${`/topics#${topic.id}/${item.id}`} title="Show the item in its topic"
             onClick=${(e) => !e.metaKey && !e.ctrlKey && (e.preventDefault(), ctx.go({ view: 'topics', q: '', hash: `${topic.id}/${item.id}` }))}>
             ${topic.title}
           </a>`}
+        </span>`}
+        <span class="meta">
           ${session &&
           html`<button class="chip" title=${session.summary || 'Open the session'}
               onClick=${(e) => (item.refs && item.refs.length ? openRef(ctx, item, item.refs.length - 1)(e) : (e.stopPropagation(), ctx.openSession(item.chain)))}>
@@ -315,7 +309,7 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
 // A list of items with a selection that the keys move.
 function ItemList({ ctx, items, sel, expanded, toggle, showTopic, rowRefs }) {
   return html`
-    <div class="list">
+    <div class=${`list ${showTopic ? 'cols' : ''}`}>
       ${items.map(
         (item) => html`<${ItemRow} key=${item.id} ctx=${ctx} item=${item} selected=${sel === item.id}
           expanded=${expanded.has(item.id)} onToggle=${() => toggle(item.id)} showTopic=${showTopic}
@@ -648,8 +642,36 @@ export function TopicsView({ ctx }) {
 
 // `refName` names the reference of an item that the panel shows, as
 // `<item>/<index>`. The panel marks the quote of the reference in `turn`.
-export function SessionPanel({ ctx, chain, turn, refName, close }) {
+export function SessionPanel({ ctx, chain, turn, refName, written, width, close }) {
   const session = ctx.index.sessions.get(chain);
+  // The prompt that the user writes for the session.
+  const [draft, setDraft] = useSession(`prompt:${chain}`, '');
+  const [sending, setSending] = useState(false);
+  const input = useRef(null);
+  // `written` is a prompt of an item that the user wants to send.
+  useEffect(() => {
+    if (!written || written.chain !== chain) return;
+    setDraft(written.text);
+    if (input.current) input.current.focus();
+  }, [written]);
+  // The server sends a prompt only to a session that waits for a prompt.
+  const status = session && session.status;
+  const blocked = status === 'busy' || status === 'waiting';
+  const send = () => {
+    const text = draft.trim();
+    if (!text || sending || blocked) return;
+    setSending(true);
+    api
+      .ui(`/sessions/${chain}/send`, { text })
+      .then(
+        (result) => {
+          setDraft('');
+          ctx.say(result.ran ? 'Sent the prompt to the session' : 'Opened a window that resumes the session with the prompt');
+        },
+        (e) => ctx.say(e.message, true),
+      )
+      .finally(() => setSending(false));
+  };
   const [turns, error] = useTurns(ctx, chain);
   const end = useRef(null);
   const cut = refName ? refName.lastIndexOf('/') : -1;
@@ -666,7 +688,7 @@ export function SessionPanel({ ctx, chain, turn, refName, close }) {
   }, [turns, turn, chain]);
 
   return html`
-    <div class="drawer" onClick=${ctx.onRef}>
+    <div class="drawer" style=${`width:${width}px`} onClick=${ctx.onRef}>
       <header>
         <span class=${`dot ${(session && session.status) || ''}`}></span>
         <h2>${sessionTitle(session) || short(chain)}</h2>
@@ -705,6 +727,23 @@ export function SessionPanel({ ctx, chain, turn, refName, close }) {
           },
         )}
         <div ref=${end}></div>
+      </div>
+      <div class="composer">
+        <textarea ref=${input} value=${draft} placeholder="Write a prompt for this session."
+          onInput=${(e) => setDraft(e.target.value)}
+          onKeyDown=${(e) => e.key === 'Enter' && !e.shiftKey && !e.isComposing && (e.preventDefault(), send())}></textarea>
+        <div class="bar">
+          <span>
+            ${blocked
+              ? `The session ${status === 'busy' ? 'is busy' : `waits for ${session.waiting_for || 'you'}`}. The server sends a prompt only to an idle session.`
+              : html`<kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line`}
+          </span>
+          <span class="spacer"></span>
+          <button class="primary" onClick=${send} disabled=${sending || blocked || !draft.trim()}
+            title=${status ? 'Write the prompt in the terminal of the session and press Enter there' : 'The session does not run. Open a new terminal window that resumes it with the prompt.'}>
+            ${status ? 'Send to the session' : 'Resume with this prompt'}
+          </button>
+        </div>
       </div>
     </div>
   `;

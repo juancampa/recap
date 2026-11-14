@@ -1,4 +1,5 @@
-//! Show the terminal window of a Claude Code session to the user.
+//! Show the terminal window of a Claude Code session to the user, and send
+//! a prompt to the session.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,11 +41,58 @@ pub fn focus_or_resume(session_id: &str, pid: Option<i32>, cwd: Option<&Path>) {
                     .spawn();
             }
         }
-        None => open_resume_window(session_id, cwd),
+        None => open_resume_window(session_id, cwd, None),
     }
 }
 
+/// The script that writes a prompt in the Ghostty terminal of a tty and
+/// sends it. The arguments are the tty path and the prompt. `input text`
+/// writes the prompt as a paste, so a line break in the prompt does not
+/// send a part of it. The script prints `none` when no terminal has the
+/// tty.
+const SEND_SCRIPT: &str = r#"on run argv
+  set theTty to item 1 of argv
+  set thePrompt to item 2 of argv
+  tell application "Ghostty"
+    repeat with t in terminals
+      if (tty of t) is theTty then
+        input text thePrompt to t
+        delay 0.3
+        send key "enter" to t
+        return "sent"
+      end if
+    end repeat
+  end tell
+  return "none"
+end run"#;
+
+/// Send `prompt` to the running Claude Code session with the process id
+/// `pid`: write the prompt in the Ghostty terminal of the process, and
+/// press Enter there. The caller makes sure that the session waits for a
+/// prompt: the Enter key answers a permission prompt of a session that
+/// shows one.
+pub fn send_prompt(pid: i32, prompt: &str) -> anyhow::Result<()> {
+    let ps = Command::new("ps").args(["-o", "tty=", "-p", &pid.to_string()]).output()?;
+    let tty = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+    anyhow::ensure!(tty.starts_with("ttys"), "the process {pid} of the session has no terminal");
+    let output = Command::new("osascript")
+        .args(["-e", SEND_SCRIPT, &format!("/dev/{tty}"), prompt])
+        .stdin(Stdio::null())
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Ghostty refused the prompt: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stdout).trim() == "sent",
+        "no Ghostty terminal has the session (/dev/{tty})"
+    );
+    Ok(())
+}
+
 /// Open a new Ghostty window that runs `claude --resume <id>` in `cwd`.
+/// With a `prompt`, the session starts with that prompt.
 ///
 /// The function uses the AppleScript interface of Ghostty and not
 /// `open -na Ghostty.app --args -e …`. macOS ignores `--args` for an app
@@ -54,9 +102,13 @@ pub fn focus_or_resume(session_id: &str, pid: Option<i32>, cwd: Option<&Path>) {
 /// `new window with configuration` opens one window in the instance that
 /// runs, uses the working directory, and shows no prompt. If Ghostty does
 /// not run, the `tell` block starts it.
-pub fn open_resume_window(session_id: &str, cwd: Option<&Path>) {
+pub fn open_resume_window(session_id: &str, cwd: Option<&Path>, prompt: Option<&str>) {
     // Ghostty runs `command` with `/bin/sh -c`.
-    let command = format!("{} --resume {}", shell_quote(&claude_bin()), shell_quote(session_id));
+    let mut command = format!("{} --resume {}", shell_quote(&claude_bin()), shell_quote(session_id));
+    if let Some(prompt) = prompt {
+        // `--` keeps a prompt that starts with `-` out of the options.
+        command.push_str(&format!(" -- {}", shell_quote(prompt)));
+    }
     let workdir = cwd.map(|d| d.to_string_lossy().into_owned());
 
     let mut script = String::from("tell application \"Ghostty\"\n");

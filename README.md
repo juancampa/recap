@@ -182,6 +182,12 @@ The server runs the approved copy. A script that changed after the approval give
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 
 A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the references. A click on the quote of a reference opens the turn in the session panel and marks the sentence. For an item that an agent said is done, the state is a link to that statement.
+
+The session panel is between the main view and the chat. Move the line at its left side to change its width.
+The panel has an input for a prompt. "Send to the session" writes the prompt in the Ghostty terminal of a Claude Code session and presses Enter there.
+The server sends a prompt only to an idle session, because the Enter key answers a permission prompt.
+For a session that does not run, the server opens a new Ghostty window that resumes the session with the prompt.
+"Edit and send" in the details of an item writes the prompt of the item in this input.
 From the details you can confirm, reopen, drop or delete the item, change its impact or its owner, copy its prompt, and go to its session.
 A click on a session opens a panel with all the turns of the session, as the prompt and the final response of each turn. The list stays in place behind the panel.
 A closed item is dim and has a check mark. The closed items are in a group at the end of the Items view.
@@ -219,6 +225,7 @@ A reply lists the changes that triagent made to the triage data.
 | `Esc` | Close the session panel, or leave a text field. |
 
 The routes under `/ui/` do the actions that only you can do, such as the approval of a script. Each request needs a token that the server writes into the page.
+The server makes a new token at each start. The page shows a notice when the server started again: load the page again then.
 The server listens only on `127.0.0.1`.
 
 A review run reads all the agents of the last 24 hours, and gives a topic to each session that has none.

@@ -96,6 +96,14 @@ export function findRefs(text, look, repo) {
   for (const ref of found) {
     if (!taken.some((t) => ref.start < t.end && t.start < ref.end)) taken.push(ref);
   }
+  // A reference to a triage object can be in backticks. The link replaces
+  // the backticks too.
+  for (const ref of taken) {
+    if (ref.kind !== 'link' && text[ref.start - 1] === '`' && text[ref.end] === '`') {
+      ref.start -= 1;
+      ref.end += 1;
+    }
+  }
   return taken.sort((a, b) => a.start - b.start);
 }
 

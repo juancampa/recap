@@ -10,8 +10,14 @@ const TOKEN = document.querySelector('meta[name="recap-token"]').content;
 
 // ── The server calls ──────────────────────────────────────────────────────
 
+// The page calls `restart.notice` when it finds that the server started
+// again. The server then has a new token, and it refuses the `/ui/` calls of
+// this page.
+const restart = { notice: () => {} };
+
 async function request(path, options = {}) {
   const response = await fetch(path, options);
+  if (response.status === 403 && path.startsWith('/ui/')) restart.notice();
   if (!response.ok) throw new Error((await response.text()) || `${response.status}`);
   if (response.status === 204) return null;
   return response.json();
@@ -210,6 +216,13 @@ function App() {
   const [reviewModel, setReviewModel] = useStored('review-model', MODELS[0]);
   const [seen, setSeen] = useStored('seen-change', null);
   const [toast, setToast] = useState(null);
+  // True when the server started again after the load of this page.
+  const [restarted, setRestarted] = useState(false);
+  restart.notice = () => setRestarted(true);
+  const [panelWidth, setPanelWidth] = useStored('session-width', 620);
+  // A prompt of an item that the session panel shows in its input:
+  // `{chain, text}`.
+  const [written, setWritten] = useState(null);
   // The reference under the pointer: `{kind, id, rect}`.
   const [hover, setHover] = useState(null);
   const chat = useRef(null);
@@ -251,9 +264,21 @@ function App() {
       else if (event.type === 'triage_chat') chatEvents.current.forEach((f) => f(event.message));
     };
     // The browser connects again after an error. The data can be old then.
+    // The server can be a new process: then its page has a new token.
+    let connected = false;
     events.onopen = () => {
       loadState();
       loadStatus();
+      if (connected) {
+        fetch('/', { cache: 'no-store' })
+          .then((r) => r.text())
+          .then((page) => {
+            const token = page.match(/name="recap-token" content="([^"]*)"/);
+            if (token && token[1] !== TOKEN) setRestarted(true);
+          })
+          .catch(() => {});
+      }
+      connected = true;
     };
     // Show an error of the page code. Without this, an error in a render
     // stops the update and the page shows old data.
@@ -312,6 +337,11 @@ function App() {
       setSession: (chain, set) => apply([{ op: 'session', chain, set }]),
       // `ref` names a reference of an item, as `<item>/<index>`.
       openSession: (chain, turn, ref) => go({ session: chain, turn: turn || null, ref: (turn && ref) || null }),
+      // Show the session panel with `text` in its prompt input.
+      writePrompt: (chain, text) => {
+        setWritten({ chain, text });
+        go({ session: chain, turn: null, ref: null });
+      },
       showItem: (id) => go({ view: 'items', q: '', hash: id }),
       showTopic: (id) => go({ view: 'topics', q: '', hash: id }),
       // Add a reference to the chat draft and move the focus to the chat.
@@ -382,6 +412,30 @@ function App() {
     try {
       sessionStorage.setItem(`scroll:${view}`, String(main.current.scrollTop));
     } catch {}
+  };
+
+  // The user moves the line between the main view and the session panel.
+  const resize = (event) => {
+    event.preventDefault();
+    const from = event.clientX;
+    const panel = event.currentTarget.nextElementSibling;
+    const start = panel.offsetWidth;
+    // The style sheet limits the width. Keep the width that the page shows.
+    const move = (e) => {
+      panel.style.width = `${Math.max(320, Math.round(start + from - e.clientX))}px`;
+      setPanelWidth(panel.offsetWidth);
+    };
+    const stop = () => {
+      document.body.classList.remove('resizing');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+    };
+    // The class stops the selection of text while the user moves the line.
+    document.body.classList.add('resizing');
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
   };
 
   const openView = (id) => go({ view: id, q: '', hash: '', session: null, turn: null });
@@ -474,13 +528,27 @@ function App() {
             ${view === 'activity' && html`<${ActivityView} ctx=${ctx} seen=${seen} setSeen=${setSeen} />`}
           </div>
         </div>
+        ${route.session &&
+        html`<div class="resizer" onPointerDown=${resize} title="Move to change the width of the session panel"></div>
+          <${SessionPanel} key=${route.session} ctx=${ctx} chain=${route.session} turn=${route.turn} refName=${route.ref}
+            written=${written} width=${panelWidth} close=${() => go({ session: null, turn: null, ref: null })} />`}
         ${chatOpen && html`<${Chat} ctx=${ctx} handle=${chat} events=${chatEvents} />`}
       </div>
-      ${route.session &&
-      html`<${SessionPanel} key=${route.session} ctx=${ctx} chain=${route.session} turn=${route.turn} refName=${route.ref}
-        close=${() => go({ session: null, turn: null, ref: null })} />`}
       ${hover && html`<${RefPopover} ctx=${ctx} hover=${hover} />`}
       ${toast && html`<div class=${`toast ${toast.isError ? 'error' : ''}`}>${toast.text}</div>`}
+      ${restarted &&
+      html`<div class="modal">
+        <div class="box">
+          <h2>The recap server started again</h2>
+          <p>This page is from the server process before. The server now refuses the changes and the chat messages of this page.</p>
+          <p>Load the page again. The page keeps the expanded items, the scroll position and the drafts.</p>
+          <div class="actions">
+            <span class="spacer"></span>
+            <button class="plain" onClick=${() => setRestarted(false)}>Not now</button>
+            <button class="primary" onClick=${() => location.reload()}>Load the page again</button>
+          </div>
+        </div>
+      </div>`}
     </div>
   `;
 }

@@ -324,6 +324,41 @@ impl Server {
         Ok(())
     }
 
+    /// Send `text` as a prompt to the newest session of the chain `chain`.
+    /// A session that runs must wait for a prompt. A session that does not
+    /// run gets a new window that resumes it with the prompt. The result
+    /// is true when the session ran.
+    pub fn send_to_chain(&self, chain: &str, text: &str) -> ApiResult<bool> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(error("the prompt is empty"));
+        }
+        let (agents, running) = self.chain_data();
+        let agent = agents.get(chain).ok_or_else(|| error(format!("no session chain {chain}")))?;
+        if agent.source != EditSource::ClaudeCode {
+            return Err(error("the server can send a prompt only to a Claude Code session"));
+        }
+        let Some(run) = running.get(chain) else {
+            let cwd = agent.project_roots.first().cloned();
+            crate::focus::open_resume_window(&agent.session_id, cwd.as_deref(), Some(text));
+            log::info!("triage: the user sent a prompt to the session {} in a new window", agent.session_id);
+            return Ok(false);
+        };
+        // The Enter key that sends the prompt also answers a permission
+        // prompt. Thus the server sends only to a session that is idle.
+        if run.status.as_deref() != Some("idle") {
+            let state = match (run.status.as_deref(), run.waiting_for.as_deref()) {
+                (Some("waiting"), Some(what)) => format!("waits for {what}"),
+                (Some(status), _) => format!("is {status}"),
+                (None, _) => "has no known status".to_string(),
+            };
+            return Err(error(format!("the session {state}: the server sends a prompt only to an idle session")));
+        }
+        crate::focus::send_prompt(run.pid, text).map_err(error)?;
+        log::info!("triage: the user sent a prompt to the session {}", run.session_id);
+        Ok(true)
+    }
+
     // ── The chat ────────────────────────────────────────────────────────────
 
     pub fn chat_threads(&self) -> ApiResult<Vec<ChatThread>> {

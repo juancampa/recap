@@ -80,6 +80,7 @@ pub fn router(server: Server, web_dir: WebDir) -> Router<Server> {
         .route("/checks", get(checks))
         .route("/checks/{name}/approve", post(approve))
         .route("/sessions/{chain}/focus", post(focus))
+        .route("/sessions/{chain}/send", post(send))
         .route("/chat/threads", get(threads))
         .route("/chat/threads/{id}", get(thread))
         .route("/chat/messages", post(chat_send))
@@ -186,6 +187,18 @@ async fn threads(State(s): State<Server>) -> Result<Response, Response> {
 
 async fn thread(State(s): State<Server>, UrlPath(id): UrlPath<i64>) -> Result<Response, Response> {
     Ok(Json(blocking(s, move |s| s.chat_thread(id)).await?).into_response())
+}
+
+#[derive(Deserialize)]
+struct Prompt {
+    text: String,
+}
+
+/// The result is `{"ran": bool}`: false when the server opened a new
+/// window that resumes the session with the prompt.
+async fn send(State(s): State<Server>, UrlPath(chain): UrlPath<String>, Json(prompt): Json<Prompt>) -> Result<Response, Response> {
+    let ran = blocking(s, move |s| s.send_to_chain(&chain, &prompt.text)).await?;
+    Ok(Json(serde_json::json!({ "ran": ran })).into_response())
 }
 
 #[derive(Deserialize)]

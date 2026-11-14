@@ -14,11 +14,16 @@ function inline(text, env) {
   // other rules do not change them.
   const kept = [];
   const keep = (htmlText) => `\u0000${kept.push(htmlText) - 1}\u0000`;
-  let s = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${escape(code)}</code>`));
+  const look = (env && env.look) || NO_DATA;
+  // A code span that is only a reference to a triage object is a link.
+  let s = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const [ref] = findRefs(code, look);
+    const whole = ref && ref.kind !== 'link' && ref.start === 0 && ref.end === code.length;
+    return keep(whole ? refHtml(ref, look) : `<code>${escape(code)}</code>`);
+  });
   s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, (_, label, url) =>
     keep(`<a href="${escape(url)}" target="_blank" rel="noreferrer">${escape(label)}</a>`),
   );
-  const look = (env && env.look) || NO_DATA;
   const refs = findRefs(s, look, env && env.repo);
   for (let i = refs.length - 1; i >= 0; i--) {
     s = s.slice(0, refs[i].start) + keep(refHtml(refs[i], look)) + s.slice(refs[i].end);
