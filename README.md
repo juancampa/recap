@@ -147,7 +147,7 @@ When the server finds a triage directory of an earlier version (`items.json`, `a
 #### Items and checks
 
 Each item has an owner (the agent or you), an impact (`critical`, `high`, `normal` or `low`), the reason for a critical or a high impact, and a done condition.
-It can also have a due time, an event that the item must come before (such as the next prod deploy), a prompt that you can send to the session, and references to the turns that the item came from.
+It can also have a due time, an event that the item must come before (such as the next prod deploy), a prompt that you can send to the session, and references. A reference names one turn of a session and quotes the sentence of the turn that is about the item: where the work was first named, where an agent said that the work is done, or another fact.
 Triagent writes a check script for each done condition that a script can test.
 The server runs the check of each open item: every 10 minutes for a critical item, 30 minutes for a high item, 2 hours for a normal item, and 6 hours for a low item.
 A check exits with 0 when the item is done, 1 when it is not done, and another code when it cannot decide.
@@ -181,7 +181,7 @@ The server runs the approved copy. A script that changed after the approval give
 | Checks | The check scripts, with the colors of their syntax. A script that waits for your approval shows its text or its diff, and an Approve button. The tab shows the number of scripts that wait. |
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 
-A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the turns that the item refers to.
+A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the references. A click on the quote of a reference opens the turn in the session panel and marks the sentence. For an item that an agent said is done, the state is a link to that statement.
 From the details you can confirm, reopen, drop or delete the item, change its impact or its owner, copy its prompt, and go to its session.
 A click on a session opens a panel with all the turns of the session, as the prompt and the final response of each turn. The list stays in place behind the panel.
 A closed item is dim and has a check mark. The closed items are in a group at the end of the Items view.
@@ -199,7 +199,7 @@ The address of the page holds the navigation state, so the Back button and a rel
 |---|---|
 | `/items`, `/topics`, `/checks`, `/activity` | The view. |
 | `?q=<text>` | The text filter of the Items view. |
-| `?session=<chain>&turn=<n>` | The session in the session panel, and the turn that the panel marks. |
+| `?session=<chain>&turn=<n>` | The session in the session panel, and the turn that the panel marks. With `&ref=<item>/<index>`, the panel marks the quote of that reference of the item. |
 | `#<id>` | The object that the view shows and marks: an item in the Items view, a script in the Checks view, a topic in the Topics view. `#<topic>/<item>` shows one item of the topic. |
 
 The chat on the right side sends a message to triagent.

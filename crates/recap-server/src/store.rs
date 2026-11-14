@@ -440,6 +440,16 @@ impl Store {
         self.ordinals.get(&entry.file_path).copied()
     }
 
+    /// The prompt and the response of the turn `turn` of the chain `chain`.
+    pub fn turn_texts(&self, chain: &str, turn: usize) -> Option<(&str, Option<&str>)> {
+        let entry = self
+            .history
+            .entries
+            .iter()
+            .find(|e| self.ordinal(e) == Some(turn) && self.entry_chain_id(e) == Some(chain))?;
+        Some((entry.prompt_text()?, entry.response_text()))
+    }
+
     fn session_title(&self, entry: &HistoryEntry) -> Option<&String> {
         entry
             .session_id

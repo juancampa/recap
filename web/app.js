@@ -114,7 +114,9 @@ const RELOADED = Boolean(navigation && navigation.type === 'reload');
 // The address holds the navigation state:
 //   /<view>          the view (the server has the same list of views)
 //   ?q=<text>        the text filter of the Items view
-//   ?session=<chain> the session in the session panel, with `&turn=<n>`
+//   ?session=<chain> the session in the session panel, with `&turn=<n>`.
+//                    `&ref=<item>/<index>` names a reference of an item:
+//                    the panel marks the quote of the reference
 //   #<id>            the object that the view shows and marks: an item in
 //                    the Items view, a script in the Checks view, and a
 //                    topic in the Topics view (`#<topic>/<item>` shows
@@ -138,6 +140,7 @@ function readRoute() {
     q: url.searchParams.get('q') || '',
     session: url.searchParams.get('session') || null,
     turn: Number(url.searchParams.get('turn')) || null,
+    ref: url.searchParams.get('ref') || null,
     hash,
   };
 }
@@ -147,6 +150,7 @@ function routeUrl(route) {
   if (route.q) query.set('q', route.q);
   if (route.session) query.set('session', route.session);
   if (route.session && route.turn) query.set('turn', String(route.turn));
+  if (route.session && route.turn && route.ref) query.set('ref', route.ref);
   const text = query.toString();
   return `/${route.view}${text ? `?${text}` : ''}${route.hash ? `#${encodeURIComponent(route.hash)}` : ''}`;
 }
@@ -294,7 +298,8 @@ function App() {
       apply,
       setItem: (id, set) => apply([{ op: 'item', id, set }]),
       setSession: (chain, set) => apply([{ op: 'session', chain, set }]),
-      openSession: (chain, turn) => go({ session: chain, turn: turn || null }),
+      // `ref` names a reference of an item, as `<item>/<index>`.
+      openSession: (chain, turn, ref) => go({ session: chain, turn: turn || null, ref: (turn && ref) || null }),
       showItem: (id) => go({ view: 'items', q: '', hash: id }),
       showTopic: (id) => go({ view: 'topics', q: '', hash: id }),
       // Add a reference to the chat draft and move the focus to the chat.
@@ -458,8 +463,8 @@ function App() {
         ${chatOpen && html`<${Chat} ctx=${ctx} handle=${chat} events=${chatEvents} />`}
       </div>
       ${route.session &&
-      html`<${SessionPanel} key=${route.session} ctx=${ctx} chain=${route.session} turn=${route.turn}
-        close=${() => go({ session: null, turn: null })} />`}
+      html`<${SessionPanel} key=${route.session} ctx=${ctx} chain=${route.session} turn=${route.turn} refName=${route.ref}
+        close=${() => go({ session: null, turn: null, ref: null })} />`}
       ${hover && html`<${RefPopover} ctx=${ctx} hover=${hover} />`}
       ${toast && html`<div class=${`toast ${toast.isError ? 'error' : ''}`}>${toast.text}</div>`}
     </div>

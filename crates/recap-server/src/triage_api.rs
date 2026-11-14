@@ -14,7 +14,8 @@ use crate::triage::{self, TriageConfig};
 use crate::triage_store::TriageStore;
 use chrono::Local;
 use recap_api::triage::{
-    Actor, Batch, BatchResult, CHECKS_DIR, ChatMessage, ChatThread, ItemView, SessionNote, SessionView, TriageState,
+    Actor, Batch, BatchResult, CHECKS_DIR, ChatMessage, ChatThread, ItemView, Op, QUOTE_MAX, SessionNote, SessionView, TriageState,
+    TurnRef,
 };
 use recap_api::{ApiError, ApiResult, EditSource, Event};
 use serde::{Deserialize, Serialize};
@@ -201,9 +202,51 @@ impl Server {
         Ok(TriageState { version, last_change: store.last_change(), topics: store.topics(), sessions, items })
     }
 
-    /// Do the operations of `batch` for `actor`.
+    /// The error of the first reference in `set` whose `quote` is not an
+    /// excerpt of its turn. The triage store cannot test this, because the
+    /// turns are in the history of the server.
+    fn quote_error(&self, set: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+        // The triage store reports a `refs` value that is not valid.
+        let refs: Vec<TurnRef> = serde_json::from_value(set.get("refs")?.clone()).ok()?;
+        refs.iter().filter(|r| !r.quote.is_empty()).find_map(|r| {
+            let place = format!("turn {} of chain {}", r.turn, r.chain);
+            if r.quote.chars().count() > QUOTE_MAX {
+                return Some(format!("the quote for {place} has more than {QUOTE_MAX} characters"));
+            }
+            let Some((prompt, response)) = self.turn_texts(&r.chain, r.turn) else {
+                return Some(format!("the history has no {place}"));
+            };
+            match quote_count(&r.quote, &prompt) + response.map_or(0, |text| quote_count(&r.quote, &text)) {
+                1 => None,
+                0 => Some(format!(
+                    "the quote `{}` is not in the prompt or the response of {place}: copy the exact text, or leave `quote` out",
+                    r.quote
+                )),
+                n => Some(format!("the quote `{}` occurs {n} times in {place}: use a longer excerpt", r.quote)),
+            }
+        })
+    }
+
+    /// Do the operations of `batch` for `actor`. An item operation with a
+    /// reference whose quote is not in its turn changes nothing.
     pub fn triage_apply(&self, actor: Actor, batch: &Batch) -> ApiResult<BatchResult> {
-        let result = self.handle()?.store.apply(actor, batch);
+        let handle = self.handle()?;
+        let refused: Vec<Option<String>> = batch
+            .ops
+            .iter()
+            .map(|op| match op {
+                Op::Item { set, .. } => self.quote_error(set),
+                _ => None,
+            })
+            .collect();
+        let accepted = Batch { ops: batch.ops.iter().zip(&refused).filter(|(_, e)| e.is_none()).map(|(op, _)| op.clone()).collect() };
+        let done = handle.store.apply(actor, &accepted);
+        // The errors of the store, at the places of their operations.
+        let mut errors = done.errors.into_iter();
+        let result = BatchResult {
+            version: done.version,
+            errors: refused.into_iter().map(|e| e.or_else(|| errors.next().flatten())).collect(),
+        };
         for (op, e) in batch.ops.iter().zip(&result.errors) {
             if let Some(e) = e {
                 log::warn!("triage apply ({actor:?}): refused {}: {e}", serde_json::to_string(op).unwrap_or_default());
@@ -526,9 +569,29 @@ fn run_reply(
     Ok(())
 }
 
+/// The number of times that `quote` occurs in `text`. A sequence of white
+/// space in one text is equal to any sequence of white space in the other.
+fn quote_count(quote: &str, text: &str) -> usize {
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let quote = flat(quote);
+    if quote.is_empty() {
+        return 0;
+    }
+    flat(text).matches(&quote).count()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::github_page;
+    use super::{github_page, quote_count};
+
+    #[test]
+    fn a_quote_matches_with_other_white_space() {
+        let text = "The PR is merged.\nI ran  the tests. The PR is open.";
+        assert_eq!(quote_count("merged. I ran the tests", text), 1);
+        assert_eq!(quote_count("The PR is", text), 2);
+        assert_eq!(quote_count("the pr is merged", text), 0);
+        assert_eq!(quote_count("  ", text), 0);
+    }
 
     #[test]
     fn the_github_page_of_a_remote() {

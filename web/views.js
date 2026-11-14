@@ -4,7 +4,7 @@
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
 import { api, closed, short, ago, until, clock, useStored, useSession } from '/web/app.js';
 import { markdown } from '/web/markdown.js';
-import { Linked, TopicRef, hrefOf } from '/web/text.js';
+import { Linked, TopicRef, hrefOf, quoteRange } from '/web/text.js';
 import { highlight } from '/web/highlight.js';
 
 const MARKS = { open: '○', claimed: '◐', unknown: '?', verified: '✓', confirmed: '✓', dropped: '–' };
@@ -16,6 +16,7 @@ const STATE_TEXT = {
   confirmed: 'You confirmed that the item is done.',
   dropped: 'Dropped',
 };
+const REF_KIND = { origin: 'Origin', claim: 'Done claim', context: 'Context' };
 const IMPACTS = ['critical', 'high', 'normal', 'low'];
 const IMPACT_LABEL = { critical: 'crit', high: 'high', normal: 'norm', low: 'low' };
 const OUTCOME_CLASS = { done: 'done', 'not-done': '', unknown: 'bad', unapproved: 'bad', missing: 'bad' };
@@ -71,20 +72,52 @@ function useTurns(ctx, chain) {
 }
 
 // A long text shows its start only, with a button that shows all of it.
-function Clip({ ctx, text, cls, repo }) {
+// `open` shows all of the text from the start.
+function Clip({ ctx, text, cls, repo, open }) {
   const long = text.length > 1400 || text.split('\n').length > 22;
-  const [all, setAll] = useState(false);
+  const [all, setAll] = useState(Boolean(open));
   return html`
     <div class=${`${cls} ${long && !all ? 'clip' : ''}`}><${Md} ctx=${ctx} text=${text} repo=${repo} /></div>
     ${long && html`<button class="plain" onClick=${() => setAll(!all)}>${all ? 'Show less' : 'Show all'}</button>`}
   `;
 }
 
-function Turn({ ctx, chain, entry, hit, elRef }) {
+// The address of the session panel for the reference `index` of `item`.
+const refName = (item, index) => `${item.id}/${index}`;
+const refHref = (item, index) => {
+  const r = item.refs[index];
+  return `?session=${encodeURIComponent(r.chain)}&turn=${r.turn}&ref=${encodeURIComponent(refName(item, index))}`;
+};
+const openRef = (ctx, item, index) => (event) => {
+  if (event.metaKey || event.ctrlKey) return;
+  event.preventDefault();
+  event.stopPropagation();
+  ctx.openSession(item.refs[index].chain, item.refs[index].turn, refName(item, index));
+};
+
+// One turn of a session. `quote` is a text of the turn that the page
+// marks. With `scroll`, the page also scrolls to the mark, or to the turn
+// when the turn does not hold the quote.
+function Turn({ ctx, chain, entry, hit, quote, scroll }) {
   const repo = repoOf(ctx, chain);
-  const env = { ctx, repo };
+  const env = { ctx, repo, open: Boolean(quote) };
+  const el = useRef(null);
+  useEffect(() => {
+    if (!el.current) return;
+    const range = quote && window.Highlight && CSS.highlights ? quoteRange(el.current, quote) : null;
+    if (scroll) {
+      if (range) range.startContainer.parentElement.scrollIntoView({ block: 'center' });
+      else el.current.scrollIntoView({ block: 'start' });
+    }
+    if (!range) return;
+    // The style sheet gives the color of the highlight `quote`.
+    let marks = CSS.highlights.get('quote');
+    if (!marks) CSS.highlights.set('quote', (marks = new Highlight()));
+    marks.add(range);
+    return () => marks.delete(range);
+  }, [quote, scroll, entry.kind.text, entry.kind.response]);
   return html`
-    <div class=${`turn ${hit ? 'hit' : ''}`} ref=${elRef}>
+    <div class=${`turn ${hit ? 'hit' : ''}`} ref=${el}>
       <div class="n"><span>Turn ${entry.ordinal}</span><span>${clock(entry.timestamp)}</span></div>
       <${Clip} ...${env} cls="q a" text=${entry.kind.text || ''} />
       ${entry.kind.response
@@ -94,18 +127,22 @@ function Turn({ ctx, chain, entry, hit, elRef }) {
   `;
 }
 
-// One referenced turn in the details of an item. It loads the turn when the
-// user opens it.
-function TurnRef({ ctx, turnRef }) {
+// The reference `index` of `item`, in the details of the item: the kind,
+// the turn and the quote. A click on the quote opens the turn in the
+// session panel. The element loads the turn when the user opens it.
+function TurnRef({ ctx, item, index }) {
+  const turnRef = item.refs[index];
   const [open, setOpen] = useState(false);
   const session = ctx.index.sessions.get(turnRef.chain);
   return html`
     <details class="turn-ref" onToggle=${(e) => setOpen(e.target.open)}>
       <summary>
-        Turn ${turnRef.turn} of ${sessionTitle(session) || short(turnRef.chain)}
-        <button class="plain" style="float:right" onClick=${(e) => (e.preventDefault(), ctx.openSession(turnRef.chain, turnRef.turn))}>
-          Open in the session
-        </button>
+        <span class="kind">${REF_KIND[turnRef.kind || 'context']}</span>
+        turn ${turnRef.turn}${turnRef.chain !== item.chain ? ` of ${sessionTitle(session) || short(turnRef.chain)}` : ''}
+        ${' '}
+        <a class="quote" href=${refHref(item, index)} onClick=${openRef(ctx, item, index)} title="Show the sentence in the session">
+          ${turnRef.quote ? `“${turnRef.quote}”` : 'Open in the session'}
+        </a>
       </summary>
       ${open && html`<${TurnRefBody} ctx=${ctx} turnRef=${turnRef} />`}
     </details>
@@ -118,7 +155,7 @@ function TurnRefBody({ ctx, turnRef }) {
   if (!turns) return html`<div class="note">Loading…</div>`;
   const entry = turns.find((t) => t.ordinal === turnRef.turn);
   if (!entry) return html`<div class="note">The history has no turn ${turnRef.turn} for this session.</div>`;
-  return html`<div><${Turn} ctx=${ctx} chain=${turnRef.chain} entry=${entry} /></div>`;
+  return html`<div><${Turn} ctx=${ctx} chain=${turnRef.chain} entry=${entry} quote=${turnRef.quote} /></div>`;
 }
 
 // ── One item ──────────────────────────────────────────────────────────────
@@ -136,6 +173,15 @@ function CheckRun({ label, spec, run }) {
       ${run && run.output && html`<pre>${run.output}</pre>`}
     </div>
   `;
+}
+
+// The state of an item as a sentence. For the state `claimed`, the first
+// sentence is a link to the newest reference that holds the statement.
+function StateText({ ctx, item }) {
+  const claim = item.state === 'claimed' && item.refs ? item.refs.findLastIndex((r) => r.kind === 'claim') : -1;
+  if (claim < 0) return STATE_TEXT[item.state];
+  const [said, rest] = STATE_TEXT.claimed.split(/(?<=\.) /);
+  return html`<a href=${refHref(item, claim)} onClick=${openRef(ctx, item, claim)} title="Show the statement in the session">${said}</a> ${rest}`;
 }
 
 function ItemDetail({ ctx, item }) {
@@ -156,7 +202,7 @@ function ItemDetail({ ctx, item }) {
     <div class="detail">
       <div class="fields">
         <div class="k">State</div>
-        <div class="v">${STATE_TEXT[item.state]}${item.late ? ' The item is late.' : ''}</div>
+        <div class="v"><${StateText} ctx=${ctx} item=${item} />${item.late ? ' The item is late.' : ''}</div>
         ${(item.why || needsWhy) &&
         html`<div class="k">Why</div>
           <div class=${`v ${item.why ? '' : 'missing'}`}>${item.why ? linked(item.why) : 'No reason recorded.'}</div>`}
@@ -193,8 +239,8 @@ function ItemDetail({ ctx, item }) {
           </div>`}
         ${item.refs &&
         item.refs.length > 0 &&
-        html`<div class="k">Turns</div>
-          <div class="v">${item.refs.map((r) => html`<${TurnRef} key=${`${r.chain}:${r.turn}`} ctx=${ctx} turnRef=${r} />`)}</div>`}
+        html`<div class="k">References</div>
+          <div class="v">${item.refs.map((r, index) => html`<${TurnRef} key=${`${r.chain}:${r.turn}:${r.quote || ''}`} ctx=${ctx} item=${item} index=${index} />`)}</div>`}
       </div>
       <div class="actions">
         ${!isClosed && html`<button class="primary" onClick=${() => ctx.setItem(item.id, { status: 'confirmed' })}>Confirm done</button>`}
@@ -255,7 +301,7 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
           </a>`}
           ${session &&
           html`<button class="chip" title=${session.summary || 'Open the session'}
-              onClick=${(e) => (e.stopPropagation(), ctx.openSession(item.chain, item.refs && item.refs.length ? item.refs[item.refs.length - 1].turn : undefined))}>
+              onClick=${(e) => (item.refs && item.refs.length ? openRef(ctx, item, item.refs.length - 1)(e) : (e.stopPropagation(), ctx.openSession(item.chain)))}>
               <span class=${`dot ${session.status || ''}`}></span>${sessionTitle(session)}
             </button>`}
           <span class="age">${ago(item.created)}</span>
@@ -600,20 +646,23 @@ export function TopicsView({ ctx }) {
 
 // ── The session panel ─────────────────────────────────────────────────────
 
-export function SessionPanel({ ctx, chain, turn, close }) {
+// `refName` names the reference of an item that the panel shows, as
+// `<item>/<index>`. The panel marks the quote of the reference in `turn`.
+export function SessionPanel({ ctx, chain, turn, refName, close }) {
   const session = ctx.index.sessions.get(chain);
   const [turns, error] = useTurns(ctx, chain);
-  const hit = useRef(null);
   const end = useRef(null);
+  const cut = refName ? refName.lastIndexOf('/') : -1;
+  const refItem = cut > 0 ? ctx.look.items.get(refName.slice(0, cut)) : null;
+  const shown = refItem && refItem.refs ? refItem.refs[Number(refName.slice(cut + 1))] : null;
+  const quote = shown && shown.chain === chain && shown.turn === turn ? shown.quote : '';
   const [allItems, setAllItems] = useState(false);
   const topic = session && session.topic ? ctx.index.topics.get(session.topic) : null;
   const items = ctx.state.items.filter((i) => i.chain === chain && !closed(i));
 
-  // Show the referenced turn, or the newest turn.
+  // Show the newest turn. The referenced turn scrolls to its own place.
   useEffect(() => {
-    if (!turns) return;
-    if (turn && hit.current) hit.current.scrollIntoView({ block: 'start' });
-    else if (end.current) end.current.scrollIntoView({ block: 'end' });
+    if (turns && !turn && end.current) end.current.scrollIntoView({ block: 'end' });
   }, [turns, turn, chain]);
 
   return html`
@@ -634,6 +683,11 @@ export function SessionPanel({ ctx, chain, turn, close }) {
         ${topic && html`<${TopicRef} topic=${topic} prefix=${true} />`}
         ${session && session.status === 'waiting' && html`<span class="pill wait">waits for ${session.waiting_for || 'you'}</span>`}
         ${session && session.summary && html`<${Linked} key=${session.summary} ctx=${ctx} text=${session.summary} repo=${session.repo} />`}
+        ${shown &&
+        html`<span class="shown">
+          ${REF_KIND[shown.kind || 'context']} of <a class="ref" data-kind="item" data-id=${refItem.id} href=${hrefOf('item', refItem.id)}>${refItem.text}</a>
+          ${!quote && shown.quote ? ' (the reference is in another turn)' : ''}
+        </span>`}
         ${(allItems ? items : items.slice(0, 6)).map((i) => html`<a class="ref" data-kind="item" data-id=${i.id} href=${hrefOf('item', i.id)}>${i.impact === 'critical' || i.impact === 'high' ? `${i.impact}: ` : ''}${i.text}</a>`)}
         ${items.length > 6 && html`<button class="plain" onClick=${() => setAllItems(!allItems)}>${allItems ? 'Show fewer items' : `+${items.length - 6} open items`}</button>`}
       </div>
@@ -643,8 +697,12 @@ export function SessionPanel({ ctx, chain, turn, close }) {
         ${turns && turns.length === 0 && html`<div class="note">The history has no prompt for this session.</div>`}
         ${turns &&
         turns.map(
-          (entry) => html`<${Turn} key=${entry.id} ctx=${ctx} chain=${chain} entry=${entry} hit=${turn === entry.ordinal}
-            elRef=${turn === entry.ordinal ? hit : undefined} />`,
+          (entry) => {
+            const hit = turn === entry.ordinal;
+            // A new quote makes a new element, so a long text shows all of it.
+            return html`<${Turn} key=${`${entry.id}:${hit ? quote : ''}`} ctx=${ctx} chain=${chain} entry=${entry} hit=${hit}
+              quote=${hit ? quote : ''} scroll=${hit} />`;
+          },
         )}
         <div ref=${end}></div>
       </div>

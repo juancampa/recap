@@ -48,14 +48,43 @@ pub struct SessionNote {
     pub muted_turn: Option<usize>,
 }
 
-/// One turn of a session chain.
+/// What a referenced turn shows about an item.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefKind {
+    /// The turn where the work of the item was first named.
+    Origin,
+    /// The turn where an agent or the user said that the item is done.
+    Claim,
+    /// A turn that gives other facts about the item.
+    #[default]
+    Context,
+}
+
+impl RefKind {
+    fn is_context(&self) -> bool {
+        *self == RefKind::Context
+    }
+}
+
+/// A reference of an item: one turn of a session chain, and the sentence
+/// of the turn that is about the item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TurnRef {
     pub chain: String,
     /// The ordinal of the prompt in the chain, from 1.
     pub turn: usize,
+    #[serde(default, skip_serializing_if = "RefKind::is_context")]
+    pub kind: RefKind,
+    /// An exact excerpt of the prompt or of the response of the turn. It
+    /// occurs one time in the turn, so the web UI can mark the sentence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quote: String,
 }
+
+/// The maximum number of characters of [`TurnRef::quote`].
+pub const QUOTE_MAX: usize = 200;
 
 /// One item: a piece of work that an agent or the user must do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -109,7 +109,10 @@ An item is one piece of work that an agent or the user must do.
       "check": { "script": "prod-deploy-after", "args": ["app", "2026-11-06T07:55"] }
     },
     "due": "2026-11-07T12:00:00-08:00",
-    "refs": [{ "chain": "4f2a9c1e-0000-4000-8000-000000000000", "turn": 9 }]
+    "refs": [
+      { "chain": "4f2a9c1e-0000-4000-8000-000000000000", "turn": 9, "kind": "origin", "quote": "The worker stops on each upload larger than 1 MB" },
+      { "chain": "4f2a9c1e-0000-4000-8000-000000000000", "turn": 12, "kind": "claim", "quote": "PR 123 is merged" }
+    ]
 } }
 ```
 
@@ -139,8 +142,19 @@ The fields of an item:
 - `prompt`: for an item of the user that the user does with a message to the session of `chain`.
   Write the message as the user would write it to the agent. The user copies it into the session.
   Use `{placeholder}` for a value that only the user knows.
-- `refs`: the turns where the item came from, and the turns that show its state. Each entry has `chain` and `turn`.
-  The user opens these turns from the item. Always write the turn where the work was first named.
+- `refs`: the references of the item. Each reference names one sentence of a transcript that is about the item.
+  The user reads the references to get the full context of the item. The UI opens the turn and marks the sentence.
+  - `chain` and `turn`: the turn that holds the sentence.
+  - `kind`: what the sentence shows.
+    `origin`: an agent or the user first named the work. Always write this reference.
+    `claim`: an agent or the user said that the work is done. Always write this reference when you set `claimed`, when a turn holds the statement.
+    `context`: another fact about the item, for example a clarification, a decision of the user, or a new problem.
+  - `quote`: an exact excerpt of the prompt or of the response of the turn, with a maximum of 200 characters.
+    Copy 5 to 20 words of one sentence. Choose words that occur only one time in the turn.
+    Copy plain words: leave out a list number, a link address and a table.
+    The server refuses a quote that is not in the turn, or that occurs more than one time.
+    Leave `quote` out only when the history of the turn does not hold the sentence.
+  `refs` in `set` replaces the list. To add a reference, send the old references and the new one.
 - `status`:
   - `open`: the work is not done.
   - `claimed`: an agent said that the work is done, but no check confirms it. Write in `note` who said it, and when.
@@ -235,6 +249,7 @@ The run message lists the directories that you can use. Other directories need a
    - When the user must send a message to the session, write an item with the owner `user` and a `prompt`.
      Write a maximum of 3 such items for one session.
    - Update the items of the session. Set `claimed` only for an item that has no check.
+     Add a reference for each new statement about an item: a `claim`, or a `context`.
    - Update the session: `turn`, `summary`, and `topic` if it has none.
 6. Look at all the items that are not done, of all sessions, not only the stopped sessions.
    - When an agent prepares a deploy or a merge, find the open items that must come before it, also in other chains.
@@ -266,7 +281,7 @@ In a review run, do the normal steps for each agent of the last 24 hours, not on
    Do not write a session for an agent that needs nothing from the user.
 5. Give a topic to each session that has an open item and no topic, also the sessions that are older than 24 hours.
    Read the title and the open items of the session to find its goal. First group the sessions by goal, then make the topics.
-6. Complete the open items that have no `done_when`, no `refs`, or no `why` when the impact needs it.
+6. Complete the open items that have no `done_when`, no `refs`, a reference without `quote`, or no `why` when the impact needs it.
    For each item, find the facts in the transcript or the repository, and then do one of these:
    - Give the item all its fields and a check.
    - Set `dropped` with the reason when the work is no longer needed or is done in another way.

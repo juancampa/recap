@@ -248,6 +248,13 @@ impl Server {
         &self.inner.ui_token
     }
 
+    /// The prompt and the response of the turn `turn` of the chain `chain`.
+    pub(crate) fn turn_texts(&self, chain: &str, turn: usize) -> Option<(String, Option<String>)> {
+        let store = read(&self.inner.store);
+        let (prompt, response) = store.turn_texts(chain, turn)?;
+        Some((prompt.to_string(), response.map(str::to_string)))
+    }
+
     /// The agents by chain id, and the running session of each chain. For a
     /// chain with more than one running session, a session that waits comes
     /// before a busy session, and a busy session before an idle session.

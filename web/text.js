@@ -99,6 +99,43 @@ export function findRefs(text, look, repo) {
   return taken.sort((a, b) => a.start - b.start);
 }
 
+// The letters and the digits of `text` in lower case, and the index in
+// `text` of each of them. A quote of a transcript and the text of the page
+// are equal in this form: the Markdown signs and the white space are gone.
+function plainChars(text) {
+  let flat = '';
+  const indexes = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i].toLowerCase();
+    if (ch.length === 1 && /[\p{L}\p{N}]/u.test(ch)) {
+      flat += ch;
+      indexes.push(i);
+    }
+  }
+  return [flat, indexes];
+}
+
+// The range of the text `quote` in the element `root`, or null.
+export function quoteRange(root, quote) {
+  const [want] = plainChars(quote);
+  if (!want) return null;
+  let flat = '';
+  const places = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node; (node = walker.nextNode()); ) {
+    const [text, indexes] = plainChars(node.data);
+    flat += text;
+    for (const index of indexes) places.push([node, index]);
+  }
+  const at = flat.indexOf(want);
+  if (at < 0) return null;
+  const range = document.createRange();
+  range.setStart(places[at][0], places[at][1]);
+  const end = places[at + want.length - 1];
+  range.setEnd(end[0], end[1] + 1);
+  return range;
+}
+
 // The text that the page shows for a reference.
 function labelOf(ref, look) {
   if (ref.kind === 'topic') {
