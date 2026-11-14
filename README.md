@@ -176,8 +176,7 @@ The server runs the approved copy. A script that changed after the approval give
 
 | View | Content |
 |---|---|
-| Items | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic. The sessions that wait for you now are at the top. |
-| Topics | One block for each topic: its summary, its sessions with their current status, and its first open items. |
+| Items | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic or by session. The sessions that wait for you now are at the top. |
 | Checks | The check scripts, with the colors of their syntax. A script that waits for your approval shows its text or its diff, and an Approve button. The tab shows the number of scripts that wait. |
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 
@@ -203,10 +202,11 @@ The address of the page holds the navigation state, so the Back button and a rel
 
 | Part | Content |
 |---|---|
-| `/items`, `/topics`, `/checks`, `/activity` | The view. |
+| `/items`, `/checks`, `/activity` | The view. |
+| `?group=topic`, `?group=session` | The grouping of the Items view: one group for each topic, or one group for each session. |
 | `?q=<text>` | The text filter of the Items view. |
 | `?session=<chain>&turn=<n>` | The session in the session panel, and the turn that the panel marks. With `&ref=<item>/<index>`, the panel marks the quote of that reference of the item. |
-| `#<id>` | The object that the view shows and marks: an item in the Items view, a script in the Checks view, a topic in the Topics view. `#<topic>/<item>` shows one item of the topic. |
+| `#<id>` | The object that the view shows and marks: an item in the Items view, a script in the Checks view. `#topic:<id>` shows the group of a topic in the Items view. |
 
 The chat on the right side sends a message to triagent.
 Type `@` to name an item, a session or a topic, or use an "Ask triagent" button.
@@ -216,7 +216,7 @@ A reply lists the changes that triagent made to the triage data.
 
 | Key | Action |
 |---|---|
-| `1` to `4` | Show the Items, Topics, Checks or Activity view. |
+| `1` to `3` | Show the Items, Checks or Activity view. |
 | `j` / `k` | Move the selection. |
 | `Enter` | Show or hide the details of the selected item. |
 | `a` | Add the selected item to the chat message. |

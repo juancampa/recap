@@ -44,7 +44,7 @@ const WEB_FILES: &[(&str, &str, &str)] = &[
 
 /// The views of the web UI. The page is also at `/<view>`, so the address
 /// of a view works after a reload. `web/app.js` has the same list.
-const VIEWS: &[&str] = &["items", "topics", "checks", "activity"];
+const VIEWS: &[&str] = &["items", "checks", "activity"];
 
 /// A directory that holds the files of the web UI. With it, the server
 /// reads each file from the disk at each request, so a page reload shows a

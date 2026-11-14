@@ -1,4 +1,4 @@
-// The views of the triage web UI: Items, Topics, Checks, Activity, and the
+// The views of the triage web UI: Items, Checks, Activity, and the
 // session panel.
 
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
@@ -265,7 +265,7 @@ function ItemDetail({ ctx, item }) {
   `;
 }
 
-function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) {
+function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, showSession, elRef }) {
   const session = item.chain ? ctx.index.sessions.get(item.chain) : null;
   const topic = item.in_topic ? ctx.index.topics.get(item.in_topic) : null;
   const run = item.check_run;
@@ -287,13 +287,14 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
         ${showTopic &&
         html`<span class="topic">
           ${topic &&
-          html`<a class="chip tc" style=${topic.style} href=${`/topics#${topic.id}/${item.id}`} title="Show the item in its topic"
-            onClick=${(e) => !e.metaKey && !e.ctrlKey && (e.preventDefault(), ctx.go({ view: 'topics', q: '', hash: `${topic.id}/${item.id}` }))}>
+          html`<a class="chip tc" style=${topic.style} href=${`/items?group=topic#${item.id}`} title="Show the item with the other items of its topic"
+            onClick=${(e) => !e.metaKey && !e.ctrlKey && (e.preventDefault(), ctx.go({ group: 'topic', hash: item.id }))}>
             ${topic.title}
           </a>`}
         </span>`}
         <span class="meta">
           ${session &&
+          showSession &&
           html`<button class="chip" title=${session.summary || 'Open the session'}
               onClick=${(e) => (item.refs && item.refs.length ? openRef(ctx, item, item.refs.length - 1)(e) : (e.stopPropagation(), ctx.openSession(item.chain)))}>
               <span class=${`dot ${session.status || ''}`}></span>${sessionTitle(session)}
@@ -307,12 +308,15 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
 }
 
 // A list of items with a selection that the keys move.
-function ItemList({ ctx, items, sel, expanded, toggle, showTopic, rowRefs }) {
+// `group` is the grouping of the view: a list in a group does not show
+// the value that all its items have in common.
+function ItemList({ ctx, items, sel, expanded, toggle, group, rowRefs }) {
+  const showTopic = !group;
   return html`
     <div class=${`list ${showTopic ? 'cols' : ''}`}>
       ${items.map(
         (item) => html`<${ItemRow} key=${item.id} ctx=${ctx} item=${item} selected=${sel === item.id}
-          expanded=${expanded.has(item.id)} onToggle=${() => toggle(item.id)} showTopic=${showTopic}
+          expanded=${expanded.has(item.id)} onToggle=${() => toggle(item.id)} showTopic=${showTopic} showSession=${group !== 'session'}
           elRef=${(el) => (el ? rowRefs.current.set(item.id, el) : rowRefs.current.delete(item.id))} />`,
       )}
     </div>
@@ -340,16 +344,48 @@ function useSelection(name) {
 }
 
 const CollapseAll = ({ selection }) =>
-  html`<button onClick=${selection.collapseAll} disabled=${selection.expanded.size === 0} title="Hide the details of all the items">
-    Collapse all
+  html`<button class="icon" onClick=${selection.collapseAll} disabled=${selection.expanded.size === 0}
+    title="Hide the details of all the items" aria-label="Hide the details of all the items">
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 2l4 4 4-4M4 14l4-4 4 4" />
+    </svg>
   </button>`;
+
+// The keys of the Items view. The list shows when the pointer or the focus
+// is on the button.
+const Keys = () =>
+  html`<span class="keys">
+    <button class="icon" aria-label="Keyboard shortcuts">
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round">
+        <rect x="1.5" y="3.5" width="13" height="9" rx="1.5" />
+        <path d="M4 6.5h.01M6.7 6.5h.01M9.3 6.5h.01M12 6.5h.01M4 9.5h.01M12 9.5h.01M6.5 9.5h3" />
+      </svg>
+    </button>
+    <div class="pop">
+      <div><kbd>j</kbd> <kbd>k</kbd> Move the selection</div>
+      <div><kbd>Enter</kbd> Show or hide the details</div>
+      <div><kbd>a</kbd> Ask triagent about the item</div>
+      <div><kbd>/</kbd> Go to the filter</div>
+      <div><kbd>c</kbd> Go to the chat</div>
+      <div><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> Show a view</div>
+      <div><kbd>Esc</kbd> Close the session panel</div>
+    </div>
+  </span>`;
+
+// The groupings of the Items view. The address holds the grouping.
+const GROUPS = [
+  ['', 'None'],
+  ['topic', 'Topic'],
+  ['session', 'Session'],
+];
 
 // ── The Items view ──────────────────────────────────────────────────────────
 
 export function ItemsView({ ctx }) {
   const { state, index, route, go } = ctx;
   const [owner, setOwner] = useStored('items-owner', 'user');
-  const [grouped, setGrouped] = useStored('items-grouped', false);
+  const group = route.group;
+  const groupRefs = useRef(new Map());
   const [showMuted, setShowMuted] = useStored('items-muted', false);
   // The address holds the text filter.
   const query = route.q;
@@ -386,17 +422,21 @@ export function ItemsView({ ctx }) {
   const done = all.filter(closed);
   const doneShown = closedOpen ? done.slice(0, closedLimit) : [];
 
-  // The groups are in the order of the first item of each topic.
+  // The key of the group of an item: the topic or the session.
+  const keyOf = (item, by) => (by === 'topic' ? item.in_topic : item.chain) || '';
+  // The groups are in the order of the first item of each group.
   let groups = null;
-  if (grouped) {
-    const byTopic = new Map();
+  if (group) {
+    const byKey = new Map();
     for (const item of open) {
-      const key = item.in_topic || '';
-      if (!byTopic.has(key)) byTopic.set(key, []);
-      byTopic.get(key).push(item);
+      const key = keyOf(item, group);
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(item);
     }
-    groups = [...byTopic.entries()];
+    groups = [...byKey.entries()];
   }
+  // The address can name a topic, as `#topic:<id>`.
+  const hashTopic = route.hash.startsWith('topic:') ? route.hash.slice(6) : null;
 
   const order = [...(groups ? groups.flatMap(([, items]) => items) : open), ...doneShown].map((i) => i.id);
 
@@ -404,6 +444,23 @@ export function ItemsView({ ctx }) {
   useEffect(() => {
     const id = route.hash;
     if (!id) return;
+    if (hashTopic !== null) {
+      if (!index.topics.has(hashTopic)) return ctx.say(`No topic ${hashTopic}`, true);
+      if (group !== 'topic') go({ group: 'topic' }, true);
+      // Remove the filters when they hide all the items of the topic.
+      if (!open.some((i) => i.in_topic === hashTopic)) {
+        if (!state.items.some((i) => !closed(i) && i.in_topic === hashTopic)) return ctx.say('The topic has no open item');
+        setOwner('all');
+        setShowMuted(true);
+        if (query) setQuery('');
+      }
+      if (route.restore) return;
+      setTimeout(() => {
+        const el = groupRefs.current.get(hashTopic);
+        if (el) el.scrollIntoView({ block: 'start' });
+      }, 60);
+      return;
+    }
     const item = index.items.get(id);
     if (!item) return ctx.say(`No item ${id}`, true);
     // Remove only the filters that hide the item.
@@ -461,14 +518,17 @@ export function ItemsView({ ctx }) {
       <input type="text" placeholder="Filter ( / )" value=${query} ref=${filter}
         onInput=${(e) => setQuery(e.target.value)}
         onKeyDown=${(e) => e.key === 'Escape' && (setQuery(''), e.target.blur())} />
-      <label><input type="checkbox" checked=${grouped} onChange=${(e) => setGrouped(e.target.checked)} /> Group by topic</label>
+      <span class="label">Group</span>
+      <div class="seg">
+        ${GROUPS.map(([id, label]) => html`<button class=${group === id ? 'on' : ''} onClick=${() => go({ group: id }, true)}>${label}</button>`)}
+      </div>
       ${(mutedCount > 0 || showMuted) &&
       html`<label title="The items of the sessions that you muted">
         <input type="checkbox" checked=${showMuted} onChange=${(e) => setShowMuted(e.target.checked)} /> Muted (${mutedCount})
       </label>`}
-      <${CollapseAll} selection=${selection} />
       <span class="spacer"></span>
-      <span class="age" style="width:auto"><kbd>j</kbd> <kbd>k</kbd> move · <kbd>Enter</kbd> details · <kbd>a</kbd> ask · <kbd>c</kbd> chat</span>
+      <${Keys} />
+      <${CollapseAll} selection=${selection} />
     </div>
 
     ${waiting.length > 0 &&
@@ -487,19 +547,29 @@ export function ItemsView({ ctx }) {
 
     ${open.length === 0 && html`<div class="note">No open item passes the filter.</div>`}
     ${groups
-      ? groups.map(([topicId, items]) => {
-          const topic = index.topics.get(topicId);
-          return html`<div class="group" key=${topicId}>
+      ? groups.map(([key, items]) => {
+          const topic = group === 'topic' ? index.topics.get(key) : null;
+          const session = group === 'session' ? index.sessions.get(key) : null;
+          const sessionTopic = session && session.topic ? index.topics.get(session.topic) : null;
+          return html`<div class=${`group ${group === 'topic' && key === hashTopic ? 'marked' : ''}`} key=${key}
+            ref=${(el) => (el ? groupRefs.current.set(key, el) : groupRefs.current.delete(key))}>
             <h3>
-              ${topic ? html`<${TopicRef} topic=${topic} />` : html`<span class="title">No topic</span>`}
+              ${topic && html`<${TopicRef} topic=${topic} />`}
+              ${session &&
+              html`<button class="chip title" onClick=${() => ctx.openSession(key)} title="Show the session">
+                <span class=${`dot ${session.status || ''}`}></span>${sessionTitle(session)}
+              </button>`}
+              ${!topic && !session && html`<span class="title">${group === 'topic' ? 'No topic' : key ? short(key) : 'No session'}</span>`}
               <span>${items.length}</span>
-              <span class="sum">${topic ? topic.summary : ''}</span>
+              ${sessionTopic && html`<${TopicRef} topic=${sessionTopic} />`}
+              <span class="sum">${topic ? topic.summary : session ? `${session.status === 'waiting' ? `Waits for ${session.waiting_for || 'you'}. ` : ''}${session.summary || ''}` : ''}</span>
               ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triagent</button>`}
+              ${session && html`<button class="plain" onClick=${() => ctx.ask(`@session:${short(key)}`)}>Ask triagent</button>`}
             </h3>
-            <${ItemList} ...${listProps} items=${items} showTopic=${false} />
+            <${ItemList} ...${listProps} items=${items} group=${group} />
           </div>`;
         })
-      : open.length > 0 && html`<div class="group"><${ItemList} ...${listProps} items=${open} showTopic=${true} /></div>`}
+      : open.length > 0 && html`<div class="group"><${ItemList} ...${listProps} items=${open} group="" /></div>`}
 
     ${done.length > 0 &&
     html`<div class="group">
@@ -507,138 +577,20 @@ export function ItemsView({ ctx }) {
         <button class="plain" onClick=${() => setClosedOpen(!closedOpen)}>${closedOpen ? '▾' : '▸'} Closed (${done.length})</button>
       </h3>
       ${closedOpen &&
-      html`<${ItemList} ...${listProps} items=${doneShown} showTopic=${true} />
+      html`<${ItemList} ...${listProps} items=${doneShown} group="" />
         ${done.length > closedLimit && html`<div class="more"><button class="plain" onClick=${() => setClosedLimit(closedLimit + 200)}>Show more</button></div>`}`}
     </div>`}
   `;
 }
 
-// ── The Topics view ───────────────────────────────────────────────────────
-
-const STATUS_ORDER = { waiting: 0, busy: 1, idle: 2 };
-
-function SessionRow({ ctx, session, openCount }) {
-  return html`
-    <div class=${`srow ${session.muted ? 'muted' : ''}`} onClick=${() => ctx.openSession(session.chain)}>
-      <span class=${`dot ${session.status || ''}`} title=${session.status || 'The session does not run'}></span>
-      <span class="t">${sessionTitle(session)}</span>
-      <span class="s">${session.status === 'waiting' ? `Waits for ${session.waiting_for || 'you'}. ` : ''}${session.summary}</span>
-      <span class="meta" style="display:flex;gap:5px;align-items:center">
-        ${session.muted && html`<span class="chip">muted</span>`}
-        ${openCount > 0 && html`<span class="chip">${openCount} open</span>`}
-        <span class="age">${ago(session.last_ts)}</span>
-      </span>
-    </div>
-  `;
-}
-
-function TopicCard({ ctx, topic, sessions, items, marked, showItem, selection, elRef }) {
-  const [allItems, setAllItems] = useState(false);
-  const [showQuiet, setShowQuiet] = useState(false);
-  const open = items.filter((i) => !closed(i));
-  const countOf = (chain) => open.filter((i) => i.chain === chain).length;
-  const sorted = [...sessions].sort(
-    (a, b) =>
-      (STATUS_ORDER[a.status] ?? 3) - (STATUS_ORDER[b.status] ?? 3) || (b.last_ts || '').localeCompare(a.last_ts || ''),
-  );
-  // A quiet session is muted, or it does not run and has no open item.
-  const quiet = (s) => s.muted || (!s.status && countOf(s.chain) === 0);
-  const shownSessions = showQuiet ? sorted : sorted.filter((s) => !quiet(s));
-  const quietCount = sorted.length - sorted.filter((s) => !quiet(s)).length;
-  // The card shows all its items when the address names a later item.
-  const all = allItems || open.findIndex((i) => i.id === showItem) >= 5;
-  const shownItems = all ? open : open.slice(0, 5);
-  const count = (f) => open.filter(f).length;
-  // The repository of most of the sessions of the topic.
-  const repoCount = new Map();
-  sessions.forEach((s) => s.repo && repoCount.set(s.repo, (repoCount.get(s.repo) || 0) + 1));
-  const repo = [...repoCount.entries()].sort((a, b) => b[1] - a[1]).map(([r]) => r)[0];
-  return html`
-    <div class=${`topic-card ${marked ? 'marked' : ''}`} ref=${elRef}>
-      <header>
-        <h2 class=${topic ? 'tc' : ''} style=${topic ? topic.style : ''}>${topic ? topic.title : 'No topic'}</h2>
-        ${count((i) => i.impact === 'critical') > 0 && html`<span class="pill crit">${count((i) => i.impact === 'critical')} critical</span>`}
-        ${count((i) => i.impact === 'high') > 0 && html`<span class="pill high">${count((i) => i.impact === 'high')} high</span>`}
-        <span class="pill">${open.length} open</span>
-        ${count((i) => i.owner === 'user') > 0 && html`<span class="pill info">${count((i) => i.owner === 'user')} for you</span>`}
-        <span class="spacer"></span>
-        ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triagent</button>`}
-        ${topic && topic.summary && html`<div class="sum"><${Linked} key=${topic.summary} ctx=${ctx} text=${topic.summary} repo=${repo} /></div>`}
-      </header>
-      ${sorted.length > 0 &&
-      html`<div class="sessions">
-        ${shownSessions.map((s) => html`<${SessionRow} key=${s.chain} ctx=${ctx} session=${s} openCount=${countOf(s.chain)} />`)}
-        ${quietCount > 0 &&
-        html`<div class="more" style="padding-left:12px">
-          <button class="plain" onClick=${() => setShowQuiet(!showQuiet)}>
-            ${showQuiet ? 'Hide' : 'Show'} ${quietCount} sessions that are muted or have no open item
-          </button>
-        </div>`}
-      </div>`}
-      ${shownItems.length > 0 &&
-      html`<${ItemList} ctx=${ctx} items=${shownItems} sel=${selection.sel} expanded=${selection.expanded}
-        toggle=${selection.toggle} rowRefs=${selection.rowRefs} showTopic=${false} />`}
-      ${open.length > 5 &&
-      html`<div class="more"><button class="plain" onClick=${() => setAllItems(!all)}>${all ? 'Show the first 5 items' : `Show all the ${open.length} open items`}</button></div>`}
-    </div>
-  `;
-}
-
-export function TopicsView({ ctx }) {
-  const { state, route } = ctx;
-  const cards = useRef(new Map());
-  const selection = useSelection('topics');
-  // The hash is `<topic>` or `<topic>/<item>`.
-  const [hashTopic, hashItem] = route.hash.split('/');
-  // The priority of a topic is the place of its first open item.
-  const groups = useMemo(() => {
-    const byTopic = new Map(state.topics.map((t) => [t.id, { topic: t, sessions: [], items: [], first: Infinity }]));
-    const none = { topic: null, sessions: [], items: [], first: Infinity };
-    const group = (id) => byTopic.get(id) || none;
-    state.sessions.forEach((s) => group(s.topic).sessions.push(s));
-    state.items.forEach((item, at) => {
-      const g = group(item.in_topic);
-      g.items.push(item);
-      if (!closed(item)) g.first = Math.min(g.first, at);
-    });
-    const list = [...byTopic.values()].sort((a, b) => a.first - b.first || a.topic.title.localeCompare(b.topic.title));
-    if (none.sessions.length || none.items.length) list.push(none);
-    return list;
-  }, [state]);
-
-  // Show the topic of the address after each navigation.
-  useEffect(() => {
-    if (!hashTopic) return;
-    const card = cards.current.get(hashTopic);
-    if (!card) return ctx.say(`No topic ${hashTopic}`, true);
-    if (hashItem) {
-      selection.setSel(hashItem);
-      selection.expand(hashItem);
-    }
-    if (route.restore) return;
-    setTimeout(() => {
-      const row = hashItem && selection.rowRefs.current.get(hashItem);
-      if (row) row.scrollIntoView({ block: 'center' });
-      else card.scrollIntoView({ block: 'start' });
-    }, 60);
-  }, [route.seq]);
-
-  return html`
-    <div class="toolbar"><${CollapseAll} selection=${selection} /></div>
-    ${state.topics.length === 0 &&
-    html`<div class="note">
-      No session has a topic yet. Triagent gives each session a topic in the next review run.
-    </div>`}
-    ${groups.map(
-      (g) => html`<${TopicCard} key=${g.topic ? g.topic.id : ''} ctx=${ctx} topic=${g.topic} sessions=${g.sessions} items=${g.items}
-        marked=${g.topic && g.topic.id === hashTopic && !hashItem} showItem=${g.topic && g.topic.id === hashTopic ? hashItem : null}
-        selection=${selection}
-        elRef=${(el) => g.topic && (el ? cards.current.set(g.topic.id, el) : cards.current.delete(g.topic.id))} />`,
-    )}
-  `;
-}
-
 // ── The session panel ─────────────────────────────────────────────────────
+
+// The short end of an item id such as `7b6d7bd0-f1`: the part after the
+// session. An id that is a name has no short end.
+const idEnd = (id) => {
+  const end = id.match(/^[0-9a-f]{8}-([a-z0-9]{1,4})$/);
+  return end ? end[1] : '';
+};
 
 // `refName` names the reference of an item that the panel shows, as
 // `<item>/<index>`. The panel marks the quote of the reference in `turn`.
@@ -710,8 +662,12 @@ export function SessionPanel({ ctx, chain, turn, refName, written, width, close 
           ${REF_KIND[shown.kind || 'context']} of <a class="ref" data-kind="item" data-id=${refItem.id} href=${hrefOf('item', refItem.id)}>${refItem.text}</a>
           ${!quote && shown.quote ? ' (the reference is in another turn)' : ''}
         </span>`}
-        ${(allItems ? items : items.slice(0, 6)).map((i) => html`<a class="ref" data-kind="item" data-id=${i.id} href=${hrefOf('item', i.id)}>${i.impact === 'critical' || i.impact === 'high' ? `${i.impact}: ` : ''}${i.text}</a>`)}
-        ${items.length > 6 && html`<button class="plain" onClick=${() => setAllItems(!allItems)}>${allItems ? 'Show fewer items' : `+${items.length - 6} open items`}</button>`}
+        ${(allItems ? items : items.slice(0, 6)).map(
+          (i) => html`<a class="ref" data-kind="item" data-id=${i.id} href=${hrefOf('item', i.id)}>
+            ${i.impact === 'critical' || i.impact === 'high' ? `${i.impact}: ` : ''}${i.text}${idEnd(i.id) && html` <span class="id-end">${idEnd(i.id)}</span>`}
+          </a>`,
+        )}
+        ${items.length > 6 && html`<button class="chip" onClick=${() => setAllItems(!allItems)}>${allItems ? 'Show fewer items' : `+${items.length - 6} open items`}</button>`}
       </div>
       <div class="turns">
         ${error && html`<div class="note">${error}</div>`}

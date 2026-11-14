@@ -31,7 +31,7 @@ export function setTopicColors(state) {
 // The address of the page that shows a triage object.
 export function hrefOf(kind, id) {
   if (kind === 'item') return `/items#${encodeURIComponent(id)}`;
-  if (kind === 'topic') return `/topics#${encodeURIComponent(id)}`;
+  if (kind === 'topic') return `/items?group=topic#${encodeURIComponent(`topic:${id}`)}`;
   return `?session=${encodeURIComponent(id)}`;
 }
 

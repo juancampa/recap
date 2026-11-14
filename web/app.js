@@ -2,7 +2,7 @@
 // frame. The views are in views.js and the chat is in chat.js.
 
 import { html, render, useState, useEffect, useRef, useCallback, useMemo } from '/web/vendor/preact.js';
-import { ItemsView, TopicsView, ChecksView, ActivityView, SessionPanel, RefPopover } from '/web/views.js';
+import { ItemsView, ChecksView, ActivityView, SessionPanel, RefPopover } from '/web/views.js';
 import { Chat } from '/web/chat.js';
 import { lookup, setTopicColors } from '/web/text.js';
 
@@ -131,16 +131,15 @@ const RELOADED = Boolean(navigation && navigation.type === 'reload');
 // The address holds the navigation state:
 //   /<view>          the view (the server has the same list of views)
 //   ?q=<text>        the text filter of the Items view
+//   ?group=<name>    the grouping of the Items view: `topic` or `session`
 //   ?session=<chain> the session in the session panel, with `&turn=<n>`.
 //                    `&ref=<item>/<index>` names a reference of an item:
 //                    the panel marks the quote of the reference
 //   #<id>            the object that the view shows and marks: an item in
-//                    the Items view, a script in the Checks view, and a
-//                    topic in the Topics view (`#<topic>/<item>` shows
-//                    one item of the topic)
+//                    the Items view (`#topic:<id>` shows the group of a
+//                    topic), and a script in the Checks view
 const VIEWS = [
   ['items', 'Items'],
-  ['topics', 'Topics'],
   ['checks', 'Checks'],
   ['activity', 'Activity'],
 ];
@@ -155,6 +154,7 @@ function readRoute() {
   return {
     view,
     q: url.searchParams.get('q') || '',
+    group: ['topic', 'session'].find((g) => g === url.searchParams.get('group')) || '',
     session: url.searchParams.get('session') || null,
     turn: Number(url.searchParams.get('turn')) || null,
     ref: url.searchParams.get('ref') || null,
@@ -165,6 +165,7 @@ function readRoute() {
 function routeUrl(route) {
   const query = new URLSearchParams();
   if (route.q) query.set('q', route.q);
+  if (route.view === 'items' && route.group) query.set('group', route.group);
   if (route.session) query.set('session', route.session);
   if (route.session && route.turn) query.set('turn', String(route.turn));
   if (route.session && route.turn && route.ref) query.set('ref', route.ref);
@@ -343,7 +344,7 @@ function App() {
         go({ session: chain, turn: null, ref: null });
       },
       showItem: (id) => go({ view: 'items', q: '', hash: id }),
-      showTopic: (id) => go({ view: 'topics', q: '', hash: id }),
+      showTopic: (id) => go({ view: 'items', group: 'topic', q: '', hash: `topic:${id}` }),
       // Add a reference to the chat draft and move the focus to the chat.
       ask: (reference) => {
         setChatOpen(true);
@@ -523,7 +524,6 @@ function App() {
         <div class="main" ref=${main} onClick=${ctx.onRef} onScroll=${onScroll}>
           <div class="inner">
             ${view === 'items' && html`<${ItemsView} ctx=${ctx} />`}
-            ${view === 'topics' && html`<${TopicsView} ctx=${ctx} />`}
             ${view === 'checks' && html`<${ChecksView} ctx=${ctx} />`}
             ${view === 'activity' && html`<${ActivityView} ctx=${ctx} seen=${seen} setSeen=${setSeen} />`}
           </div>
