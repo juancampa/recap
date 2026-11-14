@@ -314,7 +314,7 @@ impl Server {
         let started = (|| -> anyhow::Result<()> {
             store.add_message(thread.id, "user", text, true)?;
             let reply = store.add_message(thread.id, "agent", "", false)?;
-            let prompt = chat_prompt(self, &handle, text);
+            let prompt = chat_prompt(self, &handle, thread.id, text);
             let (_, running) = self.chain_data();
             let mut dirs: BTreeSet<PathBuf> = running.values().filter_map(|r| r.cwd.clone()).collect();
             dirs.extend(self.recent_project_dirs());
@@ -349,11 +349,11 @@ impl Server {
 /// The user message of a chat reply: the text of the user, and the current
 /// data of each object that the text names with `@item:<id>`,
 /// `@session:<chain>` or `@topic:<id>`.
-fn chat_prompt(server: &Server, handle: &TriageHandle, text: &str) -> String {
+fn chat_prompt(server: &Server, handle: &TriageHandle, thread: i64, text: &str) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "Time: {}", Local::now().format("%Y-%m-%d %H:%M %:z (%A)"));
     let _ = writeln!(s, "recap server: http://127.0.0.1:{}", handle.config.port);
-    let _ = writeln!(s, "This is a chat message of the user (see \"Chat\").");
+    let _ = writeln!(s, "This is a chat message of the user (see \"Chat\"). The chat thread is {thread}.");
     let _ = writeln!(s);
     let _ = writeln!(s, "{text}");
     let Ok(state) = server.triage_state(&StateQuery::default()) else {

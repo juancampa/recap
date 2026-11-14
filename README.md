@@ -176,7 +176,7 @@ The server runs the approved copy. A script that changed after the approval give
 
 | View | Content |
 |---|---|
-| Now | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic. The sessions that wait for you now are at the top. |
+| Items | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic. The sessions that wait for you now are at the top. |
 | Topics | One block for each topic: its summary, its sessions with their current status, and its first open items. |
 | Checks | The check scripts, with the colors of their syntax. A script that waits for your approval shows its text or its diff, and an Approve button. The tab shows the number of scripts that wait. |
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
@@ -184,7 +184,7 @@ The server runs the approved copy. A script that changed after the approval give
 A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the turns that the item refers to.
 From the details you can confirm, reopen, drop or delete the item, change its impact or its owner, copy its prompt, and go to its session.
 A click on a session opens a panel with all the turns of the session, as the prompt and the final response of each turn. The list stays in place behind the panel.
-A closed item is dim and has a check mark. The closed items are in a group at the end of the Now view.
+A closed item is dim and has a check mark. The closed items are in a group at the end of the Items view.
 
 The page shows each reference in a text as a link:
 
@@ -197,10 +197,10 @@ The address of the page holds the navigation state, so the Back button and a rel
 
 | Part | Content |
 |---|---|
-| `/now`, `/topics`, `/checks`, `/activity` | The view. |
-| `?q=<text>` | The text filter of the Now view. |
+| `/items`, `/topics`, `/checks`, `/activity` | The view. |
+| `?q=<text>` | The text filter of the Items view. |
 | `?session=<chain>&turn=<n>` | The session in the session panel, and the turn that the panel marks. |
-| `#<id>` | The object that the view shows and marks: an item in the Now view, a topic in the Topics view, a script in the Checks view. |
+| `#<id>` | The object that the view shows and marks: an item in the Items view, a script in the Checks view, a topic in the Topics view. `#<topic>/<item>` shows one item of the topic. |
 
 The chat on the right side sends a message to triagent.
 Type `@` to name an item, a session or a topic, or use an "Ask triagent" button.
@@ -210,7 +210,7 @@ A reply lists the changes that triagent made to the triage data.
 
 | Key | Action |
 |---|---|
-| `1` to `4` | Show the Now, Topics, Checks or Activity view. |
+| `1` to `4` | Show the Items, Topics, Checks or Activity view. |
 | `j` / `k` | Move the selection. |
 | `Enter` | Show or hide the details of the selected item. |
 | `a` | Add the selected item to the chat message. |

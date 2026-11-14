@@ -118,6 +118,7 @@ The fields of an item:
 - `id`: a unique short name in kebab case. An id never changes.
 - `chain`: the chain id of the session that the item came from. Leave it out for an item that is not about one session.
 - `topic`: only for an item without `chain`. An item with `chain` takes the topic of its session.
+- `thread`: only for an item that you write in a chat (see "Chat"): the number of the chat thread.
 - `owner`: `agent` for the work that an agent must do, `user` for the work that only the user can do: a manual test, a deploy approval, a review, a decision.
   Write each piece of work as one item. Do not write the same work as an agent item and as a user item.
 - `text`: 1 to 8 words, for example "Test red button" or "Deploy gref fix to prod".
@@ -285,6 +286,12 @@ A chat message is not a run: do not do the steps of a run.
 - Name objects in the same form in your answer, for example `@item:upload-crash-fix`. The UI shows each name as a link.
 - When the user asks for a change of the triage data, make it with `/v1/triage/apply`, and say what you changed.
   When the user corrects you, change the data and write the rule in `memory.md` if it is true for many runs.
+- When your answer asks the user for an action or a decision, and the user must do it later, write it as an item.
+  No triage run reads the chat, so the request is lost without an item.
+  Give the item the owner `user`, no `chain`, a `topic`, and `thread` with the number of the chat thread of the message.
+  The web UI then shows a link from the item to this conversation.
+  Do not write an item for the approval of a check script: the web UI shows the scripts that wait.
+  When the user gives the answer in the chat, set the status of the item to `claimed` and write the answer in `note`.
 - The rules of a run apply: you only read the sessions and the repositories, and you only change the triage data and the triage directory.
 
 ## Rules

@@ -179,6 +179,7 @@ export function Chat({ ctx, handle, events }) {
 
   handle.current = {
     focus: () => input.current && input.current.focus(),
+    open: (id) => setThreadId(id),
     add: (reference) => {
       const el = input.current;
       const text = el ? el.value : draft;

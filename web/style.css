@@ -243,6 +243,7 @@ button.pill { border: none; }
   box-shadow: inset 0 0 0 var(--tc-line, 0) oklch(var(--tc-fg) var(--h) / 0.65);
 }
 h2.tc { border-radius: 5px; padding: 0 7px; }
+a.chip { text-decoration: none; }
 .chip.late { background: var(--crit-bg); color: var(--crit); font-weight: 650; }
 .chip.done { background: var(--ok-bg); color: var(--ok); }
 .chip.bad { background: var(--warn-bg); color: var(--warn); }
@@ -420,7 +421,7 @@ a.ref {
 
 /* The checks view and the activity view */
 .script { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; margin-bottom: 10px; }
-.script > header { display: flex; gap: 8px; align-items: center; padding: 6px 12px; }
+.script > header { display: flex; gap: 8px; align-items: center; padding: 6px 12px; cursor: pointer; }
 .script > header .n { font-family: var(--mono); font-weight: 600; color: var(--text); text-decoration: none; }
 .script pre { margin: 0; border-radius: 0 0 7px 7px; max-height: 380px; overflow: auto; white-space: pre; }
 .script pre .line { display: block; }

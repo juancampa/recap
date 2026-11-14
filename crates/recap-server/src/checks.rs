@@ -599,6 +599,7 @@ mod tests {
             id: id.to_string(),
             chain: None,
             topic: None,
+            thread: None,
             owner: Owner::Agent,
             text: "Fix it".to_string(),
             impact,

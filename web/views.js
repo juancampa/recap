@@ -1,8 +1,8 @@
-// The views of the triage web UI: Now, Topics, Checks, Activity, and the
+// The views of the triage web UI: Items, Topics, Checks, Activity, and the
 // session panel.
 
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
-import { api, closed, short, ago, until, clock, useStored } from '/web/app.js';
+import { api, closed, short, ago, until, clock, useStored, useSession } from '/web/app.js';
 import { markdown } from '/web/markdown.js';
 import { Linked, TopicRef, hrefOf } from '/web/text.js';
 import { highlight } from '/web/highlight.js';
@@ -176,6 +176,12 @@ function ItemDetail({ ctx, item }) {
             </button>
             ${' '}${session.summary && linked(session.summary)}
           </div>`}
+        ${item.thread &&
+        html`<div class="k">Chat</div>
+          <div class="v">
+            Triagent asked for this item in a chat.${' '}
+            <button onClick=${() => ctx.openThread(item.thread)}>Open the conversation</button>
+          </div>`}
         ${item.prompt &&
         html`<div class="k">Prompt</div>
           <div class="v">
@@ -241,7 +247,12 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
           ${!item.late && item.due && !closed(item) && html`<span class="chip">due ${until(item.due)}</span>`}
           ${!item.late && item.before && !closed(item) && html`<span class="chip" title=${`Before: ${item.before.event}`}>before ${item.before.event}</span>`}
           ${run && run.outcome !== 'not-done' && html`<span class=${`chip ${OUTCOME_CLASS[run.outcome]}`} title="The outcome of the check">${run.outcome}</span>`}
-          ${showTopic && topic && html`<span class="chip tc" style=${topic.style}>${topic.title}</span>`}
+          ${showTopic &&
+          topic &&
+          html`<a class="chip tc" style=${topic.style} href=${`/topics#${topic.id}/${item.id}`} title="Show the item in its topic"
+            onClick=${(e) => !e.metaKey && !e.ctrlKey && (e.preventDefault(), ctx.go({ view: 'topics', q: '', hash: `${topic.id}/${item.id}` }))}>
+            ${topic.title}
+          </a>`}
           ${session &&
           html`<button class="chip" title=${session.summary || 'Open the session'}
               onClick=${(e) => (e.stopPropagation(), ctx.openSession(item.chain, item.refs && item.refs.length ? item.refs[item.refs.length - 1].turn : undefined))}>
@@ -268,41 +279,44 @@ function ItemList({ ctx, items, sel, expanded, toggle, showTopic, rowRefs }) {
   `;
 }
 
-// The selection and the expanded items of a view.
-function useSelection() {
+// The selection and the expanded items of the view `name`. The browser
+// keeps the expanded items for this tab, so a reload shows them again.
+function useSelection(name) {
   const [sel, setSel] = useState(null);
-  const [expanded, setExpanded] = useState(() => new Set());
+  const [list, setList] = useSession(`expanded:${name}`, []);
+  const expanded = useMemo(() => new Set(list), [list]);
   const rowRefs = useRef(new Map());
   const toggle = (id) => {
     setSel(id);
-    setExpanded((old) => {
-      const next = new Set(old);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+    setList(expanded.has(id) ? list.filter((x) => x !== id) : [...list, id]);
   };
-  const expand = (id) => setExpanded((old) => new Set(old).add(id));
+  const expand = (id) => !expanded.has(id) && setList([...list, id]);
+  const collapseAll = () => setList([]);
   const scrollTo = (id) => {
     const el = rowRefs.current.get(id);
     if (el) el.scrollIntoView({ block: 'nearest' });
   };
-  return { sel, setSel, expanded, toggle, expand, rowRefs, scrollTo };
+  return { sel, setSel, expanded, toggle, expand, collapseAll, rowRefs, scrollTo };
 }
 
-// ── The Now view ──────────────────────────────────────────────────────────
+const CollapseAll = ({ selection }) =>
+  html`<button onClick=${selection.collapseAll} disabled=${selection.expanded.size === 0} title="Hide the details of all the items">
+    Collapse all
+  </button>`;
 
-export function NowView({ ctx }) {
+// ── The Items view ──────────────────────────────────────────────────────────
+
+export function ItemsView({ ctx }) {
   const { state, index, route, go } = ctx;
-  const [owner, setOwner] = useStored('now-owner', 'user');
-  const [grouped, setGrouped] = useStored('now-grouped', false);
-  const [showMuted, setShowMuted] = useStored('now-muted', false);
+  const [owner, setOwner] = useStored('items-owner', 'user');
+  const [grouped, setGrouped] = useStored('items-grouped', false);
+  const [showMuted, setShowMuted] = useStored('items-muted', false);
   // The address holds the text filter.
   const query = route.q;
   const setQuery = (q) => go({ q }, true);
-  const [closedOpen, setClosedOpen] = useState(false);
+  const [closedOpen, setClosedOpen] = useSession('items-closed-open', false);
   const [closedLimit, setClosedLimit] = useState(50);
-  const selection = useSelection();
+  const selection = useSelection('items');
   const { sel, setSel, expanded, expand, rowRefs, scrollTo } = selection;
   const filter = useRef(null);
   // The address holds the item that the user opened last.
@@ -362,6 +376,7 @@ export function NowView({ ctx }) {
     }
     setSel(id);
     expand(id);
+    if (route.restore) return;
     setTimeout(() => {
       const el = rowRefs.current.get(id);
       if (el) el.scrollIntoView({ block: 'center' });
@@ -411,6 +426,7 @@ export function NowView({ ctx }) {
       html`<label title="The items of the sessions that you muted">
         <input type="checkbox" checked=${showMuted} onChange=${(e) => setShowMuted(e.target.checked)} /> Muted (${mutedCount})
       </label>`}
+      <${CollapseAll} selection=${selection} />
       <span class="spacer"></span>
       <span class="age" style="width:auto"><kbd>j</kbd> <kbd>k</kbd> move · <kbd>Enter</kbd> details · <kbd>a</kbd> ask · <kbd>c</kbd> chat</span>
     </div>
@@ -476,8 +492,7 @@ function SessionRow({ ctx, session, openCount }) {
   `;
 }
 
-function TopicCard({ ctx, topic, sessions, items, marked, elRef }) {
-  const selection = useSelection();
+function TopicCard({ ctx, topic, sessions, items, marked, showItem, selection, elRef }) {
   const [allItems, setAllItems] = useState(false);
   const [showQuiet, setShowQuiet] = useState(false);
   const open = items.filter((i) => !closed(i));
@@ -490,7 +505,9 @@ function TopicCard({ ctx, topic, sessions, items, marked, elRef }) {
   const quiet = (s) => s.muted || (!s.status && countOf(s.chain) === 0);
   const shownSessions = showQuiet ? sorted : sorted.filter((s) => !quiet(s));
   const quietCount = sorted.length - sorted.filter((s) => !quiet(s)).length;
-  const shownItems = allItems ? open : open.slice(0, 5);
+  // The card shows all its items when the address names a later item.
+  const all = allItems || open.findIndex((i) => i.id === showItem) >= 5;
+  const shownItems = all ? open : open.slice(0, 5);
   const count = (f) => open.filter(f).length;
   // The repository of most of the sessions of the topic.
   const repoCount = new Map();
@@ -522,7 +539,7 @@ function TopicCard({ ctx, topic, sessions, items, marked, elRef }) {
       html`<${ItemList} ctx=${ctx} items=${shownItems} sel=${selection.sel} expanded=${selection.expanded}
         toggle=${selection.toggle} rowRefs=${selection.rowRefs} showTopic=${false} />`}
       ${open.length > 5 &&
-      html`<div class="more"><button class="plain" onClick=${() => setAllItems(!allItems)}>${allItems ? 'Show the first 5 items' : `Show all the ${open.length} open items`}</button></div>`}
+      html`<div class="more"><button class="plain" onClick=${() => setAllItems(!all)}>${all ? 'Show the first 5 items' : `Show all the ${open.length} open items`}</button></div>`}
     </div>
   `;
 }
@@ -530,6 +547,9 @@ function TopicCard({ ctx, topic, sessions, items, marked, elRef }) {
 export function TopicsView({ ctx }) {
   const { state, route } = ctx;
   const cards = useRef(new Map());
+  const selection = useSelection('topics');
+  // The hash is `<topic>` or `<topic>/<item>`.
+  const [hashTopic, hashItem] = route.hash.split('/');
   // The priority of a topic is the place of its first open item.
   const groups = useMemo(() => {
     const byTopic = new Map(state.topics.map((t) => [t.id, { topic: t, sessions: [], items: [], first: Infinity }]));
@@ -548,20 +568,31 @@ export function TopicsView({ ctx }) {
 
   // Show the topic of the address after each navigation.
   useEffect(() => {
-    if (!route.hash) return;
-    const el = cards.current.get(route.hash);
-    if (el) el.scrollIntoView({ block: 'start' });
-    else ctx.say(`No topic ${route.hash}`, true);
+    if (!hashTopic) return;
+    const card = cards.current.get(hashTopic);
+    if (!card) return ctx.say(`No topic ${hashTopic}`, true);
+    if (hashItem) {
+      selection.setSel(hashItem);
+      selection.expand(hashItem);
+    }
+    if (route.restore) return;
+    setTimeout(() => {
+      const row = hashItem && selection.rowRefs.current.get(hashItem);
+      if (row) row.scrollIntoView({ block: 'center' });
+      else card.scrollIntoView({ block: 'start' });
+    }, 60);
   }, [route.seq]);
 
   return html`
+    <div class="toolbar"><${CollapseAll} selection=${selection} /></div>
     ${state.topics.length === 0 &&
     html`<div class="note">
       No session has a topic yet. Triagent gives each session a topic in the next review run.
     </div>`}
     ${groups.map(
       (g) => html`<${TopicCard} key=${g.topic ? g.topic.id : ''} ctx=${ctx} topic=${g.topic} sessions=${g.sessions} items=${g.items}
-        marked=${g.topic && g.topic.id === route.hash}
+        marked=${g.topic && g.topic.id === hashTopic && !hashItem} showItem=${g.topic && g.topic.id === hashTopic ? hashItem : null}
+        selection=${selection}
         elRef=${(el) => g.topic && (el ? cards.current.set(g.topic.id, el) : cards.current.delete(g.topic.id))} />`,
     )}
   `;
@@ -666,7 +697,7 @@ function Script({ ctx, script, reload, marked, elRef }) {
   );
   return html`
     <div class=${`script ${marked ? 'marked' : ''}`} ref=${elRef}>
-      <header>
+      <header onClick=${(e) => !e.target.closest('a, button') && setOpen(!open)} title=${open ? 'Hide the script' : 'Show the script'}>
         <button class="plain" onClick=${() => setOpen(!open)}>${open ? '▾' : '▸'}</button>
         <a class="n" href=${`/checks#${encodeURIComponent(script.name)}`}
           onClick=${(e) => (e.preventDefault(), ctx.go({ view: 'checks', hash: script.name }))}>${script.name}</a>
@@ -730,7 +761,9 @@ const brief = (value) => {
 
 export function ChangeText({ change }) {
   if (!change.field) return html`<span>${change.new !== undefined ? 'new' : 'deleted'}</span>`;
-  return html`<span><span class="f">${change.field}:</span> ${change.old !== undefined ? `${brief(change.old)} → ` : ''}${brief(change.new)}</span>`;
+  // The check runner writes the outcome of a check or of an event.
+  const field = { check_run: 'check outcome', event_run: 'event outcome' }[change.field] || change.field;
+  return html`<span><span class="f">${field}:</span> ${change.old !== undefined ? `${brief(change.old)} → ` : ''}${brief(change.new)}</span>`;
 }
 
 export function showChange(ctx, change) {
@@ -780,7 +813,7 @@ export function ActivityView({ ctx, seen, setSeen }) {
       ${shown.map(
         (c) => html`<div class=${`change ${seenAtOpen.current !== null && c.seq > seenAtOpen.current ? 'new' : ''}`} key=${c.seq}>
           <span class="when">${clock(c.at)}</span>
-          <span class="who">${c.actor === 'user' ? 'you' : c.actor}</span>
+          <span class="who">${c.actor === 'user' ? 'you' : c.actor === 'runner' ? 'check runner' : c.actor}</span>
           <span class="oid" title=${c.id} onClick=${() => showChange(ctx, c)}>${changeLabel(ctx, c)}</span>
           <span class="what" title=${c.field ? `${brief(c.old)} → ${brief(c.new)}` : ''}><${ChangeText} change=${c} /></span>
         </div>`,

@@ -154,9 +154,24 @@ impl TriageStore {
 
     /// Write the check results of the item `id`. Only the check runner
     /// calls it.
+    ///
+    /// A new outcome of the check or of the event check gives a change row
+    /// of the runner, in the field `check_run` or `event_run` of the item.
     pub fn put_results(&self, id: &str, results: &ItemResults) -> anyhow::Result<()> {
         let conn = self.conn();
+        let old: ItemResults = get(&conn, RESULT, id)?
+            .and_then(|json| serde_json::from_value(Value::Object(json)).ok())
+            .unwrap_or_default();
         put(&conn, RESULT, id, &serde_json::to_value(results)?)?;
+        for (field, old, new) in [("check_run", &old.check, &results.check), ("event_run", &old.event, &results.event)] {
+            let outcome = |run: &Option<recap_api::triage::CheckRun>| run.as_ref().and_then(|r| serde_json::to_string(&r.outcome).ok());
+            if outcome(old) != outcome(new) {
+                conn.execute(
+                    "INSERT INTO changes (at, actor, kind, id, field, old, new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![Local::now().to_rfc3339(), actor_word(Actor::Runner), ITEM, id, field, outcome(old), outcome(new)],
+                )?;
+            }
+        }
         bump(&conn)?;
         Ok(())
     }
@@ -500,6 +515,10 @@ fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> a
                 anyhow::ensure!(item.chain.is_none(), "an item with `chain` takes the topic of its session: remove `topic`");
                 anyhow::ensure!(exists(conn, TOPIC, topic), "no topic `{topic}`: make the topic first");
             }
+            if let Some(thread) = item.thread {
+                let found: i64 = conn.query_row("SELECT COUNT(*) FROM chat_threads WHERE id = ?1", [thread], |r| r.get(0))?;
+                anyhow::ensure!(found == 1, "no chat thread {thread}");
+            }
             let specs = [item.check.as_ref(), item.before.as_ref().and_then(|b| b.check.as_ref())];
             for spec in specs.into_iter().flatten() {
                 anyhow::ensure!(valid_script_name(&spec.script), "`{}` is not a valid script name", spec.script);
@@ -674,6 +693,7 @@ fn import_legacy(store: &TriageStore, dir: &Path) -> anyhow::Result<Option<Strin
                 id: id.clone(),
                 chain: Some(chain.clone()),
                 topic: None,
+                thread: None,
                 owner: Owner::User,
                 text: title.trim().to_string(),
                 impact,
@@ -838,6 +858,33 @@ mod tests {
         // A `null` removes the field.
         store.apply(Actor::User, &batch(json!([item_op("a", json!({"note": null}))])));
         assert_eq!(store.items()[0].note, "");
+    }
+
+    #[test]
+    fn a_new_check_outcome_gives_a_change_row_of_the_runner() {
+        use recap_api::triage::{CheckRun, CheckSpec, Outcome};
+        let store = TriageStore::in_memory().unwrap();
+        let run = |outcome| ItemResults {
+            check: Some(CheckRun {
+                spec: CheckSpec { script: "pr-merged".to_string(), args: Vec::new() },
+                sha256: String::new(),
+                outcome,
+                at: Local::now(),
+                exit: None,
+                output: String::new(),
+            }),
+            ..Default::default()
+        };
+        store.put_results("a", &run(Outcome::NotDone)).unwrap();
+        // The same outcome gives no row.
+        store.put_results("a", &run(Outcome::NotDone)).unwrap();
+        store.put_results("a", &run(Outcome::Done)).unwrap();
+        let changes = store.changes_after(0, 10);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|c| c.actor == Actor::Runner && c.field == "check_run" && c.id == "a"));
+        assert_eq!(changes[0].old, None);
+        assert_eq!(changes[1].old, Some(json!("not-done")));
+        assert_eq!(changes[1].new, Some(json!("done")));
     }
 
     #[test]

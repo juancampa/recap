@@ -71,6 +71,10 @@ pub struct Item {
     /// an item with a chain is the topic of its session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The id of the chat thread where triagent asked the user for the
+    /// work of the item. The web UI shows a link to the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<i64>,
     pub owner: Owner,
     /// 1 to 8 words.
     pub text: String,
@@ -520,6 +524,7 @@ mod tests {
             id: "a".to_string(),
             chain: None,
             topic: None,
+            thread: None,
             owner: Owner::Agent,
             text: "Fix it".to_string(),
             impact: Impact::High,

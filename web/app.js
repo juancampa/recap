@@ -2,7 +2,7 @@
 // frame. The views are in views.js and the chat is in chat.js.
 
 import { html, render, useState, useEffect, useRef, useCallback, useMemo } from '/web/vendor/preact.js';
-import { NowView, TopicsView, ChecksView, ActivityView, SessionPanel, RefPopover } from '/web/views.js';
+import { ItemsView, TopicsView, ChecksView, ActivityView, SessionPanel, RefPopover } from '/web/views.js';
 import { Chat } from '/web/chat.js';
 import { lookup, setTopicColors } from '/web/text.js';
 
@@ -83,17 +83,44 @@ export function useStored(key, fallback) {
   return [value, set];
 }
 
+// A state value that the browser keeps for this tab. A reload keeps it.
+export function useSession(key, fallback) {
+  const [value, setValue] = useState(() => {
+    try {
+      const text = sessionStorage.getItem(key);
+      return text === null ? fallback : JSON.parse(text);
+    } catch {
+      return fallback;
+    }
+  });
+  const set = useCallback(
+    (next) => {
+      setValue(next);
+      try {
+        sessionStorage.setItem(key, JSON.stringify(next));
+      } catch {}
+    },
+    [key],
+  );
+  return [value, set];
+}
+
+// True when the user loaded the page again.
+const navigation = performance.getEntriesByType('navigation')[0];
+const RELOADED = Boolean(navigation && navigation.type === 'reload');
+
 // ── The address of the page ───────────────────────────────────────────────
 
 // The address holds the navigation state:
 //   /<view>          the view (the server has the same list of views)
-//   ?q=<text>        the text filter of the Now view
+//   ?q=<text>        the text filter of the Items view
 //   ?session=<chain> the session in the session panel, with `&turn=<n>`
 //   #<id>            the object that the view shows and marks: an item in
-//                    the Now view, a topic in the Topics view, a script in
-//                    the Checks view
+//                    the Items view, a script in the Checks view, and a
+//                    topic in the Topics view (`#<topic>/<item>` shows
+//                    one item of the topic)
 const VIEWS = [
-  ['now', 'Now'],
+  ['items', 'Items'],
   ['topics', 'Topics'],
   ['checks', 'Checks'],
   ['activity', 'Activity'],
@@ -101,7 +128,7 @@ const VIEWS = [
 
 function readRoute() {
   const url = new URL(location.href);
-  const view = VIEWS.map(([id]) => id).find((id) => url.pathname === `/${id}`) || 'now';
+  const view = VIEWS.map(([id]) => id).find((id) => url.pathname === `/${id}`) || 'items';
   let hash = url.hash.slice(1);
   try {
     hash = decodeURIComponent(hash);
@@ -128,17 +155,20 @@ function routeUrl(route) {
 // new value at each navigation, but not at a change with `replace`. A view
 // shows the object of the hash again when `seq` changes.
 function useRoute() {
-  const [route, setRoute] = useState(() => ({ ...readRoute(), seq: 0 }));
+  // `restore` is true after a reload and after a Back or Forward step of
+  // the browser. Then the page shows the scroll position that the view had
+  // before, and does not scroll to the object of the hash.
+  const [route, setRoute] = useState(() => ({ ...readRoute(), seq: 0, restore: RELOADED }));
   const current = useRef(route);
   current.current = route;
   useEffect(() => {
-    const onPop = () => setRoute({ ...readRoute(), seq: current.current.seq + 1 });
+    const onPop = () => setRoute({ ...readRoute(), seq: current.current.seq + 1, restore: true });
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
   const go = useCallback((change, replace) => {
     const old = current.current;
-    const next = { ...old, ...change, seq: replace ? old.seq : old.seq + 1 };
+    const next = { ...old, ...change, seq: replace ? old.seq : old.seq + 1, restore: replace ? old.restore : false };
     if (routeUrl(next) !== routeUrl(old)) {
       if (replace) history.replaceState(null, '', routeUrl(next));
       else history.pushState(null, '', routeUrl(next));
@@ -167,6 +197,7 @@ function App() {
   // The reference under the pointer: `{kind, id, rect}`.
   const [hover, setHover] = useState(null);
   const chat = useRef(null);
+  const main = useRef(null);
   const chatEvents = useRef(new Set());
 
   const say = useCallback((text, isError) => {
@@ -264,12 +295,17 @@ function App() {
       setItem: (id, set) => apply([{ op: 'item', id, set }]),
       setSession: (chain, set) => apply([{ op: 'session', chain, set }]),
       openSession: (chain, turn) => go({ session: chain, turn: turn || null }),
-      showItem: (id) => go({ view: 'now', q: '', hash: id }),
+      showItem: (id) => go({ view: 'items', q: '', hash: id }),
       showTopic: (id) => go({ view: 'topics', q: '', hash: id }),
       // Add a reference to the chat draft and move the focus to the chat.
       ask: (reference) => {
         setChatOpen(true);
         setTimeout(() => chat.current && chat.current.add(reference), 0);
+      },
+      // Show the chat thread `id`.
+      openThread: (id) => {
+        setChatOpen(true);
+        setTimeout(() => chat.current && chat.current.open(id), 0);
       },
       goToSession: (chain) =>
         api
@@ -307,6 +343,28 @@ function App() {
   };
   const onOut = (event) => {
     if (event.target.closest && event.target.closest('a.ref')) setHover(null);
+  };
+
+  // Each view keeps its scroll position for this tab. A view shows it
+  // again, unless the address names an object to show.
+  const loaded = Boolean(state);
+  useEffect(() => {
+    if (!loaded || (route.hash && !route.restore)) return;
+    let top = 0;
+    try {
+      top = Number(sessionStorage.getItem(`scroll:${view}`)) || 0;
+    } catch {}
+    const restore = () => main.current && (main.current.scrollTop = top);
+    restore();
+    // The views that load data get their full height later.
+    const timer = setTimeout(restore, 250);
+    return () => clearTimeout(timer);
+  }, [view, loaded, route.seq]);
+  const onScroll = (event) => {
+    if (event.target !== main.current) return;
+    try {
+      sessionStorage.setItem(`scroll:${view}`, String(main.current.scrollTop));
+    } catch {}
   };
 
   const openView = (id) => go({ view: id, q: '', hash: '', session: null, turn: null });
@@ -389,9 +447,9 @@ function App() {
         <button class="plain" onClick=${() => setChatOpen(!chatOpen)} title="Show or hide the chat (c)">${chatOpen ? 'Hide chat' : 'Chat'}</button>
       </div>
       <div class="body">
-        <div class="main" onClick=${ctx.onRef}>
+        <div class="main" ref=${main} onClick=${ctx.onRef} onScroll=${onScroll}>
           <div class="inner">
-            ${view === 'now' && html`<${NowView} ctx=${ctx} />`}
+            ${view === 'items' && html`<${ItemsView} ctx=${ctx} />`}
             ${view === 'topics' && html`<${TopicsView} ctx=${ctx} />`}
             ${view === 'checks' && html`<${ChecksView} ctx=${ctx} />`}
             ${view === 'activity' && html`<${ActivityView} ctx=${ctx} seen=${seen} setSeen=${setSeen} />`}
