@@ -24,6 +24,7 @@ use crate::checks::{Checker, Notice};
 use crate::session::RunningSessions;
 use crate::triage_store::TriageStore;
 use chrono::{DateTime, Local};
+use recap_api::triage::Model;
 use recap_api::{RunningSession, TriageRun, TriageStatus};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -142,8 +143,9 @@ pub struct Triage {
     config: TriageConfig,
     /// The stops that wait for the next run.
     pending: Vec<Stop>,
-    /// True when the next run is a review of the agents of the last 24 hours.
-    review: bool,
+    /// The model of the review of the agents of the last 24 hours, when the
+    /// next run is a review.
+    review: Option<Model>,
     run: Option<Run>,
     /// The last run that ended.
     last: Option<TriageRun>,
@@ -166,7 +168,7 @@ impl Triage {
         let next_run = read_next_run(&dir);
         let store = Arc::new(TriageStore::open(&dir)?);
         store.end_open_messages()?;
-        let review = store.sessions().is_empty();
+        let review = store.sessions().is_empty().then(Model::default);
         let checker = Checker::new(
             dir.clone(),
             Arc::clone(&store),
@@ -200,17 +202,18 @@ impl Triage {
         TriageStatus {
             dir: self.config.dir.clone(),
             pending: self.pending.len(),
-            review: self.review,
+            review: self.review.is_some(),
             next_run: self.next_run.map(DateTime::<Local>::from),
             run: self.run.as_ref().map(Run::info).or_else(|| self.last.clone()),
             unapproved: self.checker.unapproved().to_vec(),
         }
     }
 
-    /// Make the next run a review of the agents of the last 24 hours.
-    pub fn request_review(&mut self) {
-        log::info!("triage: a client asked for a review");
-        self.review = true;
+    /// Make the next run a review of the agents of the last 24 hours, with
+    /// `model`.
+    pub fn request_review(&mut self, model: Model) {
+        log::info!("triage: a client asked for a review with {}", model.as_str());
+        self.review = Some(model);
     }
 
     /// Add stops for the next run. The runner ignores the stops of its own
@@ -299,19 +302,23 @@ impl Triage {
         }
         let scheduled = self.next_run.is_some_and(|t| SystemTime::now() >= t);
         let urgent = self.notices.iter().any(|n| n.urgent);
-        if self.pending.is_empty() && !scheduled && !self.review && !urgent {
+        if self.pending.is_empty() && !scheduled && self.review.is_none() && !urgent {
             return changed;
         }
         if self.config.paused {
             self.pending.clear();
             self.notices.clear();
-            self.review = false;
+            self.review = None;
             self.next_run = None;
             return changed;
         }
         let stops = std::mem::take(&mut self.pending);
         let notices = std::mem::take(&mut self.notices);
-        let review = std::mem::take(&mut self.review);
+        // A review run uses the model that the user chose. Each other run
+        // uses the default model.
+        let model = self.review.take();
+        let review = model.is_some();
+        let model = model.unwrap_or_default();
         // A scheduled run uses its time. Without a new `next-run` file, the
         // next run waits for a stop.
         self.next_run = None;
@@ -319,6 +326,7 @@ impl Triage {
         let prompt = run_prompt(&self.config, &stops, &notices, review, running, &dirs);
         let info = |session_id: String| TriageRun {
             session_id,
+            model,
             started: Local::now(),
             stops: stops.len(),
             review,
@@ -350,7 +358,7 @@ impl Triage {
     }
 
     fn start(&self, prompt: &str, repo_dirs: &BTreeSet<PathBuf>, info: TriageRun) -> anyhow::Result<Run> {
-        let mut child = agent_command(&self.config, repo_dirs)
+        let mut child = agent_command(&self.config, repo_dirs, info.model)
             // The clients find the transcript of the run by this id.
             .args(["--session-id", &info.session_id])
             .stdin(Stdio::piped())
@@ -398,11 +406,11 @@ impl Triage {
 /// reply. The caller adds the session option, and writes the prompt to
 /// stdin: `--allowedTools` takes all the arguments that follow it, so the
 /// prompt cannot be an argument.
-pub(crate) fn agent_command(config: &TriageConfig, repo_dirs: &BTreeSet<PathBuf>) -> Command {
+pub(crate) fn agent_command(config: &TriageConfig, repo_dirs: &BTreeSet<PathBuf>, model: Model) -> Command {
     let mut command = Command::new(&config.claude);
     command
         .current_dir(&config.dir)
-        .args(["-p", "--model", "opus", "--append-system-prompt", INSTRUCTIONS])
+        .args(["-p", "--model", model.as_str(), "--append-system-prompt", INSTRUCTIONS])
         // The sandbox of Claude Code refuses the connections to the recap
         // server. The allowed tools limit the run instead.
         .args(["--settings", r#"{"sandbox":{"enabled":false}}"#])

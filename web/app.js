@@ -29,6 +29,17 @@ export const api = {
   post: (path) => request(path, { method: 'POST' }),
 };
 
+// The models that triagent can use for a review run and for a chat reply.
+// The first one is the model of each other run.
+export const MODELS = ['opus', 'fable', 'sonnet', 'haiku'];
+
+// The selector of one of `MODELS`.
+export function ModelSelect({ value, set, title }) {
+  return html`<select class="model" value=${value} title=${title} onChange=${(e) => set(e.target.value)}>
+    ${MODELS.map((m) => html`<option value=${m}>${m}</option>`)}
+  </select>`;
+}
+
 // ── Helpers that the views share ──────────────────────────────────────────
 
 export const closed = (item) => ['verified', 'confirmed', 'dropped'].includes(item.state);
@@ -196,6 +207,7 @@ function App() {
   const [route, go] = useRoute();
   const view = route.view;
   const [chatOpen, setChatOpen] = useStored('chat-open', true);
+  const [reviewModel, setReviewModel] = useStored('review-model', MODELS[0]);
   const [seen, setSeen] = useStored('seen-change', null);
   const [toast, setToast] = useState(null);
   // The reference under the pointer: `{kind, id, rect}`.
@@ -439,16 +451,18 @@ function App() {
         <span class="spacer"></span>
         <span class=${`runner ${active ? 'active' : ''}`} title=${run && run.activity ? run.activity : ''}>
           ${active
-            ? `Triagent run: ${run.activity || 'started'}`
+            ? `Triagent ${run.review ? 'review ' : ''}run${run.model === MODELS[0] ? '' : ` with ${run.model}`}: ${run.activity || 'started'}`
             : status && status.next_run
               ? `Next triagent run ${until(status.next_run)}`
               : run
                 ? `Last triagent run ${ago(run.ended)} ago${run.success ? '' : ' (failed)'}`
                 : 'No triagent run yet'}
         </span>
-        <button class="plain" onClick=${() => api.post('/v1/triage/review').then(() => say('Asked for a review run'), (e) => say(e.message, true))} title="Ask triagent to read all the sessions of the last 24 hours">
+        <button class="plain" onClick=${() => api.post(`/v1/triage/review?model=${reviewModel}`).then(() => say(`Asked for a review run with ${reviewModel}`), (e) => say(e.message, true))}
+          title="Ask triagent to read all the sessions of the last 24 hours, and to complete the open items">
           Review
         </button>
+        <${ModelSelect} value=${reviewModel} set=${setReviewModel} title="The model of the review run" />
         <button class="plain" onClick=${() => setChatOpen(!chatOpen)} title="Show or hide the chat (c)">${chatOpen ? 'Hide chat' : 'Chat'}</button>
       </div>
       <div class="body">

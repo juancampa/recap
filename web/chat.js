@@ -1,7 +1,7 @@
 // The chat of the user with triagent.
 
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
-import { api, closed, short, clock, useStored } from '/web/app.js';
+import { api, closed, short, clock, useStored, MODELS, ModelSelect } from '/web/app.js';
 import { markdown } from '/web/markdown.js';
 import { ChangeText, showChange, changeLabel } from '/web/views.js';
 
@@ -110,6 +110,7 @@ export function Chat({ ctx, handle, events }) {
   const [threadId, setThreadId] = useStored('chat-thread', null);
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useStored('chat-draft', '');
+  const [model, setModel] = useStored('chat-model', MODELS[0]);
   const [sending, setSending] = useState(false);
   // The `@` completion: `{start, word, at}`.
   const [complete, setComplete] = useState(null);
@@ -196,7 +197,7 @@ export function Chat({ ctx, handle, events }) {
     setSending(true);
     nearEnd.current = true;
     api
-      .ui('/chat/messages', { thread: threadId, text })
+      .ui('/chat/messages', { thread: threadId, text, model })
       .then(
         (thread) => {
           current.current = thread.id;
@@ -276,6 +277,7 @@ export function Chat({ ctx, handle, events }) {
         <div class="bar">
           <span><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line</span>
           <span class="spacer"></span>
+          <${ModelSelect} value=${model} set=${setModel} title="The model that writes the reply" />
           <button class="primary" onClick=${send} disabled=${busy || !draft.trim()}>${busy ? 'Triagent writes…' : 'Send'}</button>
         </div>
       </div>

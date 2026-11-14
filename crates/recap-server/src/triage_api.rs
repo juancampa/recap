@@ -14,6 +14,7 @@ use crate::triage::{self, TriageConfig};
 use crate::triage_store::TriageStore;
 use chrono::Local;
 use recap_api::triage::{
+    Model,
     Actor, Batch, BatchResult, CHECKS_DIR, ChatMessage, ChatThread, ItemView, Op, QUOTE_MAX, SessionNote, SessionView, TriageState,
     TurnRef,
 };
@@ -335,8 +336,9 @@ impl Server {
 
     /// Send `text` to triagent in the thread `thread`, or in a new
     /// thread. It returns the thread with the new message and an empty
-    /// reply. The reply comes as [`Event::TriageChat`] events.
-    pub fn chat_send(&self, thread: Option<i64>, text: &str) -> ApiResult<ChatThread> {
+    /// reply. The reply comes as [`Event::TriageChat`] events. `model`
+    /// writes the reply.
+    pub fn chat_send(&self, thread: Option<i64>, text: &str, model: Model) -> ApiResult<ChatThread> {
         let handle = Arc::clone(self.handle()?);
         let text = text.trim();
         if text.is_empty() {
@@ -367,7 +369,7 @@ impl Server {
             let handle = Arc::clone(&handle);
             std::thread::Builder::new().name("triage-chat".to_string()).spawn(move || {
                 let mut reply = reply;
-                if let Err(e) = run_reply(&server, &handle, &session, first, &prompt, &dirs, &mut reply) {
+                if let Err(e) = run_reply(&server, &handle, &session, first, model, &prompt, &dirs, &mut reply) {
                     log::error!("triage chat: {e}");
                     let _ = write!(reply.text, "\n\n(The reply failed: {e})");
                 }
@@ -460,11 +462,12 @@ fn run_reply(
     handle: &TriageHandle,
     session: &str,
     first: bool,
+    model: Model,
     prompt: &str,
     repo_dirs: &BTreeSet<PathBuf>,
     reply: &mut ChatMessage,
 ) -> anyhow::Result<()> {
-    let mut command = triage::agent_command(&handle.config, repo_dirs);
+    let mut command = triage::agent_command(&handle.config, repo_dirs, model);
     // Each text delta of the reply is one event.
     command.arg("--include-partial-messages");
     if first {

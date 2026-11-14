@@ -289,8 +289,8 @@ impl Api for Client {
         Ok(())
     }
 
-    fn triage_review(&self) -> ApiResult<()> {
-        self.post(routes::TRIAGE_REVIEW).call().map_err(error)?;
+    fn triage_review(&self, model: recap_api::triage::Model) -> ApiResult<()> {
+        self.post(routes::TRIAGE_REVIEW).query("model", model.as_str()).call().map_err(error)?;
         Ok(())
     }
 

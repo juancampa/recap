@@ -118,7 +118,7 @@ impl<T: ListItem> ListCache<T> {
 /// A request from an API call to the manager thread.
 enum Command {
     Reload,
-    TriageReview,
+    TriageReview(recap_api::triage::Model),
 }
 
 struct Inner {
@@ -316,9 +316,9 @@ impl Server {
         loop {
             match commands.recv_timeout(TICK) {
                 Ok(Command::Reload) => next_load = Instant::now(),
-                Ok(Command::TriageReview) => {
+                Ok(Command::TriageReview(model)) => {
                     if let Some(t) = triage.as_mut() {
-                        t.request_review();
+                        t.request_review(model);
                         let status = t.status();
                         *write(&self.inner.triage) = Some(status.clone());
                         self.send(Event::Triage(status));
@@ -873,7 +873,7 @@ impl Api for Server {
         Ok(())
     }
 
-    fn triage_review(&self) -> ApiResult<()> {
+    fn triage_review(&self, model: recap_api::triage::Model) -> ApiResult<()> {
         if read(&self.inner.triage).is_none() {
             return Err(ApiError(
                 "the server runs without --triage-dir".to_string(),
@@ -881,7 +881,7 @@ impl Api for Server {
         }
         if let Some(commands) = &self.inner.commands {
             lock(commands)
-                .send(Command::TriageReview)
+                .send(Command::TriageReview(model))
                 .map_err(|_| ApiError("the manager thread stopped".to_string()))?;
         }
         Ok(())

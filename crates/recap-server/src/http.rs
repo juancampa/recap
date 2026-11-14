@@ -252,8 +252,14 @@ async fn reload(State(s): State<Server>) -> HttpResult<StatusCode> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn triage_review(State(s): State<Server>) -> HttpResult<StatusCode> {
-    blocking(s, |s| s.triage_review()).await?;
+#[derive(Deserialize)]
+struct ReviewQuery {
+    /// None gives the default model.
+    model: Option<recap_api::triage::Model>,
+}
+
+async fn triage_review(State(s): State<Server>, Query(q): Query<ReviewQuery>) -> HttpResult<StatusCode> {
+    blocking(s, move |s| s.triage_review(q.model.unwrap_or_default())).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

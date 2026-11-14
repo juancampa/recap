@@ -223,6 +223,9 @@ The server listens only on `127.0.0.1`.
 
 A review run reads all the agents of the last 24 hours, and gives a topic to each session that has none.
 The server starts a review when the triage data has no session, and when you press "Review" in the web UI.
+A review run also completes the open items that have no done condition, no reference or no quote.
+The selector next to "Review" sets the model of the review run, and the selector in the chat sets the model of a reply.
+Each other run uses `opus`.
 
 `examples/hammerspoon/recap.lua` has the `recapNotify` function that triagent uses for notifications.
 The comment at the start of the file tells how to install it.

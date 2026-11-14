@@ -193,8 +193,10 @@ struct ChatSend {
     /// None starts a new thread.
     thread: Option<i64>,
     text: String,
+    /// The model that writes the reply. None gives the default model.
+    model: Option<recap_api::triage::Model>,
 }
 
 async fn chat_send(State(s): State<Server>, Json(send): Json<ChatSend>) -> Result<Response, Response> {
-    Ok(Json(blocking(s, move |s| s.chat_send(send.thread, &send.text)).await?).into_response())
+    Ok(Json(blocking(s, move |s| s.chat_send(send.thread, &send.text, send.model.unwrap_or_default())).await?).into_response())
 }

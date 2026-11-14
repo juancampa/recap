@@ -809,6 +809,9 @@ pub struct TriageRun {
     /// The Claude Code session of the run. The transcript of the run is the
     /// agent with this chain id.
     pub session_id: String,
+    /// The model of the run.
+    #[serde(default)]
+    pub model: triage::Model,
     pub started: DateTime<Local>,
     /// The number of stops that started the run.
     pub stops: usize,
@@ -960,8 +963,8 @@ pub trait Api: Send + Sync {
     /// Start the model server and the indexer, if they do not run.
     fn start_embedding(&self) -> ApiResult<()>;
     /// Ask the triage runner for a review of the agents of the last 24
-    /// hours. The review starts when no run is active.
-    fn triage_review(&self) -> ApiResult<()>;
+    /// hours. The review starts when no run is active, and uses `model`.
+    fn triage_review(&self, model: triage::Model) -> ApiResult<()>;
     fn blame(&self, request: &BlameRequest) -> ApiResult<Vec<HunkBlame>>;
     /// Write the files of an archived session back where the agent reads
     /// them, so the agent can resume the session.
@@ -1106,6 +1109,7 @@ mod tests {
                 next_run: Some(entry.timestamp),
                 run: Some(TriageRun {
                     session_id: "s1".to_string(),
+                    model: triage::Model::Sonnet,
                     started: entry.timestamp,
                     stops: 1,
                     review: false,

@@ -85,6 +85,7 @@ input[type="text"], textarea, select {
   border-radius: 5px;
   padding: 3px 7px;
 }
+select.model { padding: 1px 4px; font-size: 11px; color: var(--dim); }
 a { color: var(--accent); }
 code, pre { font-family: var(--mono); font-size: 12px; }
 pre {

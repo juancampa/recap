@@ -481,6 +481,31 @@ pub struct BatchResult {
     pub errors: Vec<Option<String>>,
 }
 
+/// A model of Claude Code that triagent can use. A run that a session
+/// stop, a time or a check notice starts uses the default model. The user
+/// chooses the model of a review run and of a chat reply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Model {
+    Fable,
+    #[default]
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+impl Model {
+    /// The name of the model for the `--model` option of `claude`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Model::Fable => "fable",
+            Model::Opus => "opus",
+            Model::Sonnet => "sonnet",
+            Model::Haiku => "haiku",
+        }
+    }
+}
+
 /// Who changes the triage data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
