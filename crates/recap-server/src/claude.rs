@@ -805,7 +805,21 @@ fn load_session(
 /// prompts for example. The copied lines are a block at the start of the
 /// file, so the block ends at the last line that names another session.
 /// The parent is the session that this last line names.
+///
+/// A session that starts with the `/clear` command has no copied lines.
+/// Claude Code keeps its process after `/clear`, and it writes the id of the
+/// session before `/clear` in the `session_id` field of the new lines.
+/// Limit: the function finds no copied lines in a session that continues a
+/// session that starts with `/clear`.
 fn copied_prefix(session_id: &str, lines: &[Line]) -> Option<(usize, String)> {
+    let after_clear = lines
+        .iter()
+        .filter(|l| l.kind.as_deref() == Some("user"))
+        .take(2)
+        .any(|l| user_text(l).is_some_and(|t| t.contains("<command-name>/clear</command-name>")));
+    if after_clear {
+        return None;
+    }
     lines.iter().enumerate().rev().find_map(|(i, l)| {
         let writer = l.writer_session.as_deref()?;
         (writer != session_id).then(|| (i + 1, writer.to_string()))
@@ -1294,6 +1308,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// After `/clear`, the new session is not a continuation: its lines name
+    /// the session before `/clear`, but they are not a copy.
+    #[test]
+    fn a_session_after_clear_has_no_parent() {
+        let old = serde_json::json!({ "session_id": "before" });
+        let lines = vec![
+            user("c1", "<local-command-caveat>The command below was run directly.</local-command-caveat>"),
+            user("c2", "<command-name>/clear</command-name>\n<command-message>clear</command-message>"),
+            user("u1", "show the snapshots"),
+            with_fields(assistant_text("a1", "Done."), old),
+        ];
+        let (out, facts) = load_lines_with_facts("cleared", &lines, &mut HashSet::new());
+        assert_eq!(facts.parents.get("cleared"), None);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].prompt_text(), Some("show the snapshots"));
     }
 
     /// A session that continues another session starts with a copy of the
