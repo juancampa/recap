@@ -1,6 +1,6 @@
 //! The types of the triage data.
 //!
-//! The server keeps the triage data in a database. The triage agent and the
+//! The server keeps the triage data in a database. Triagent and the
 //! web UI read it with `GET /v1/triage/state` and change it with a batch of
 //! operations ([`Batch`]). The triage runner of the server runs the check of
 //! each item and records the result, so that the state of an item comes from
@@ -28,7 +28,7 @@ pub struct Topic {
     pub summary: String,
 }
 
-/// What the triage agent and the user recorded about one session chain.
+/// What triagent and the user recorded about one session chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionNote {
@@ -36,7 +36,7 @@ pub struct SessionNote {
     /// The id of the topic of the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
-    /// The last turn of the session that the triage agent read.
+    /// The last turn of the session that triagent read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<usize>,
     /// One sentence: what the session does now, or what it needs.
@@ -381,6 +381,10 @@ pub struct SessionView {
     pub note: SessionNote,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The GitHub page of the repository of the session, for the links to
+    /// its pull requests: `https://github.com/<owner>/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// The newest session of the chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -449,7 +453,9 @@ pub struct BatchResult {
 #[serde(rename_all = "lowercase")]
 pub enum Actor {
     User,
-    Agent,
+    /// The earlier name of this actor was `agent`.
+    #[serde(alias = "agent")]
+    Triagent,
     Runner,
 }
 
@@ -470,7 +476,7 @@ pub struct Change {
     pub new: Option<serde_json::Value>,
 }
 
-/// One conversation of the user with the triage agent. It is one Claude
+/// One conversation of the user with triagent. It is one Claude
 /// Code session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatThread {

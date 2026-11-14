@@ -1,12 +1,13 @@
 //! The HTTP routes of the triage data and of the web UI.
 //!
-//! The routes under `/v1/triage/` are for the triage agent and for each
-//! other client. The agent changes the data with `POST /v1/triage/apply`,
+//! The routes under `/v1/triage/` are for triagent and for each
+//! other client. Triagent changes the data with `POST /v1/triage/apply`,
 //! and the server refuses the changes that only the user can make.
 //!
 //! The routes under `/ui/` are for the web UI of the user. Each request
 //! must send the token of the server in the `X-Recap-Token` header. The
-//! server writes the token into the page at `/`. The triage agent can call
+//! server writes the token into the page at `/` and at the path of each
+//! view (see [`VIEWS`]). Triagent can call
 //! only the `/v1/` routes with `curl`, so it cannot get the token and
 //! cannot, for example, approve its own check scripts.
 
@@ -36,8 +37,14 @@ const WEB_FILES: &[(&str, &str, &str)] = &[
     ("views.js", "text/javascript; charset=utf-8", include_str!("../../../web/views.js")),
     ("chat.js", "text/javascript; charset=utf-8", include_str!("../../../web/chat.js")),
     ("markdown.js", "text/javascript; charset=utf-8", include_str!("../../../web/markdown.js")),
+    ("text.js", "text/javascript; charset=utf-8", include_str!("../../../web/text.js")),
+    ("highlight.js", "text/javascript; charset=utf-8", include_str!("../../../web/highlight.js")),
     ("vendor/preact.js", "text/javascript; charset=utf-8", include_str!("../../../web/vendor/preact.js")),
 ];
+
+/// The views of the web UI. The page is also at `/<view>`, so the address
+/// of a view works after a reload. `web/app.js` has the same list.
+const VIEWS: &[&str] = &["now", "topics", "checks", "activity"];
 
 /// A directory that holds the files of the web UI. With it, the server
 /// reads each file from the disk at each request, so a page reload shows a
@@ -77,8 +84,11 @@ pub fn router(server: Server, web_dir: WebDir) -> Router<Server> {
         .route("/chat/threads/{id}", get(thread))
         .route("/chat/messages", post(chat_send))
         .layer(middleware::from_fn_with_state(server, check_token));
-    Router::new()
-        .route("/", get(index))
+    let mut router = Router::new().route("/", get(index));
+    for view in VIEWS {
+        router = router.route(&format!("/{view}"), get(index));
+    }
+    router
         .route("/web/{*path}", get(web_file))
         .route("/v1/triage/state", get(state))
         .route("/v1/triage/apply", post(agent_apply))
@@ -113,7 +123,7 @@ async fn index(State(server): State<Server>, Extension(web_dir): Extension<WebDi
 }
 
 async fn web_file(Extension(web_dir): Extension<WebDir>, UrlPath(path): UrlPath<String>) -> Response {
-    // The page with the token is only at `/`.
+    // This route does not send the page with the token.
     match web_content(&web_dir, &path).filter(|_| path != "index.html") {
         Some((content_type, text)) => (
             [(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")],
@@ -137,7 +147,7 @@ async fn apply(server: Server, actor: Actor, body: String) -> Result<Response, R
 }
 
 async fn agent_apply(State(s): State<Server>, body: String) -> Result<Response, Response> {
-    apply(s, Actor::Agent, body).await
+    apply(s, Actor::Triagent, body).await
 }
 
 async fn ui_apply(State(s): State<Server>, body: String) -> Result<Response, Response> {

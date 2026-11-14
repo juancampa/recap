@@ -1,6 +1,6 @@
 //! The check runner of the triage items.
 //!
-//! The triage agent writes the items to the triage store, and the check
+//! Triagent writes the items to the triage store, and the check
 //! scripts in the `checks` directory (see `triage_prompt.md`). The runner
 //! runs the check of each open item at an interval that depends on the
 //! impact of the item, and writes the outcome to the store. Only the runner
@@ -9,7 +9,7 @@
 //! The runner runs a script only after the user approves it, in the web UI
 //! or with `recap triage approve`. The approval copies the script to the approved
 //! directory, next to the triage directory and outside the files that the
-//! triage agent can change. The runner runs the approved copy, so a change
+//! triagent can change. The runner runs the approved copy, so a change
 //! of the script after the approval has no effect until the user approves
 //! it again.
 //!
@@ -43,7 +43,7 @@ const MAX_OUTPUT: usize = 2000;
 /// critical item.
 const DUE_SOON: TimeDelta = TimeDelta::hours(24);
 
-/// A change that the triage agent must know about.
+/// A change that triagent must know about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub item: String,
@@ -54,7 +54,7 @@ pub struct Notice {
 }
 
 /// The directory of the approved copies of the check scripts. It is next to
-/// the triage directory, so the triage agent cannot write to it.
+/// the triage directory, so triagent cannot write to it.
 pub fn approved_dir(triage_dir: &Path) -> PathBuf {
     let name = triage_dir
         .file_name()
@@ -190,7 +190,7 @@ impl Checker {
     }
 
     /// Collect a batch that ended, and start a new batch when checks are
-    /// due. It returns the notices for the triage agent.
+    /// due. It returns the notices for triagent.
     pub fn tick(&mut self) -> Vec<Notice> {
         let mut notices = Vec::new();
         if self.batch.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -487,7 +487,7 @@ fn execute(
         .next()
         .unwrap_or_default()
         .to_string();
-    // A script file has no execute permission when the agent writes it, so
+    // A script file has no execute permission when triagent writes it, so
     // the runner starts its interpreter.
     let mut command = match first_line.strip_prefix("#!") {
         Some(shebang) => {
@@ -629,7 +629,7 @@ mod tests {
                 recap_api::triage::Op::Item { id: item.id.clone(), set: set.clone() }
             })
             .collect();
-        let result = store.apply(recap_api::triage::Actor::Agent, &recap_api::triage::Batch { ops });
+        let result = store.apply(recap_api::triage::Actor::Triagent, &recap_api::triage::Batch { ops });
         assert!(result.errors.iter().all(Option::is_none), "{:?}", result.errors);
         Checker::new(dir.to_path_buf(), store, std::env::var("PATH").unwrap(), String::new())
     }

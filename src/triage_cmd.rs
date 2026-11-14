@@ -1,5 +1,5 @@
 //! `recap triage approve`: the user reviews the check scripts that the
-//! triage agent wrote. The server runs a script only after an approval (see
+//! triagent wrote. The server runs a script only after an approval (see
 //! `recap_server::checks`).
 
 use anyhow::{Context, Result, bail};

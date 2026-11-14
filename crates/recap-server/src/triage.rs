@@ -1,7 +1,7 @@
-//! The triage runner. It starts a triage agent when a Claude Code session
+//! The triage runner. It starts triagent when a Claude Code session
 //! stops its turn.
 //!
-//! The triage agent keeps its data in the triage store, through the HTTP
+//! Triagent keeps its data in the triage store, through the HTTP
 //! API, and its notes and check scripts as files in the triage directory
 //! (see `triage_prompt.md`). The runner detects the stops and starts the
 //! runs of `claude -p`.
@@ -13,7 +13,7 @@
 //!
 //! One run is active at a time. The stops that occur during a run wait, and
 //! the next run gets all of them. At the end of each run, the runner reads
-//! the `next-run` file that the triage agent wrote, and starts a run at that
+//! the `next-run` file that triagent wrote, and starts a run at that
 //! time if no stop starts one first.
 //!
 //! A review run reads all the agents of the last 24 hours. The runner starts
@@ -33,7 +33,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-/// The instructions of the triage agent. The runner gives them to `claude`
+/// The instructions of triagent. The runner gives them to `claude`
 /// with `--append-system-prompt`.
 const INSTRUCTIONS: &str = include_str!("triage_prompt.md");
 
@@ -50,12 +50,12 @@ const MAX_REVIEW_RUN: Duration = Duration::from_secs(40 * 60);
 /// The settings of the triage runner.
 #[derive(Debug, Clone)]
 pub struct TriageConfig {
-    /// The directory of the notes and the check scripts of the triage
-    /// agent. The runs of the agent have it as their cwd.
+    /// The directory of the notes and the check scripts of triagent. The
+    /// runs of triagent have it as their cwd.
     pub dir: PathBuf,
     /// The `claude` binary.
     pub claude: PathBuf,
-    /// The port of this server. The triage agent reads the sessions through
+    /// The port of this server. Triagent reads the sessions through
     /// the API on this port.
     pub port: u16,
     /// True when the runner starts no triage run. The store, the checks
@@ -67,7 +67,7 @@ pub struct TriageConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stop {
     pub session_id: String,
-    /// The id of the session chain. The triage agent keeps one file for
+    /// The id of the session chain. Triagent keeps one file for
     /// each chain.
     pub chain_id: String,
     pub cwd: Option<PathBuf>,
@@ -394,7 +394,7 @@ impl Triage {
     }
 }
 
-/// The `claude -p` command of the triage agent, for a run and for a chat
+/// The `claude -p` command of triagent, for a run and for a chat
 /// reply. The caller adds the session option, and writes the prompt to
 /// stdin: `--allowedTools` takes all the arguments that follow it, so the
 /// prompt cannot be an argument.
@@ -440,7 +440,7 @@ fn repo_dirs(
 }
 
 /// The actions in one line of `--output-format stream-json`, each on one
-/// line: the tool calls and the texts of the agent, and the final result.
+/// line: the tool calls and the texts of triagent, and the final result.
 pub(crate) fn stream_actions(line: &str) -> Vec<String> {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
         return Vec::new();
@@ -764,7 +764,7 @@ mod tests {
         let first = Triage::new(config.clone()).unwrap();
         assert!(first.status().review);
         let batch = serde_json::from_str(r#"{"ops":[{"op":"session","chain":"a","set":{"turn":1}}]}"#).unwrap();
-        first.store().apply(recap_api::triage::Actor::Agent, &batch);
+        first.store().apply(recap_api::triage::Actor::Triagent, &batch);
         drop(first);
         assert!(!Triage::new(config).unwrap().status().review);
         let _ = std::fs::remove_dir_all(&dir);

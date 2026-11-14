@@ -776,7 +776,7 @@ pub struct Status {
 /// The state of the triage runner of the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriageStatus {
-    /// The directory of the text files of the triage agent.
+    /// The directory of the text files of triagent.
     pub dir: PathBuf,
     /// The number of stops that wait for the next run.
     pub pending: usize,
@@ -803,7 +803,7 @@ impl TriageStatus {
     }
 }
 
-/// One run of the triage agent.
+/// One run of triagent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TriageRun {
     /// The Claude Code session of the run. The transcript of the run is the
@@ -859,7 +859,7 @@ pub enum Event {
     Triage(TriageStatus),
     /// The triage data changed. Fetch `GET /v1/triage/state` again.
     TriageData { version: u64 },
-    /// A message of a chat with the triage agent changed.
+    /// A message of a chat with triagent changed.
     TriageChat { message: triage::ChatMessage },
 }
 

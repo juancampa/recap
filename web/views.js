@@ -4,6 +4,8 @@
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
 import { api, closed, short, ago, until, clock, useStored } from '/web/app.js';
 import { markdown } from '/web/markdown.js';
+import { Linked, TopicRef, hrefOf } from '/web/text.js';
+import { highlight } from '/web/highlight.js';
 
 const MARKS = { open: '○', claimed: '◐', unknown: '?', verified: '✓', confirmed: '✓', dropped: '–' };
 const STATE_TEXT = {
@@ -19,9 +21,14 @@ const IMPACT_LABEL = { critical: 'crit', high: 'high', normal: 'norm', low: 'low
 const OUTCOME_CLASS = { done: 'done', 'not-done': '', unknown: 'bad', unapproved: 'bad', missing: 'bad' };
 
 const sessionTitle = (session) => (session && (session.title || short(session.chain))) || '';
-const Md = ({ text }) => {
-  const __html = useMemo(() => markdown(text), [text]);
+// `repo` is the GitHub page of the repository that the text is about.
+const Md = ({ ctx, text, repo }) => {
+  const __html = useMemo(() => markdown(text, { look: ctx.look, repo }), [text, ctx.look, repo]);
   return html`<div class="md" dangerouslySetInnerHTML=${{ __html }}></div>`;
+};
+const repoOf = (ctx, chain) => {
+  const session = chain ? ctx.index.sessions.get(chain) : null;
+  return session ? session.repo : undefined;
 };
 
 // ── The turns of a session ────────────────────────────────────────────────
@@ -64,22 +71,24 @@ function useTurns(ctx, chain) {
 }
 
 // A long text shows its start only, with a button that shows all of it.
-function Clip({ text, cls }) {
+function Clip({ ctx, text, cls, repo }) {
   const long = text.length > 1400 || text.split('\n').length > 22;
   const [all, setAll] = useState(false);
   return html`
-    <div class=${`${cls} ${long && !all ? 'clip' : ''}`}><${Md} text=${text} /></div>
+    <div class=${`${cls} ${long && !all ? 'clip' : ''}`}><${Md} ctx=${ctx} text=${text} repo=${repo} /></div>
     ${long && html`<button class="plain" onClick=${() => setAll(!all)}>${all ? 'Show less' : 'Show all'}</button>`}
   `;
 }
 
-function Turn({ entry, hit, elRef }) {
+function Turn({ ctx, chain, entry, hit, elRef }) {
+  const repo = repoOf(ctx, chain);
+  const env = { ctx, repo };
   return html`
     <div class=${`turn ${hit ? 'hit' : ''}`} ref=${elRef}>
       <div class="n"><span>Turn ${entry.ordinal}</span><span>${clock(entry.timestamp)}</span></div>
-      <${Clip} cls="q a" text=${entry.kind.text} />
+      <${Clip} ...${env} cls="q a" text=${entry.kind.text || ''} />
       ${entry.kind.response
-        ? html`<${Clip} cls="a" text=${entry.kind.response} />`
+        ? html`<${Clip} ...${env} cls="a" text=${entry.kind.response} />`
         : html`<div class="note" style="padding:4px 0">No final response for this turn.</div>`}
     </div>
   `;
@@ -109,7 +118,7 @@ function TurnRefBody({ ctx, turnRef }) {
   if (!turns) return html`<div class="note">Loading…</div>`;
   const entry = turns.find((t) => t.ordinal === turnRef.turn);
   if (!entry) return html`<div class="note">The history has no turn ${turnRef.turn} for this session.</div>`;
-  return html`<div><${Turn} entry=${entry} /></div>`;
+  return html`<div><${Turn} ctx=${ctx} chain=${turnRef.chain} entry=${entry} /></div>`;
 }
 
 // ── One item ──────────────────────────────────────────────────────────────
@@ -135,6 +144,10 @@ function ItemDetail({ ctx, item }) {
   const [reason, setReason] = useState('');
   const [deleting, setDeleting] = useState(false);
   const isClosed = closed(item);
+  const repo = session ? session.repo : undefined;
+  // A text with its references as links. The key replaces the element
+  // when the text changes.
+  const linked = (text) => html`<${Linked} key=${text} ctx=${ctx} text=${text} repo=${repo} />`;
   const needsWhy = (item.impact === 'critical' || item.impact === 'high') && !item.why;
   const copyAndGo = () => ctx.copy(item.prompt).then(() => ctx.goToSession(item.chain));
   const drop = () => ctx.setItem(item.id, { status: 'dropped', note: reason || item.note }).then((ok) => ok && setDropping(false));
@@ -146,27 +159,27 @@ function ItemDetail({ ctx, item }) {
         <div class="v">${STATE_TEXT[item.state]}${item.late ? ' The item is late.' : ''}</div>
         ${(item.why || needsWhy) &&
         html`<div class="k">Why</div>
-          <div class=${`v ${item.why ? '' : 'missing'}`}>${item.why || 'No reason recorded.'}</div>`}
-        ${item.done_when && html`<div class="k">Done when</div><div class="v">${item.done_when}</div>`}
+          <div class=${`v ${item.why ? '' : 'missing'}`}>${item.why ? linked(item.why) : 'No reason recorded.'}</div>`}
+        ${item.done_when && html`<div class="k">Done when</div><div class="v">${linked(item.done_when)}</div>`}
         <${CheckRun} label="Check" spec=${item.check} run=${item.check_run} />
         ${item.before &&
         html`<div class="k">Before</div>
-          <div class="v">${item.before.event}${item.event_run && item.event_run.outcome === 'done' ? html` <span class="chip late">occurred</span>` : ''}</div>`}
+          <div class="v">${linked(item.before.event)}${item.event_run && item.event_run.outcome === 'done' ? html` <span class="chip late">occurred</span>` : ''}</div>`}
         ${item.before && html`<${CheckRun} label="Event" spec=${item.before.check} run=${item.event_run} />`}
         ${item.due && html`<div class="k">Due</div><div class="v">${clock(item.due)} (${until(item.due)})</div>`}
-        ${item.note && html`<div class="k">Note</div><div class="v"><${Md} text=${item.note} /></div>`}
+        ${item.note && html`<div class="k">Note</div><div class="v"><${Md} ctx=${ctx} text=${item.note} repo=${repo} /></div>`}
         ${session &&
         html`<div class="k">Session</div>
           <div class="v">
             <button class="chip" onClick=${() => ctx.openSession(item.chain)}>
               <span class=${`dot ${session.status || ''}`}></span>${sessionTitle(session)}
             </button>
-            ${session.summary ? ` ${session.summary}` : ''}
+            ${' '}${session.summary && linked(session.summary)}
           </div>`}
         ${item.prompt &&
         html`<div class="k">Prompt</div>
           <div class="v">
-            <div class="prompt">${item.prompt}</div>
+            <div class="prompt">${linked(item.prompt)}</div>
             <div class="actions" style="margin-top:4px">
               <button onClick=${() => ctx.copy(item.prompt)}>Copy</button>
               ${item.chain && html`<button class="primary" onClick=${copyAndGo}>Copy and go to the session</button>`}
@@ -194,7 +207,7 @@ function ItemDetail({ ctx, item }) {
           <option value="user">you</option>
           <option value="agent">agent</option>
         </select>
-        <button onClick=${() => ctx.ask(`@item:${item.id}`)}>Ask triage</button>
+        <button onClick=${() => ctx.ask(`@item:${item.id}`)}>Ask triagent</button>
         ${session &&
         html`<button onClick=${() => ctx.setSession(item.chain, { muted_turn: session.muted ? null : session.last_turn })}
             title="A muted session shows only its critical items. The mute ends at the next turn of the session.">
@@ -216,17 +229,19 @@ function ItemRow({ ctx, item, selected, expanded, onToggle, showTopic, elRef }) 
   const run = item.check_run;
   return html`
     <div class=${`item ${selected ? 'sel' : ''} ${closed(item) ? 'closed' : ''}`} ref=${elRef}>
-      <div class="row" onClick=${onToggle}>
+      <div class="row" onClick=${(e) => !e.target.closest('a') && onToggle()}>
         <span class=${`mark ${item.state}`} title=${STATE_TEXT[item.state]}>${MARKS[item.state]}</span>
         <span class=${`impact ${item.impact}`}>${IMPACT_LABEL[item.impact]}</span>
         <span class=${`owner ${item.owner}`}>${item.owner === 'user' ? 'you' : 'agent'}</span>
-        <span class="text" title=${item.text}>${item.text}<span class="id">${item.id}</span></span>
+        <span class="text" title=${item.text}>
+          <${Linked} key=${item.text} ctx=${ctx} text=${item.text} repo=${session ? session.repo : undefined} /><span class="id">${item.id}</span>
+        </span>
         <span class="meta">
           ${item.late && html`<span class="chip late">late</span>`}
           ${!item.late && item.due && !closed(item) && html`<span class="chip">due ${until(item.due)}</span>`}
           ${!item.late && item.before && !closed(item) && html`<span class="chip" title=${`Before: ${item.before.event}`}>before ${item.before.event}</span>`}
           ${run && run.outcome !== 'not-done' && html`<span class=${`chip ${OUTCOME_CLASS[run.outcome]}`} title="The outcome of the check">${run.outcome}</span>`}
-          ${showTopic && topic && html`<span class="chip topic">${topic.title}</span>`}
+          ${showTopic && topic && html`<span class="chip tc" style=${topic.style}>${topic.title}</span>`}
           ${session &&
           html`<button class="chip" title=${session.summary || 'Open the session'}
               onClick=${(e) => (e.stopPropagation(), ctx.openSession(item.chain, item.refs && item.refs.length ? item.refs[item.refs.length - 1].turn : undefined))}>
@@ -277,17 +292,24 @@ function useSelection() {
 
 // ── The Now view ──────────────────────────────────────────────────────────
 
-export function NowView({ ctx, focus }) {
-  const { state, index } = ctx;
+export function NowView({ ctx }) {
+  const { state, index, route, go } = ctx;
   const [owner, setOwner] = useStored('now-owner', 'user');
   const [grouped, setGrouped] = useStored('now-grouped', false);
   const [showMuted, setShowMuted] = useStored('now-muted', false);
-  const [query, setQuery] = useState('');
+  // The address holds the text filter.
+  const query = route.q;
+  const setQuery = (q) => go({ q }, true);
   const [closedOpen, setClosedOpen] = useState(false);
   const [closedLimit, setClosedLimit] = useState(50);
   const selection = useSelection();
-  const { sel, setSel, expanded, toggle, expand, rowRefs, scrollTo } = selection;
+  const { sel, setSel, expanded, expand, rowRefs, scrollTo } = selection;
   const filter = useRef(null);
+  // The address holds the item that the user opened last.
+  const toggle = (id) => {
+    go({ hash: expanded.has(id) ? '' : id }, true);
+    selection.toggle(id);
+  };
 
   const matches = (item) => {
     if (owner !== 'all' && item.owner !== owner) return false;
@@ -311,38 +333,40 @@ export function NowView({ ctx, focus }) {
   const doneShown = closedOpen ? done.slice(0, closedLimit) : [];
 
   // The groups are in the order of the first item of each topic.
-  const groups = useMemo(() => {
-    if (!grouped) return null;
+  let groups = null;
+  if (grouped) {
     const byTopic = new Map();
     for (const item of open) {
       const key = item.in_topic || '';
       if (!byTopic.has(key)) byTopic.set(key, []);
       byTopic.get(key).push(item);
     }
-    return [...byTopic.entries()];
-  }, [grouped, open.map((i) => i.id).join(' ')]);
+    groups = [...byTopic.entries()];
+  }
 
   const order = [...(groups ? groups.flatMap(([, items]) => items) : open), ...doneShown].map((i) => i.id);
 
-  // A request of another view to show one item.
+  // Show the item of the address after each navigation.
   useEffect(() => {
-    if (!focus) return;
-    const item = index.items.get(focus.id);
-    if (!item) return ctx.say(`No item ${focus.id}`, true);
-    setOwner('all');
-    setQuery('');
-    setShowMuted(true);
+    const id = route.hash;
+    if (!id) return;
+    const item = index.items.get(id);
+    if (!item) return ctx.say(`No item ${id}`, true);
+    // Remove only the filters that hide the item.
+    if (owner !== 'all' && item.owner !== owner) setOwner('all');
+    if (isMuted(item)) setShowMuted(true);
+    if (query && !matches(item)) setQuery('');
     if (closed(item)) {
       setClosedOpen(true);
-      setClosedLimit(Math.max(50, state.items.filter(closed).findIndex((i) => i.id === focus.id) + 1));
+      setClosedLimit(Math.max(50, state.items.filter(closed).findIndex((i) => i.id === id) + 1));
     }
-    setSel(focus.id);
-    expand(focus.id);
+    setSel(id);
+    expand(id);
     setTimeout(() => {
-      const el = rowRefs.current.get(focus.id);
+      const el = rowRefs.current.get(id);
       if (el) el.scrollIntoView({ block: 'center' });
     }, 60);
-  }, [focus && focus.at]);
+  }, [route.seq]);
 
   useEffect(() => {
     const onKey = (event) => {
@@ -411,10 +435,10 @@ export function NowView({ ctx, focus }) {
           const topic = index.topics.get(topicId);
           return html`<div class="group" key=${topicId}>
             <h3>
-              <span class="title">${topic ? topic.title : 'No topic'}</span>
+              ${topic ? html`<${TopicRef} topic=${topic} />` : html`<span class="title">No topic</span>`}
               <span>${items.length}</span>
               <span class="sum">${topic ? topic.summary : ''}</span>
-              ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triage</button>`}
+              ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triagent</button>`}
             </h3>
             <${ItemList} ...${listProps} items=${items} showTopic=${false} />
           </div>`;
@@ -452,7 +476,7 @@ function SessionRow({ ctx, session, openCount }) {
   `;
 }
 
-function TopicCard({ ctx, topic, sessions, items, elRef }) {
+function TopicCard({ ctx, topic, sessions, items, marked, elRef }) {
   const selection = useSelection();
   const [allItems, setAllItems] = useState(false);
   const [showQuiet, setShowQuiet] = useState(false);
@@ -468,17 +492,21 @@ function TopicCard({ ctx, topic, sessions, items, elRef }) {
   const quietCount = sorted.length - sorted.filter((s) => !quiet(s)).length;
   const shownItems = allItems ? open : open.slice(0, 5);
   const count = (f) => open.filter(f).length;
+  // The repository of most of the sessions of the topic.
+  const repoCount = new Map();
+  sessions.forEach((s) => s.repo && repoCount.set(s.repo, (repoCount.get(s.repo) || 0) + 1));
+  const repo = [...repoCount.entries()].sort((a, b) => b[1] - a[1]).map(([r]) => r)[0];
   return html`
-    <div class="topic-card" ref=${elRef}>
+    <div class=${`topic-card ${marked ? 'marked' : ''}`} ref=${elRef}>
       <header>
-        <h2>${topic ? topic.title : 'No topic'}</h2>
+        <h2 class=${topic ? 'tc' : ''} style=${topic ? topic.style : ''}>${topic ? topic.title : 'No topic'}</h2>
         ${count((i) => i.impact === 'critical') > 0 && html`<span class="pill crit">${count((i) => i.impact === 'critical')} critical</span>`}
         ${count((i) => i.impact === 'high') > 0 && html`<span class="pill high">${count((i) => i.impact === 'high')} high</span>`}
         <span class="pill">${open.length} open</span>
         ${count((i) => i.owner === 'user') > 0 && html`<span class="pill info">${count((i) => i.owner === 'user')} for you</span>`}
         <span class="spacer"></span>
-        ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triage</button>`}
-        ${topic && topic.summary && html`<div class="sum">${topic.summary}</div>`}
+        ${topic && html`<button class="plain" onClick=${() => ctx.ask(`@topic:${topic.id}`)}>Ask triagent</button>`}
+        ${topic && topic.summary && html`<div class="sum"><${Linked} key=${topic.summary} ctx=${ctx} text=${topic.summary} repo=${repo} /></div>`}
       </header>
       ${sorted.length > 0 &&
       html`<div class="sessions">
@@ -499,8 +527,8 @@ function TopicCard({ ctx, topic, sessions, items, elRef }) {
   `;
 }
 
-export function TopicsView({ ctx, focus }) {
-  const { state } = ctx;
+export function TopicsView({ ctx }) {
+  const { state, route } = ctx;
   const cards = useRef(new Map());
   // The priority of a topic is the place of its first open item.
   const groups = useMemo(() => {
@@ -518,20 +546,22 @@ export function TopicsView({ ctx, focus }) {
     return list;
   }, [state]);
 
+  // Show the topic of the address after each navigation.
   useEffect(() => {
-    if (!focus) return;
-    const el = cards.current.get(focus.id);
+    if (!route.hash) return;
+    const el = cards.current.get(route.hash);
     if (el) el.scrollIntoView({ block: 'start' });
-    else ctx.say(`No topic ${focus.id}`, true);
-  }, [focus && focus.at]);
+    else ctx.say(`No topic ${route.hash}`, true);
+  }, [route.seq]);
 
   return html`
     ${state.topics.length === 0 &&
     html`<div class="note">
-      No session has a topic yet. The triage agent gives each session a topic in the next review run.
+      No session has a topic yet. Triagent gives each session a topic in the next review run.
     </div>`}
     ${groups.map(
       (g) => html`<${TopicCard} key=${g.topic ? g.topic.id : ''} ctx=${ctx} topic=${g.topic} sessions=${g.sessions} items=${g.items}
+        marked=${g.topic && g.topic.id === route.hash}
         elRef=${(el) => g.topic && (el ? cards.current.set(g.topic.id, el) : cards.current.delete(g.topic.id))} />`,
     )}
   `;
@@ -562,7 +592,7 @@ export function SessionPanel({ ctx, chain, turn, close }) {
         <h2>${sessionTitle(session) || short(chain)}</h2>
         <span class="spacer"></span>
         <button class="primary" onClick=${() => ctx.goToSession(chain)}>Go to the session</button>
-        <button onClick=${() => ctx.ask(`@session:${short(chain)}`)}>Ask triage</button>
+        <button onClick=${() => ctx.ask(`@session:${short(chain)}`)}>Ask triagent</button>
         ${session &&
         html`<button onClick=${() => ctx.setSession(chain, { muted_turn: session.muted ? null : session.last_turn })}>
           ${session.muted ? 'Unmute' : 'Mute'}
@@ -570,10 +600,10 @@ export function SessionPanel({ ctx, chain, turn, close }) {
         <button class="plain" onClick=${close} title="Close (Esc)">✕</button>
       </header>
       <div class="sub">
-        ${topic && html`<a class="ref" data-kind="topic" data-id=${topic.id}>${topic.title}</a>`}
+        ${topic && html`<${TopicRef} topic=${topic} prefix=${true} />`}
         ${session && session.status === 'waiting' && html`<span class="pill wait">waits for ${session.waiting_for || 'you'}</span>`}
-        ${session && session.summary && html`<span>${session.summary}</span>`}
-        ${(allItems ? items : items.slice(0, 6)).map((i) => html`<a class="ref" data-kind="item" data-id=${i.id} title=${i.text}>${i.impact === 'critical' || i.impact === 'high' ? `${i.impact}: ` : ''}${i.text}</a>`)}
+        ${session && session.summary && html`<${Linked} key=${session.summary} ctx=${ctx} text=${session.summary} repo=${session.repo} />`}
+        ${(allItems ? items : items.slice(0, 6)).map((i) => html`<a class="ref" data-kind="item" data-id=${i.id} href=${hrefOf('item', i.id)}>${i.impact === 'critical' || i.impact === 'high' ? `${i.impact}: ` : ''}${i.text}</a>`)}
         ${items.length > 6 && html`<button class="plain" onClick=${() => setAllItems(!allItems)}>${allItems ? 'Show fewer items' : `+${items.length - 6} open items`}</button>`}
       </div>
       <div class="turns">
@@ -582,7 +612,7 @@ export function SessionPanel({ ctx, chain, turn, close }) {
         ${turns && turns.length === 0 && html`<div class="note">The history has no prompt for this session.</div>`}
         ${turns &&
         turns.map(
-          (entry) => html`<${Turn} key=${entry.id} entry=${entry} hit=${turn === entry.ordinal}
+          (entry) => html`<${Turn} key=${entry.id} ctx=${ctx} chain=${chain} entry=${entry} hit=${turn === entry.ordinal}
             elRef=${turn === entry.ordinal ? hit : undefined} />`,
         )}
         <div ref=${end}></div>
@@ -593,8 +623,8 @@ export function SessionPanel({ ctx, chain, turn, close }) {
 
 // ── The Checks view ───────────────────────────────────────────────────────
 
-// The lines of `after` with a mark for each line that `before` does not
-// have, and the lines that only `before` has.
+// The lines of `after` with the mark `+` for each line that `before` does
+// not have, and the lines that only `before` has with the mark `-`.
 function diffLines(before, after) {
   const a = before.split('\n');
   const b = after.split('\n');
@@ -604,48 +634,63 @@ function diffLines(before, after) {
       lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
     }
   }
+  // Each result is `[mark, index]`: the index of the line in `after`, or
+  // in `before` for the mark `-`.
   const out = [];
   let i = 0;
   let j = 0;
   while (i < a.length || j < b.length) {
-    if (i < a.length && j < b.length && a[i] === b[j]) out.push([' ', a[i++]]), j++;
-    else if (j < b.length && (i >= a.length || lcs[i][j + 1] >= lcs[i + 1][j])) out.push(['+', b[j++]]);
-    else out.push(['-', a[i++]]);
+    if (i < a.length && j < b.length && a[i] === b[j]) out.push([' ', j++]), i++;
+    else if (j < b.length && (i >= a.length || lcs[i][j + 1] >= lcs[i + 1][j])) out.push(['+', j++]);
+    else out.push(['-', i++]);
   }
   return out;
 }
 
-function Script({ ctx, script, reload }) {
-  const [open, setOpen] = useState(!script.approved);
+// One line of a script with the colors of its syntax.
+const CodeLine = ({ tokens }) => tokens.map(([cls, text]) => (cls ? html`<span class=${`hl-${cls}`}>${text}</span>` : text));
+
+function Script({ ctx, script, reload, marked, elRef }) {
+  const [open, setOpen] = useState(!script.approved || marked);
+  const after = useMemo(() => highlight(script.text), [script.text]);
+  const before = useMemo(() => (script.approved_text ? highlight(script.approved_text) : null), [script.approved_text]);
   const approve = () =>
     api.ui(`/checks/${encodeURIComponent(script.name)}/approve`, {}).then(
       () => (ctx.say(`Approved ${script.name}`), reload()),
       (e) => ctx.say(e.message, true),
     );
-  const lines = script.approved_text ? diffLines(script.approved_text, script.text) : null;
+  // An approved script shows no difference.
+  const lines = useMemo(
+    () => (before && !script.approved ? diffLines(script.approved_text, script.text) : after.map((_, at) => ['', at])),
+    [script.text, script.approved_text, script.approved],
+  );
   return html`
-    <div class="script">
+    <div class=${`script ${marked ? 'marked' : ''}`} ref=${elRef}>
       <header>
         <button class="plain" onClick=${() => setOpen(!open)}>${open ? '▾' : '▸'}</button>
-        <span class="n">${script.name}</span>
+        <a class="n" href=${`/checks#${encodeURIComponent(script.name)}`}
+          onClick=${(e) => (e.preventDefault(), ctx.go({ view: 'checks', hash: script.name }))}>${script.name}</a>
         ${script.approved
           ? html`<span class="pill ok">approved</span>`
           : html`<span class="pill wait">${script.approved_text ? 'changed, needs your approval' : 'new, needs your approval'}</span>`}
-        ${script.items.slice(0, 6).map((id) => html`<a class="ref" data-kind="item" data-id=${id}>${id}</a>`)}
+        ${script.items.slice(0, 6).map((id) => html`<a class="ref" data-kind="item" data-id=${id} href=${hrefOf('item', id)}>${id}</a>`)}
         ${script.items.length > 6 && html`<span class="age" style="width:auto">+${script.items.length - 6} items</span>`}
         ${script.items.length === 0 && html`<span class="age" style="width:auto">no item uses it</span>`}
         <span class="spacer"></span>
         ${!script.approved && html`<button class="primary" onClick=${approve}>Approve this version</button>`}
       </header>
       ${open &&
-      html`<pre>${lines
-        ? lines.map(([mark, line]) => html`<span class=${mark === '+' ? 'add' : mark === '-' ? 'del' : ''} style="display:block">${mark} ${line}</span>`)
-        : script.text}</pre>`}
+      html`<pre>${lines.map(
+        ([mark, at]) => html`<span class=${`line ${mark === '+' ? 'add' : mark === '-' ? 'del' : ''}`}>
+          ${mark && `${mark} `}<${CodeLine} tokens=${(mark === '-' ? before : after)[at] || []} />${'\n'}</span>`,
+      )}</pre>`}
     </div>
   `;
 }
 
 export function ChecksView({ ctx }) {
+  const { route } = ctx;
+  const rows = useRef(new Map());
   const [scripts, setScripts] = useState(null);
   const [error, setError] = useState(null);
   const unapproved = ((ctx.status && ctx.status.unapproved) || []).join(' ');
@@ -653,6 +698,11 @@ export function ChecksView({ ctx }) {
   useEffect(() => {
     load();
   }, [unapproved, ctx.state.version]);
+  // Show the script of the address after each navigation.
+  useEffect(() => {
+    const el = scripts && route.hash && rows.current.get(route.hash);
+    if (el) el.scrollIntoView({ block: 'start' });
+  }, [route.seq, !scripts]);
   if (error) return html`<div class="note">${error}</div>`;
   if (!scripts) return html`<div class="note">Loading…</div>`;
   const waiting = scripts.filter((s) => !s.approved);
@@ -663,7 +713,9 @@ export function ChecksView({ ctx }) {
     </div>
     ${waiting.length === 0 && html`<div class="note" style="padding:0 0 10px">No script waits for your approval.</div>`}
     ${[...waiting, ...scripts.filter((s) => s.approved)].map(
-      (s) => html`<${Script} key=${`${s.name}:${s.approved}`} ctx=${ctx} script=${s} reload=${load} />`,
+      (s) => html`<${Script} key=${`${s.name}:${s.approved}:${s.name === route.hash}`} ctx=${ctx} script=${s} reload=${load}
+        marked=${s.name === route.hash}
+        elRef=${(el) => (el ? rows.current.set(s.name, el) : rows.current.delete(s.name))} />`,
     )}
   `;
 }
@@ -713,7 +765,12 @@ export function ActivityView({ ctx, seen, setSeen }) {
   return html`
     <div class="toolbar">
       <div class="seg">
-        ${['all', 'agent', 'user', 'runner'].map((a) => html`<button class=${actor === a ? 'on' : ''} onClick=${() => setActor(a)}>${a === 'all' ? 'All' : a === 'user' ? 'You' : a}</button>`)}
+        ${[
+          ['all', 'All'],
+          ['triagent', 'Triagent'],
+          ['user', 'You'],
+          ['runner', 'Check runner'],
+        ].map(([a, label]) => html`<button class=${actor === a ? 'on' : ''} onClick=${() => setActor(a)}>${label}</button>`)}
       </div>
       <span class="age" style="width:auto">The last ${changes.length} changes of the triage data, newest first.</span>
     </div>
@@ -729,5 +786,54 @@ export function ActivityView({ ctx, seen, setSeen }) {
         </div>`,
       )}
     </div>`}
+  `;
+}
+
+// ── The details of the reference under the pointer ────────────────────────
+
+// `hover` is `{kind, id, rect}`: an item or a session, and the place of the
+// reference in the window.
+export function RefPopover({ ctx, hover }) {
+  const { index, state } = ctx;
+  const session = hover.kind === 'session' ? state.sessions.find((s) => s.chain.startsWith(hover.id)) : null;
+  const item = hover.kind === 'item' ? index.items.get(hover.id) : null;
+  if (!item && !session) return null;
+  const of = item ? (item.chain ? index.sessions.get(item.chain) : null) : session;
+  const topicId = item ? item.in_topic : session.topic;
+  const topic = topicId ? index.topics.get(topicId) : null;
+  // The place of an open item in the priority order.
+  const place = item && !closed(item) ? state.items.indexOf(item) + 1 : 0;
+  // Below the reference, or above it near the end of the window.
+  const { rect } = hover;
+  const below = rect.bottom < window.innerHeight - 150;
+  const style = `left:${Math.max(8, Math.min(rect.left, window.innerWidth - 468))}px;${
+    below ? `top:${rect.bottom + 5}px` : `bottom:${window.innerHeight - rect.top + 5}px`
+  }`;
+  return html`
+    <div class=${`popover ${item && closed(item) ? 'closed' : ''}`} style=${style}>
+      ${item
+        ? html`<div class="head">
+              <span class=${`mark ${item.state}`}>${MARKS[item.state]}</span>
+              <span class=${`impact ${item.impact}`}>${IMPACT_LABEL[item.impact]}</span>
+              <span class=${`owner ${item.owner}`}>${item.owner === 'user' ? 'you' : 'agent'}</span>
+              ${place > 0 && html`<span class="age" style="width:auto" title="The place in the priority order">#${place}</span>`}
+              ${item.late && html`<span class="chip late">late</span>`}
+              <span class="spacer"></span>
+              <span class="age" style="width:auto">${ago(item.created)}</span>
+            </div>
+            <div class="title">${item.text}</div>`
+        : html`<div class="head">
+              <span class=${`dot ${session.status || ''}`}></span>
+              <span class="title">${sessionTitle(session)}</span>
+              <span class="spacer"></span>
+              <span class="age" style="width:auto">${ago(session.last_ts)}</span>
+            </div>
+            ${session.summary && html`<div>${session.summary}</div>`}`}
+      <div class="foot">
+        ${topic && html`<span class="chip tc" style=${topic.style}>${topic.title}</span>`}
+        ${item && of && html`<span class="chip"><span class=${`dot ${of.status || ''}`}></span>${sessionTitle(of)}</span>`}
+        ${item && html`<span class="id">${item.id}</span>`}
+      </div>
+    </div>
   `;
 }

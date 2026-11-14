@@ -2,50 +2,50 @@
 // sessions, and for the chat. It returns HTML. It escapes all the text, so
 // the result is safe to insert in the page.
 
-const escape = (s) =>
-  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+import { escapeHtml as escape, findRefs, refHtml } from '/web/text.js';
 
-// A reference to a triage object: `@item:<id>`, `@session:<chain>` or
-// `@topic:<id>`. The page handles a click on `a.ref`.
-const REF = /@(item|session|topic):([A-Za-z0-9._-]+)/g;
+// The lookup of a text without triage data.
+const NO_DATA = { items: new Map(), topics: new Map(), repos: new Map(), chainOf: () => null };
 
-function inline(text) {
-  // Take the code spans out first, so the other rules do not change them.
-  const codes = [];
-  let s = text.replace(/`([^`\n]+)`/g, (_, code) => {
-    codes.push(`<code>${escape(code)}</code>`);
-    return `\u0000${codes.length - 1}\u0000`;
-  });
+// `env` is `{look, repo}`: the lookup of the triage data and the GitHub
+// page of the repository that the text is about (see text.js).
+function inline(text, env) {
+  // Take the code spans, the links and the references out first, so the
+  // other rules do not change them.
+  const kept = [];
+  const keep = (htmlText) => `\u0000${kept.push(htmlText) - 1}\u0000`;
+  let s = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${escape(code)}</code>`));
+  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, (_, label, url) =>
+    keep(`<a href="${escape(url)}" target="_blank" rel="noreferrer">${escape(label)}</a>`),
+  );
+  const look = (env && env.look) || NO_DATA;
+  const refs = findRefs(s, look, env && env.repo);
+  for (let i = refs.length - 1; i >= 0; i--) {
+    s = s.slice(0, refs[i].start) + keep(refHtml(refs[i], look)) + s.slice(refs[i].end);
+  }
   s = escape(s);
-  s = s.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noreferrer">$2</a>');
   s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');
-  s = s.replace(REF, (all, kind, id) => {
-    const clean = id.replace(/[.]+$/, '');
-    const rest = id.slice(clean.length);
-    return `<a class="ref ref-${kind}" data-kind="${kind}" data-id="${clean}">${kind} ${clean.length > 30 ? clean.slice(0, 8) : clean}</a>${rest}`;
-  });
-  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => codes[Number(i)]);
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => kept[Number(i)]);
 }
 
-function table(rows) {
+function table(rows, env) {
   const cells = (line) => line.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
   const head = cells(rows[0]);
   const body = rows.slice(2).map(cells);
-  const th = head.map((c) => `<th>${inline(c)}</th>`).join('');
-  const tr = body.map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`).join('');
+  const th = head.map((c) => `<th>${inline(c, env)}</th>`).join('');
+  const tr = body.map((r) => `<tr>${r.map((c) => `<td>${inline(c, env)}</td>`).join('')}</tr>`).join('');
   return `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
 }
 
-export function markdown(text) {
+export function markdown(text, env) {
   const lines = (text || '').replace(/\r/g, '').split('\n');
   const out = [];
   let i = 0;
   let paragraph = [];
   const flush = () => {
     if (paragraph.length) {
-      out.push(`<p>${paragraph.map(inline).join('<br>')}</p>`);
+      out.push(`<p>${paragraph.map((l) => inline(l, env)).join('<br>')}</p>`);
       paragraph = [];
     }
   };
@@ -70,7 +70,7 @@ export function markdown(text) {
     if (heading) {
       flush();
       const level = Math.min(heading[1].length + 2, 6);
-      out.push(`<h${level}>${inline(heading[2])}</h${level}>`);
+      out.push(`<h${level}>${inline(heading[2], env)}</h${level}>`);
       i++;
       continue;
     }
@@ -78,14 +78,14 @@ export function markdown(text) {
       flush();
       const rows = [];
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) rows.push(lines[i++]);
-      out.push(table(rows));
+      out.push(table(rows, env));
       continue;
     }
     if (/^\s*>/.test(line)) {
       flush();
       const quote = [];
       while (i < lines.length && /^\s*>/.test(lines[i])) quote.push(lines[i++].replace(/^\s*>\s?/, ''));
-      out.push(`<blockquote>${markdown(quote.join('\n'))}</blockquote>`);
+      out.push(`<blockquote>${markdown(quote.join('\n'), env)}</blockquote>`);
       continue;
     }
     const item = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
@@ -108,7 +108,7 @@ export function markdown(text) {
       const base = Math.min(...items.map((x) => x.indent));
       const tag = ordered ? 'ol' : 'ul';
       const li = items
-        .map((x) => `<li class="${x.indent > base ? 'nested' : ''}">${x.text.map(inline).join('<br>')}</li>`)
+        .map((x) => `<li class="${x.indent > base ? 'nested' : ''}">${x.text.map((l) => inline(l, env)).join('<br>')}</li>`)
         .join('');
       out.push(`<${tag}>${li}</${tag}>`);
       continue;
@@ -125,6 +125,3 @@ export function markdown(text) {
   flush();
   return out.join('\n');
 }
-
-// One line of text with the inline rules only.
-export const inlineMarkdown = inline;

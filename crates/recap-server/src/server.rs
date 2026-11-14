@@ -374,7 +374,7 @@ impl Server {
                     *write(&self.inner.triage) = Some(status.clone());
                     self.send(Event::Triage(status));
                     // The run wrote a new transcript. Load it now, so that
-                    // the clients show what the triage agent did.
+                    // the clients show what triagent did.
                     if !t.status().running() {
                         next_load = next_load.min(Instant::now());
                     }

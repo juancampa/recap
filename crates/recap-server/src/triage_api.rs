@@ -1,12 +1,12 @@
 //! The triage functions of the server for the HTTP API: the state view, the
 //! changes of the data, the approval of the check scripts, and the chat of
-//! the user with the triage agent.
+//! the user with triagent.
 //!
 //! A chat thread is one Claude Code session. The first message starts the
 //! session, and each later message resumes it. The server starts
 //! `claude -p` for each message, with the same tools as a triage run, and
 //! sends the text of the reply to the clients as [`Event::TriageChat`]
-//! events while the agent writes it.
+//! events while triagent writes it.
 
 use crate::checks;
 use crate::server::Server;
@@ -18,10 +18,10 @@ use recap_api::triage::{
 };
 use recap_api::{ApiError, ApiResult, EditSource, Event};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,14 +35,44 @@ const EVENT_INTERVAL: Duration = Duration::from_millis(80);
 pub struct TriageHandle {
     pub store: Arc<TriageStore>,
     pub config: TriageConfig,
-    /// The threads that wait for a reply of the agent.
+    /// The threads that wait for a reply of triagent.
     busy: Mutex<HashSet<i64>>,
+    /// The GitHub page of the `origin` remote of each project directory.
+    /// The server reads a remote one time.
+    repos: Mutex<HashMap<PathBuf, Option<String>>>,
 }
 
 impl TriageHandle {
     pub fn new(store: Arc<TriageStore>, config: TriageConfig) -> TriageHandle {
-        TriageHandle { store, config, busy: Mutex::new(HashSet::new()) }
+        TriageHandle { store, config, busy: Mutex::new(HashSet::new()), repos: Mutex::new(HashMap::new()) }
     }
+
+    /// The GitHub page of the `origin` remote of the repository at `dir`.
+    fn repo(&self, dir: &Path) -> Option<String> {
+        let mut repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(known) = repos.get(dir) {
+            return known.clone();
+        }
+        let output = Command::new("git").arg("-C").arg(dir).args(["remote", "get-url", "origin"]).output();
+        let repo = output
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| github_page(String::from_utf8_lossy(&o.stdout).trim()));
+        repos.insert(dir.to_path_buf(), repo.clone());
+        repo
+    }
+}
+
+/// The GitHub page of a git remote: `https://github.com/<owner>/<name>`.
+/// None for a remote of another host.
+fn github_page(remote: &str) -> Option<String> {
+    let path = ["git@github.com:", "https://github.com/", "ssh://git@github.com/"]
+        .iter()
+        .find_map(|prefix| remote.strip_prefix(prefix))?;
+    let path = path.strip_suffix(".git").unwrap_or(path).trim_end_matches('/');
+    let valid = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let (owner, name) = path.split_once('/')?;
+    (valid(owner) && valid(name)).then(|| format!("https://github.com/{owner}/{name}"))
 }
 
 /// The filter of `GET /v1/triage/state`.
@@ -86,7 +116,8 @@ impl Server {
     /// state of each item, the priority order, and the current data of each
     /// session.
     pub fn triage_state(&self, query: &StateQuery) -> ApiResult<TriageState> {
-        let store = &self.handle()?.store;
+        let handle = self.handle()?;
+        let store = &handle.store;
         let now = Local::now();
         let version = store.version();
         let results = store.results();
@@ -157,6 +188,7 @@ impl Server {
                     title: agent.and_then(|a| a.title.clone()).or_else(|| {
                         agent.map(|a| a.first_prompt.clone())
                     }),
+                    repo: agent.and_then(|a| a.project_roots.first()).and_then(|dir| handle.repo(dir)),
                     session_id: agent.map(|a| a.session_id.clone()),
                     last_ts: agent.map(|a| a.last_ts),
                     last_turn,
@@ -258,7 +290,7 @@ impl Server {
         self.handle()?.store.thread(id).ok_or_else(|| error(format!("no chat thread {id}")))
     }
 
-    /// Send `text` to the triage agent in the thread `thread`, or in a new
+    /// Send `text` to triagent in the thread `thread`, or in a new
     /// thread. It returns the thread with the new message and an empty
     /// reply. The reply comes as [`Event::TriageChat`] events.
     pub fn chat_send(&self, thread: Option<i64>, text: &str) -> ApiResult<ChatThread> {
@@ -277,7 +309,7 @@ impl Server {
             }
         };
         if !handle.busy.lock().unwrap_or_else(|e| e.into_inner()).insert(thread.id) {
-            return Err(error("the agent still writes a reply in this thread"));
+            return Err(error("triagent still writes a reply in this thread"));
         }
         let started = (|| -> anyhow::Result<()> {
             store.add_message(thread.id, "user", text, true)?;
@@ -492,4 +524,19 @@ fn run_reply(
     }
     anyhow::ensure!(status.success() || !reply.text.trim().is_empty(), "claude ended with {status}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::github_page;
+
+    #[test]
+    fn the_github_page_of_a_remote() {
+        let page = Some("https://github.com/membrane-io/mnode".to_string());
+        assert_eq!(github_page("git@github.com:membrane-io/mnode.git"), page);
+        assert_eq!(github_page("https://github.com/membrane-io/mnode"), page);
+        assert_eq!(github_page("ssh://git@github.com/membrane-io/mnode.git"), page);
+        assert_eq!(github_page("git@gitlab.com:membrane-io/mnode.git"), None);
+        assert_eq!(github_page("https://github.com/membrane-io"), None);
+    }
 }

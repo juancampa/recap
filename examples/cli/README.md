@@ -33,5 +33,5 @@ The API:
 | `POST /v1/sessions/{id}/restore` | Write the files of an archived Claude Code session back to `~/.claude/projects`. An entry of such a session has `"session_archived": true`. |
 | `POST /v1/blame` | The body is `{"diff": "<unified diff>", "repo_root": "<path>"}`. |
 | `GET /v1/triage/state?chain=&topic=&open=1` | The triage data: the topics, the sessions, and the items in the priority order. |
-| `POST /v1/triage/apply` | The body is `{"ops": [...]}`: operations that change the triage data, as the triage agent. The response has one error or `null` for each operation. |
-| `POST /v1/triage/review` | Ask for a review run of the triage agent. |
+| `POST /v1/triage/apply` | The body is `{"ops": [...]}`: operations that change the triage data, as triagent. The response has one error or `null` for each operation. |
+| `POST /v1/triage/review` | Ask for a review run of triagent. |

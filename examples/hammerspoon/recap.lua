@@ -1,6 +1,6 @@
 -- recap.lua
 -- A global hotkey that opens the triage web UI of recap, and the
--- recapNotify() function that the triage agent calls through `hs -c`.
+-- recapNotify() function that triagent calls through `hs -c`.
 --
 -- Install: copy this file to ~/.hammerspoon/, then add this line to init.lua:
 --   require("recap").bind({ "cmd", "alt" }, "q")
@@ -8,7 +8,7 @@
 -- Options (the third argument of bind):
 --   url  The URL of the recap server. The default is "http://127.0.0.1:7717/".
 
--- The triage agent runs `hs -c`, which needs the IPC module.
+-- Triagent runs `hs -c`, which needs the IPC module.
 require("hs.ipc")
 
 local M = {}

@@ -506,7 +506,7 @@ Usage:
   recap serve [options]              Run the server in the foreground.
   recap service <command>            Manage the prod server as a launchd agent.
   recap logs [-f] [-n <lines>]       Print the end of the prod server log.
-  recap triage approve [<script>...] Review and approve the check scripts of the triage agent.
+  recap triage approve [<script>...] Review and approve the check scripts of triagent.
 
 TUI options:
   -a, --absolute       Show absolute times instead of relative times.
@@ -533,8 +533,8 @@ serve options:
       --test           Use a copy of the prod cache.
       --poll <seconds> The interval between two loads of the sources. The default is 5.
       --triage-dir <dir>
-                       Start a triage agent when a Claude Code session stops its turn.
-                       The triage agent keeps its notes and check scripts in this
+                       Start triagent when a Claude Code session stops its turn.
+                       Triagent keeps its notes and check scripts in this
                        directory. The triage data is in <dir>.db.
       --triage-paused  Start no triage run. The checks and the chat work as usual.
       --web-dir <dir>  Read the files of the web UI from this directory at each

@@ -1,8 +1,8 @@
 //! The database of the triage data: the topics, the session notes, the
-//! items, the check results, the changes and the chat with the triage agent.
+//! items, the check results, the changes and the chat with triagent.
 //!
-//! The database file is next to the triage directory and not in it, so the
-//! triage agent cannot write to the file. The agent changes the data with
+//! The database file is next to the triage directory and not in it, so
+//! triagent cannot write to the file. It changes the data with
 //! `POST /v1/triage/apply`, and the server validates each operation (see
 //! [`TriageStore::apply`]).
 //!
@@ -111,6 +111,8 @@ impl TriageStore {
 
     fn from_connection(conn: Connection) -> anyhow::Result<TriageStore> {
         conn.execute_batch(SCHEMA)?;
+        // The earlier name of the actor `triagent` was `agent`.
+        conn.execute("UPDATE changes SET actor = 'triagent' WHERE actor = 'agent'", [])?;
         Ok(TriageStore { conn: Mutex::new(conn) })
     }
 
@@ -214,7 +216,8 @@ impl TriageStore {
                 actor: match r.get::<_, String>(2)?.as_str() {
                     "user" => Actor::User,
                     "runner" => Actor::Runner,
-                    _ => Actor::Agent,
+                    // `agent` is the earlier name of this actor.
+                    _ => Actor::Triagent,
                 },
                 kind: r.get(3)?,
                 id: r.get(4)?,
@@ -226,7 +229,7 @@ impl TriageStore {
         rows.map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    // ── The chat with the triage agent ──────────────────────────────────────
+    // ── The chat with triagent ──────────────────────────────────────
 
     /// Make a chat thread for the Claude Code session `session_id`.
     pub fn new_thread(&self, title: &str, session_id: &str) -> anyhow::Result<ChatThread> {
@@ -343,7 +346,7 @@ fn time(text: &str) -> DateTime<Local> {
 fn actor_word(actor: Actor) -> &'static str {
     match actor {
         Actor::User => "user",
-        Actor::Agent => "agent",
+        Actor::Triagent => "triagent",
         Actor::Runner => "runner",
     }
 }
@@ -479,7 +482,7 @@ fn save<T: serde::Serialize>(
 }
 
 fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> anyhow::Result<()> {
-    let agent = actor == Actor::Agent;
+    let triagent = actor == Actor::Triagent;
     match op {
         Op::Item { id, set } => {
             anyhow::ensure!(valid_id(id), "the item id `{id}` is not valid: use letters, digits, `.`, `_` and `-`");
@@ -501,7 +504,7 @@ fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> a
             for spec in specs.into_iter().flatten() {
                 anyhow::ensure!(valid_script_name(&spec.script), "`{}` is not a valid script name", spec.script);
             }
-            if agent {
+            if triagent {
                 let was = old.as_ref().and_then(|o| o.get("status")).and_then(Value::as_str);
                 let confirmed = item.status == Status::Confirmed;
                 anyhow::ensure!(
@@ -516,7 +519,7 @@ fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> a
             save(conn, actor, ITEM, id, old.as_ref(), &item, now)
         }
         Op::DeleteItem { id } => {
-            anyhow::ensure!(!agent, "only the user deletes an item: set the status `dropped` and give the reason in `note`");
+            anyhow::ensure!(!triagent, "only the user deletes an item: set the status `dropped` and give the reason in `note`");
             let old = get(conn, ITEM, id)?.with_context(|| format!("no item `{id}`"))?;
             delete(conn, ITEM, id)?;
             delete(conn, RESULT, id)?;
@@ -534,7 +537,7 @@ fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> a
             if let Some(topic) = &note.topic {
                 anyhow::ensure!(exists(conn, TOPIC, topic), "no topic `{topic}`: make the topic first");
             }
-            if agent {
+            if triagent {
                 let was = old.as_ref().and_then(|o| o.get("muted_turn")).and_then(Value::as_u64);
                 anyhow::ensure!(note.muted_turn.map(|t| t as u64) == was, "only the user changes `muted_turn`");
             }
@@ -570,7 +573,7 @@ fn apply_op(conn: &Connection, actor: Actor, op: &Op, now: DateTime<Local>) -> a
 
 /// Read the files of the earlier format in `dir` into the new database:
 /// `items.json`, `results.json` and `agents/<chain>.md`. Then move the files
-/// to `<dir>.legacy`, so the triage agent does not read them. It returns a
+/// to `<dir>.legacy`, so triagent does not read them. It returns a
 /// report, or None when `dir` has no such file.
 ///
 /// A follow-up of an agent file becomes an item of the user with a
@@ -782,7 +785,7 @@ mod tests {
     fn an_operation_that_is_not_valid_changes_nothing() {
         let store = TriageStore::in_memory().unwrap();
         let result = store.apply(
-            Actor::Agent,
+            Actor::Triagent,
             &batch(json!([
                 item_op("a", json!({"owner": "agent", "text": "Fix it", "impact": "normal"})),
                 item_op("b", json!({"owner": "agent", "text": "Fix it", "impact": "critical"})),
@@ -804,19 +807,19 @@ mod tests {
             item_op("a", json!({"owner": "user", "text": "Deploy", "impact": "normal"})),
             {"op": "session", "chain": "c1", "set": {"turn": 3}},
         ]));
-        assert_eq!(store.apply(Actor::Agent, &make).errors, [None, None]);
+        assert_eq!(store.apply(Actor::Triagent, &make).errors, [None, None]);
         let user_only = batch(json!([
             item_op("a", json!({"status": "confirmed"})),
             {"op": "session", "chain": "c1", "set": {"muted_turn": 3}},
             {"op": "delete_item", "id": "a"},
         ]));
-        let refused = store.apply(Actor::Agent, &user_only);
+        let refused = store.apply(Actor::Triagent, &user_only);
         assert!(refused.errors.iter().all(Option::is_some), "{:?}", refused.errors);
         assert_eq!(store.apply(Actor::User, &batch(json!([item_op("a", json!({"status": "confirmed"}))]))).errors, [None]);
         // The agent can change other fields of a confirmed item, but not
         // its status.
-        assert_eq!(store.apply(Actor::Agent, &batch(json!([item_op("a", json!({"note": "n"}))]))).errors, [None]);
-        assert!(store.apply(Actor::Agent, &batch(json!([item_op("a", json!({"status": "open"}))]))).errors[0].is_some());
+        assert_eq!(store.apply(Actor::Triagent, &batch(json!([item_op("a", json!({"note": "n"}))]))).errors, [None]);
+        assert!(store.apply(Actor::Triagent, &batch(json!([item_op("a", json!({"status": "open"}))]))).errors[0].is_some());
         assert_eq!(store.apply(Actor::User, &user_only).errors[1..], [None, None]);
         assert!(store.items().is_empty());
     }
@@ -824,7 +827,7 @@ mod tests {
     #[test]
     fn a_change_row_names_each_field_that_changed() {
         let store = TriageStore::in_memory().unwrap();
-        store.apply(Actor::Agent, &batch(json!([item_op("a", json!({"owner": "agent", "text": "Fix it", "impact": "low"}))])));
+        store.apply(Actor::Triagent, &batch(json!([item_op("a", json!({"owner": "agent", "text": "Fix it", "impact": "low"}))])));
         let before = store.last_change();
         store.apply(Actor::User, &batch(json!([item_op("a", json!({"text": "Fix it now", "impact": "low", "note": "n"}))])));
         let changes = store.changes_after(before, 10);
@@ -841,13 +844,13 @@ mod tests {
     fn a_topic_must_exist_and_cannot_go_while_in_use() {
         let store = TriageStore::in_memory().unwrap();
         let session = json!({"op": "session", "chain": "c1", "set": {"topic": "deploy"}});
-        assert!(store.apply(Actor::Agent, &batch(json!([session.clone()]))).errors[0].is_some());
+        assert!(store.apply(Actor::Triagent, &batch(json!([session.clone()]))).errors[0].is_some());
         let topic = json!({"op": "topic", "id": "deploy", "set": {"title": "Deploy"}});
-        assert_eq!(store.apply(Actor::Agent, &batch(json!([topic, session]))).errors, [None, None]);
+        assert_eq!(store.apply(Actor::Triagent, &batch(json!([topic, session]))).errors, [None, None]);
         let delete = batch(json!([{"op": "delete_topic", "id": "deploy"}]));
-        assert!(store.apply(Actor::Agent, &delete).errors[0].is_some());
-        store.apply(Actor::Agent, &batch(json!([{"op": "session", "chain": "c1", "set": {"topic": null}}])));
-        assert_eq!(store.apply(Actor::Agent, &delete).errors, [None]);
+        assert!(store.apply(Actor::Triagent, &delete).errors[0].is_some());
+        store.apply(Actor::Triagent, &batch(json!([{"op": "session", "chain": "c1", "set": {"topic": null}}])));
+        assert_eq!(store.apply(Actor::Triagent, &delete).errors, [None]);
     }
 
     #[test]

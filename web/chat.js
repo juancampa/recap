@@ -1,16 +1,16 @@
-// The chat of the user with the triage agent.
+// The chat of the user with triagent.
 
 import { html, useState, useEffect, useRef, useMemo } from '/web/vendor/preact.js';
 import { api, closed, short, clock, useStored } from '/web/app.js';
 import { markdown } from '/web/markdown.js';
 import { ChangeText, showChange, changeLabel } from '/web/views.js';
 
-// The changes that the agent made while it wrote one message.
+// The changes that triagent made while it wrote one message.
 function MessageChanges({ ctx, message }) {
   const [changes, setChanges] = useState(null);
   useEffect(() => {
     api
-      .ui(`/changes?after=${message.changes_from}&to=${message.changes_to}&actor=agent`)
+      .ui(`/changes?after=${message.changes_from}&to=${message.changes_to}&actor=triagent`)
       .then(setChanges, () => setChanges([]));
   }, [message.id, message.changes_to]);
   if (!changes || changes.length === 0) return null;
@@ -28,47 +28,81 @@ function MessageChanges({ ctx, message }) {
 }
 
 function Message({ ctx, message }) {
-  const __html = useMemo(() => markdown(message.text), [message.text]);
+  const __html = useMemo(() => markdown(message.text, { look: ctx.look }), [message.text, ctx.look]);
   if (message.role === 'user') return html`<div class="msg user md" dangerouslySetInnerHTML=${{ __html }}></div>`;
   return html`
     <div class="msg agent">
       <div class="md" dangerouslySetInnerHTML=${{ __html }}></div>
-      ${!message.done && html`<div class="activity">${message.activity || (message.text ? '…' : 'The agent reads the message…')}</div>`}
+      ${!message.done && html`<div class="activity">${message.activity || (message.text ? '…' : 'Triagent reads the message…')}</div>`}
       ${message.done && message.changes_to > message.changes_from && html`<${MessageChanges} ctx=${ctx} message=${message} />`}
     </div>
   `;
 }
 
-// The options of the `@` completion for the text `word` after the `@`.
+// How well the letters of `needle` match `text`, in the order of the
+// needle. A larger number is a better match. -1 is no match. A letter at
+// the start of the text or after a separator counts most, so `7bf1` finds
+// the id `7b6d7bd0-f1`.
+function fuzzy(needle, text) {
+  let score = 0;
+  let at = 0;
+  let last = -2;
+  for (const letter of needle) {
+    // Prefer the next start of a part of the text to the next letter.
+    let found = -1;
+    for (let i = at; i < text.length; i++) {
+      if (text[i] !== letter) continue;
+      const start = i === 0 || '-_.:/ '.includes(text[i - 1]);
+      if (i === last + 1 || start) {
+        found = i;
+        break;
+      }
+      if (found < 0) found = i;
+    }
+    if (found < 0) return -1;
+    const start = found === 0 || '-_.:/ '.includes(text[found - 1]);
+    score += found === last + 1 ? 8 : start ? 6 : 1;
+    score -= Math.min(3, found - at) * 0.5;
+    last = found;
+    at = found + 1;
+  }
+  return score - text.length * 0.01;
+}
+
+// The options of the `@` completion for the text `word` after the `@`, the
+// best match first. The id of an option matches by its letters in order.
+// The label matches by a part of its text.
 function options(ctx, word) {
   const { state, index } = ctx;
   const [kind, rest] = word.includes(':') ? word.split(/:(.*)/) : [null, word];
   const needle = (rest || '').toLowerCase();
-  const has = (...texts) => texts.some((t) => t && t.toLowerCase().includes(needle));
-  const out = [];
   const want = (k) => !kind || k.startsWith(kind);
-  if (want('topic')) {
-    for (const t of state.topics) if (has(t.id, t.title)) out.push({ kind: 'topic', id: t.id, label: t.title });
-  }
+  const out = [];
+  // `order` keeps the order of the list for two equal scores.
+  const add = (option, id, ...labels) => {
+    let score = needle ? fuzzy(needle, id.toLowerCase()) : 0;
+    if (needle && labels.some((l) => l && l.toLowerCase().includes(needle))) score = Math.max(score, needle.length * 4);
+    if (score >= 0) out.push({ ...option, score: score - (option.dim ? 2 : 0), order: out.length });
+  };
   if (want('item')) {
-    for (const i of state.items) {
-      if (out.length > 40) break;
-      if (has(i.id, i.text)) out.push({ kind: 'item', id: i.id, label: i.text, dim: closed(i) });
-    }
+    for (const i of state.items) add({ kind: 'item', id: i.id, label: i.text, dim: closed(i) }, i.id, i.text);
   }
   if (want('session')) {
     const sessions = [...state.sessions].sort((a, b) => (b.last_ts || '').localeCompare(a.last_ts || ''));
     for (const s of sessions) {
       const topic = s.topic ? index.topics.get(s.topic) : null;
-      if (has(s.chain, s.title, topic && topic.title)) out.push({ kind: 'session', id: short(s.chain), label: s.title || short(s.chain) });
+      add({ kind: 'session', id: short(s.chain), label: s.title || short(s.chain) }, short(s.chain), s.title, topic && topic.title);
     }
   }
-  // Without a kind, show some options of each kind.
-  if (!kind) {
+  if (want('topic')) {
+    for (const t of state.topics) add({ kind: 'topic', id: t.id, label: t.title, style: t.style }, t.id, t.title);
+  }
+  // Without a text, show some options of each kind.
+  if (!needle && !kind) {
     const per = (k, n) => out.filter((o) => o.kind === k).slice(0, n);
     return [...per('item', 6), ...per('session', 4), ...per('topic', 4)];
   }
-  return out.slice(0, 14);
+  return out.sort((a, b) => b.score - a.score || a.order - b.order).slice(0, 14);
 }
 
 export function Chat({ ctx, handle, events }) {
@@ -100,7 +134,7 @@ export function Chat({ ctx, handle, events }) {
     return () => (live = false);
   }, [threadId]);
 
-  // The events of the reply that the agent writes.
+  // The events of the reply that triagent writes.
   useEffect(() => {
     const onMessage = (message) => {
       if (message.thread !== current.current) return;
@@ -218,8 +252,8 @@ export function Chat({ ctx, handle, events }) {
         onScroll=${(e) => (nearEnd.current = e.target.scrollHeight - e.target.scrollTop - e.target.clientHeight < 60)}>
         ${messages.length === 0 &&
         html`<div class="empty">
-          Ask the triage agent about the items, the sessions and the topics. It can read the sessions and change the triage data.
-          <br /><br />Type <kbd>@</kbd> to name an item, a session or a topic. The <b>Ask triage</b> buttons add a reference here.
+          Ask triagent about the items, the sessions and the topics. It can read the sessions and change the triage data.
+          <br /><br />Type <kbd>@</kbd> to name an item, a session or a topic. The <b>Ask triagent</b> buttons add a reference here.
         </div>`}
         ${messages.map((m) => html`<${Message} key=${m.id} ctx=${ctx} message=${m} />`)}
       </div>
@@ -230,18 +264,18 @@ export function Chat({ ctx, handle, events }) {
           ${choices.map(
             (o, at) => html`<div class=${`o ${at === Math.min(complete.at, choices.length - 1) ? 'on' : ''}`}
               onMouseDown=${(e) => (e.preventDefault(), choose(o))}>
-              <span class="k">${o.kind}</span>
+              <span class=${`k ${o.kind === 'topic' ? 'tc' : ''}`} style=${o.kind === 'topic' ? o.style : ''}>${o.kind}</span>
               <span class="l" style=${o.dim ? 'color:var(--faint)' : ''}>${o.label}</span>
               <span class="i">${o.id}</span>
             </div>`,
           )}
         </div>`}
-        <textarea ref=${input} value=${draft} placeholder="Message the triage agent. @ names an item, a session or a topic."
+        <textarea ref=${input} value=${draft} placeholder="Message triagent. @ names an item, a session or a topic."
           onInput=${onInput} onKeyDown=${onKeyDown} onBlur=${() => setComplete(null)}></textarea>
         <div class="bar">
           <span><kbd>Enter</kbd> send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line</span>
           <span class="spacer"></span>
-          <button class="primary" onClick=${send} disabled=${busy || !draft.trim()}>${busy ? 'The agent writes…' : 'Send'}</button>
+          <button class="primary" onClick=${send} disabled=${busy || !draft.trim()}>${busy ? 'Triagent writes…' : 'Send'}</button>
         </div>
       </div>
     </div>

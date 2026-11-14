@@ -102,14 +102,14 @@ If the session does not run, `o` opens a new Ghostty window with `claude --resum
 
 ### Triage
 
-A triage agent (`claude -p --model opus`) reads your Claude Code sessions and keeps a list of the work that you and the agents must still do.
+Triagent (`claude -p --model opus`) reads your Claude Code sessions and keeps a list of the work that you and the agents must still do.
 The triage web UI shows that list. Open it at `http://127.0.0.1:7717/`, with `recap --queue`, or with `Q` in the TUI.
 
 The server starts a triage run when a session stops its turn.
 A stop is a change of the session from `busy` to `idle`, or a change to `waiting`.
 The server reads the status from the files in `~/.claude/sessions/`.
 One run occurs at a time. The stops that occur during a run go to the next run.
-At the end of a run, the triage agent writes the delay to the next scheduled run.
+At the end of a run, triagent writes the delay to the next scheduled run.
 
 The runner is off by default. To turn it on, give the server a triage directory:
 
@@ -124,23 +124,23 @@ A later `recap service install` keeps the triage directory. `recap service insta
 #### The triage data
 
 The server keeps the triage data in the SQLite file `<triage dir>.db`, next to the triage directory.
-The triage agent cannot write this file. It changes the data with `POST /v1/triage/apply`, and the server refuses the changes that only you can make.
+Triagent cannot write this file. It changes the data with `POST /v1/triage/apply`, and the server refuses the changes that only you can make.
 
 | Object | Content |
 |---|---|
 | Topic | The goal that one or more sessions work on, for example "Worker memory management". It has a title and a summary of its state. |
-| Session | The topic of the session, one sentence about what the session needs, and the last turn that the triage agent read. You can mute a session until its next turn. |
+| Session | The topic of the session, one sentence about what the session needs, and the last turn that triagent read. You can mute a session until its next turn. |
 | Item | One piece of work. See [Items and checks](#items-and-checks). |
 
-The triage directory contains the files that the triage agent writes:
+The triage directory contains the files that triagent writes:
 
 | File | Content |
 |---|---|
-| `memory.md` | The notes of the triage agent that apply to many runs. |
+| `memory.md` | The notes of triagent that apply to many runs. |
 | `next-run` | The delay to the next scheduled run (`90s`, `30m`, `2h`, `1d`), and the reason. |
-| `checks/<script>` | The check scripts that the triage agent writes. |
+| `checks/<script>` | The check scripts that triagent writes. |
 
-`crates/recap-server/src/triage_prompt.md` contains the instructions of the triage agent.
+`crates/recap-server/src/triage_prompt.md` contains the instructions of triagent.
 
 When the server finds a triage directory of an earlier version (`items.json`, `agents/`), it imports the data into the database and moves the old files to `<triage dir>.legacy/`.
 
@@ -148,7 +148,7 @@ When the server finds a triage directory of an earlier version (`items.json`, `a
 
 Each item has an owner (the agent or you), an impact (`critical`, `high`, `normal` or `low`), the reason for a critical or a high impact, and a done condition.
 It can also have a due time, an event that the item must come before (such as the next prod deploy), a prompt that you can send to the session, and references to the turns that the item came from.
-The triage agent writes a check script for each done condition that a script can test.
+Triagent writes a check script for each done condition that a script can test.
 The server runs the check of each open item: every 10 minutes for a critical item, 30 minutes for a high item, 2 hours for a normal item, and 6 hours for a low item.
 A check exits with 0 when the item is done, 1 when it is not done, and another code when it cannot decide.
 An item is verified only when its check exits with 0.
@@ -169,7 +169,7 @@ recap triage approve
 ```
 
 Each of them shows a new or changed script, as the full text or as a diff.
-The approval copies the script to `<triage dir>.approved/`, next to the triage directory, where the triage agent cannot write.
+The approval copies the script to `<triage dir>.approved/`, next to the triage directory, where triagent cannot write.
 The server runs the approved copy. A script that changed after the approval gives the outcome `unapproved` until you approve it again.
 
 #### The web UI
@@ -178,7 +178,7 @@ The server runs the approved copy. A script that changed after the approval give
 |---|---|
 | Now | All the open items in the priority order, one line for each item. You can show your items, the items of the agents, or all. You can group the items by topic. The sessions that wait for you now are at the top. |
 | Topics | One block for each topic: its summary, its sessions with their current status, and its first open items. |
-| Checks | The check scripts. A script that waits for your approval shows its text or its diff, and an Approve button. |
+| Checks | The check scripts, with the colors of their syntax. A script that waits for your approval shows its text or its diff, and an Approve button. The tab shows the number of scripts that wait. |
 | Activity | The changes of the triage data, newest first. The top bar shows the number of changes since your last look. |
 
 A click on an item shows its details in place: the reason, the done condition, the last check result, the prompt, and the turns that the item refers to.
@@ -186,10 +186,27 @@ From the details you can confirm, reopen, drop or delete the item, change its im
 A click on a session opens a panel with all the turns of the session, as the prompt and the final response of each turn. The list stays in place behind the panel.
 A closed item is dim and has a check mark. The closed items are in a group at the end of the Now view.
 
-The chat on the right side sends a message to the triage agent.
-Type `@` to name an item, a session or a topic, or use an "Ask triage" button. The server adds the current data of each named object to the message.
-Each conversation is one Claude Code session, so the agent knows the earlier messages of the conversation.
-A reply lists the changes that the agent made to the triage data.
+The page shows each reference in a text as a link:
+
+- The id of an item, and the first 8 characters of the id of a session. The pointer on the link shows the title, the impact, the topic, the session and the age.
+- A pull request: `PR 12` and `#12` go to the GitHub repository of the session. `<name> PR 12` goes to the repository `<name>` of another session, and `<owner>/<name>#12` to that repository.
+
+Each topic has its own color.
+
+The address of the page holds the navigation state, so the Back button and a reload work:
+
+| Part | Content |
+|---|---|
+| `/now`, `/topics`, `/checks`, `/activity` | The view. |
+| `?q=<text>` | The text filter of the Now view. |
+| `?session=<chain>&turn=<n>` | The session in the session panel, and the turn that the panel marks. |
+| `#<id>` | The object that the view shows and marks: an item in the Now view, a topic in the Topics view, a script in the Checks view. |
+
+The chat on the right side sends a message to triagent.
+Type `@` to name an item, a session or a topic, or use an "Ask triagent" button.
+The `@` list finds an id by its letters in order: `@7bf1` finds the item `7b6d7bd0-f1`. The server adds the current data of each named object to the message.
+Each conversation is one Claude Code session, so triagent knows the earlier messages of the conversation.
+A reply lists the changes that triagent made to the triage data.
 
 | Key | Action |
 |---|---|
@@ -207,7 +224,7 @@ The server listens only on `127.0.0.1`.
 A review run reads all the agents of the last 24 hours, and gives a topic to each session that has none.
 The server starts a review when the triage data has no session, and when you press "Review" in the web UI.
 
-`examples/hammerspoon/recap.lua` has the `recapNotify` function that the triage agent uses for notifications.
+`examples/hammerspoon/recap.lua` has the `recapNotify` function that triagent uses for notifications.
 The comment at the start of the file tells how to install it.
 
 ### `recap list`
